@@ -1,0 +1,43 @@
+# Virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+check_*.py
+bench.py
+
+# Секреты
+.env
+.env.local
+
+# База данных (важно!)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Отчёты (данные заказчика)
+Отчёты/
+Отчеты/
+*.xlsx
+*.xls
+
+# Скачанные файлы
+downloads/
+*.pdf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Логи
+*.log
