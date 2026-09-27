@@ -202,6 +202,7 @@ def _load_monthly_dynamics() -> pd.DataFrame:
     """
     Динамика по месяцам: сколько замечаний ждут нашего ответа.
     Разделено на свежие (<90 дней) и заброшенные (>90 дней).
+    Возвращает DataFrame с колонками: ym, Тип, Количество.
     """
     df = _load_all_categorized()
     if df.empty:
@@ -218,7 +219,6 @@ def _load_monthly_dynamics() -> pd.DataFrame:
         "abandoned": "Заброшенные",
     })
 
-    # Группировка по месяцу и типу
     monthly = sub.groupby(["ym", "Тип"]).size().reset_index(name="Количество")
     return monthly
 
@@ -247,7 +247,7 @@ def _load_waiting_dynamics() -> pd.DataFrame:
 
 
 def _render_dynamics_chart():
-    """Два графика рядом: наша вина vs вина заказчика. Общий диапазон X."""
+    """Два графика рядом: наша вина (стек) vs вина заказчика. Общий диапазон X."""
     monthly_ours = _load_monthly_dynamics()
     monthly_wait = _load_waiting_dynamics()
 
@@ -256,29 +256,28 @@ def _render_dynamics_chart():
 
     st.markdown("### 📈 Динамика по месяцам")
 
-    # --- Собираем все месяцы ---
+    # --- Собираем все месяцы из обоих источников ---
     all_months = set()
     if not monthly_ours.empty:
         all_months.update(monthly_ours["ym"].tolist())
     if not monthly_wait.empty:
         all_months.update(monthly_wait["ym"].tolist())
 
-    months_sorted = sorted(all_months)
-    # Для левого графика — все месяцы, для правого — все
-    common_months = months_sorted
+    common_months = sorted(all_months)
 
-    # --- Левый: стек свежие + заброшенные ---
     col1, col2 = st.columns(2)
 
+    # --- Левый: стек свежие + заброшенные ---
     with col1:
         if not monthly_ours.empty:
-            # Приводим к общему списку месяцев
+            # Сводная таблица: ym × Тип
             pivot = (monthly_ours
                      .pivot_table(index="ym", columns="Тип",
                                   values="Количество", fill_value=0)
                      .reindex(common_months, fill_value=0)
                      .reset_index())
-            # Убеждаемся, что обе колонки есть
+
+            # Гарантируем наличие обеих колонок
             for col in ["Свежие", "Заброшенные"]:
                 if col not in pivot.columns:
                     pivot[col] = 0
@@ -340,18 +339,17 @@ def _render_dynamics_chart():
             st.info("Нет замечаний, ждущих заказчика.")
 
     st.caption(
-        "**Левый график** — стек: 🟥 свежие (<90 дней) + 🟫 заброшенные "
-        "(>90 дней без движения). **Правый** — ждут рассмотрения заказчиком."
+        "**Левый график** — стек: 🟥 свежие (<90 дней без движения) + "
+        "🟫 заброшенные (>90 дней). **Правый** — ждут рассмотрения заказчиком. "
+        "Оба за всё время проекта."
     )
 
     # --- Интерпретация ---
     st.markdown("#### 🧭 Что это значит")
 
-    # Считаем итоги
     total_ours = int(monthly_ours["Количество"].sum()) if not monthly_ours.empty else 0
     total_wait = int(monthly_wait["Количество"].sum()) if not monthly_wait.empty else 0
 
-    # Отдельно свежие и заброшенные
     if not monthly_ours.empty:
         fresh = int(monthly_ours[monthly_ours["Тип"] == "Свежие"]["Количество"].sum())
         aband = int(monthly_ours[monthly_ours["Тип"] == "Заброшенные"]["Количество"].sum())
@@ -369,7 +367,6 @@ def _render_dynamics_chart():
         help="Если >1 — мы работаем хуже. Если <1 — заказчик тормозит больше.",
     )
 
-    # Текстовый вывод
     if total_ours > total_wait * 1.2:
         st.error(
             f"🔴 **Узкое место — мы.** Ждущих нашего ответа "

@@ -34,7 +34,7 @@ def _fig_id(fig) -> str:
 def download_plotly(fig, filename: str, key: str,
                     width: int = 1400, height: int = 700, scale: int = 2):
     """
-    Кнопки скачивания графика в PNG (компактные, чтобы не обрезались).
+    Кнопки скачивания графика в PNG (компактные).
     """
     fig_hash = _fig_id(fig)
     state_key = f"png_ready_{key}_{fig_hash}"

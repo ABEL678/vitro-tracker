@@ -18,7 +18,7 @@ import streamlit as st
 from vitro.sqlite_db import init_db
 from vitro.ui import (
     overview, complexes, categories, deadlines, lagging,
-    authors, search, dynamics, export, logs, admin,
+    authors, search, dynamics, revisions, export, logs, admin,
 )
 
 st.set_page_config(
@@ -114,6 +114,7 @@ tabs = st.tabs([
     "👤 Авторы",
     "🔍 Поиск",
     "📈 Динамика",
+    "🔁 Ревизии",
     "📄 Экспорт",
     "📜 Логи",
     "⚙️ Управление",
@@ -127,9 +128,10 @@ with tabs[4]:  lagging.render()
 with tabs[5]:  authors.render()
 with tabs[6]:  search.render()
 with tabs[7]:  dynamics.render()
-with tabs[8]:  export.render()
-with tabs[9]:  logs.render()
-with tabs[10]: admin.render()
+with tabs[8]:  revisions.render()   # ← новая
+with tabs[9]:  export.render()
+with tabs[10]: logs.render()
+with tabs[11]: admin.render()
 
 # --- Футер ---
 user_label = st.session_state.get("user", "инженер")
