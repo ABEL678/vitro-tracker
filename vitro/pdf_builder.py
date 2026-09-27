@@ -3,10 +3,11 @@
 Экспорт таблиц в PDF через reportlab.
 
 Особенности:
-  - Поддержка кириллицы через DejaVu Sans.
+  - Поддержка кириллицы через DejaVu Sans (или системный шрифт).
   - Автоматическая разбивка длинных таблиц на страницы.
   - Ограничение длины текста в ячейке.
-  - Ограничение общего числа строк (для PDF нецелесообразно гнать 20 000 строк).
+  - Хедер с логотипом АТП ТЛП и заголовком документа.
+  - Футер с датой и номером страницы.
 """
 
 import io
@@ -22,8 +23,15 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image,
 )
+
+
+# ---------------------------------------------------------------------------
+#  Пути
+# ---------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent.parent
+LOGO_PATH = ROOT / "assets" / "logo.png"
 
 
 # ---------------------------------------------------------------------------
@@ -34,13 +42,10 @@ FONT_NAME_BOLD = "DejaVuSans-Bold"
 
 
 def _find_font() -> tuple[str, str] | None:
-    """
-    Ищет DejaVu Sans в системе.
-    Возвращает (путь_к_regular, путь_к_bold) или None, если не найден.
-    """
+    """Ищет DejaVu Sans или совместимый шрифт в системе."""
     candidates = []
 
-    # 1. Через matplotlib (самый надёжный способ — там шрифт всегда есть)
+    # 1. Через matplotlib (там DejaVu Sans всегда есть)
     try:
         import matplotlib
         mpl_data = Path(matplotlib.get_data_path())
@@ -51,7 +56,7 @@ def _find_font() -> tuple[str, str] | None:
     except ImportError:
         pass
 
-    # 2. Windows: стандартные шрифты
+    # 2. Windows системные
     if os.name == "nt":
         win_fonts = Path("C:/Windows/Fonts")
         candidates.extend([
@@ -75,11 +80,10 @@ def _find_font() -> tuple[str, str] | None:
     return None
 
 
-def _register_fonts():
-    """Регистрирует шрифт. Возвращает имя шрифта (regular)."""
+def _register_fonts() -> str:
+    """Регистрирует шрифт. Возвращает имя (regular)."""
     fonts = _find_font()
     if not fonts:
-        # Фолбэк: кириллица не будет работать, но PDF не упадёт
         return "Helvetica"
 
     regular_path, bold_path = fonts
@@ -91,7 +95,6 @@ def _register_fonts():
         return "Helvetica"
 
 
-# Регистрируем при импорте модуля
 ACTIVE_FONT = _register_fonts()
 
 
@@ -130,11 +133,75 @@ def _build_table(data: list, col_widths: list) -> Table:
     return table
 
 
+def _get_logo_image(width_mm: float = 40):
+    """Возвращает Image логотипа или None."""
+    if not LOGO_PATH.exists():
+        return None
+    try:
+        # Соотношение 1:0.33 примерно для горизонтальных логотипов
+        img = Image(str(LOGO_PATH),
+                    width=width_mm * mm,
+                    height=width_mm * mm * 0.33)
+        return img
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
-#  Основная функция
+#  Хедер и футер страницы
+# ---------------------------------------------------------------------------
+def draw_header_footer(canvas, doc, header_title: str = ""):
+    """
+    Рисует хедер (лого + заголовок) и футер (подпись + номер стр.)
+    на каждой странице PDF.
+    """
+    canvas.saveState()
+    width, height = doc.pagesize
+
+    # --- Хедер: логотип ---
+    logo = _get_logo_image(width_mm=30)
+    if logo:
+        try:
+            logo.drawOn(canvas, 12 * mm, height - 14 * mm)
+        except Exception:
+            pass
+
+    # --- Хедер: заголовок справа от лого ---
+    if header_title:
+        canvas.setFont(ACTIVE_FONT, 10)
+        canvas.setFillColor(colors.HexColor("#1F4E78"))
+        canvas.drawString(50 * mm, height - 11 * mm, header_title)
+
+    # --- Разделительная линия ---
+    canvas.setStrokeColor(colors.HexColor("#CCCCCC"))
+    canvas.setLineWidth(0.5)
+    canvas.line(12 * mm, height - 16 * mm, width - 12 * mm, height - 16 * mm)
+
+    # --- Футер: подпись слева ---
+    canvas.setFont(ACTIVE_FONT, 8)
+    canvas.setFillColor(colors.grey)
+    canvas.drawString(
+        12 * mm, 8 * mm,
+        f"АТП ТЛП · сформировано {datetime.now():%d.%m.%Y %H:%M}"
+    )
+
+    # --- Футер: номер страницы справа ---
+    canvas.drawRightString(width - 12 * mm, 8 * mm, f"Стр. {doc.page}")
+
+    canvas.restoreState()
+
+
+# ---------------------------------------------------------------------------
+#  Основная функция: сборка простого PDF из DataFrame
 # ---------------------------------------------------------------------------
 def build_pdf(title: str, df: pd.DataFrame, subtitle: str = "",
               max_rows: int = 1000) -> bytes:
+    """
+    Строит PDF из DataFrame (простой, без хедера/футера).
+    Используется в разделе «Экспорт» для выгрузки таблиц.
+
+    max_rows — максимум строк в PDF. Если больше — обрезается.
+    """
     buf = io.BytesIO()
 
     original_rows = len(df)
@@ -145,29 +212,22 @@ def build_pdf(title: str, df: pd.DataFrame, subtitle: str = "",
 
     doc = SimpleDocTemplate(
         buf, pagesize=page_size,
-        leftMargin=8*mm, rightMargin=8*mm,
-        topMargin=8*mm, bottomMargin=8*mm,
+        leftMargin=8 * mm, rightMargin=8 * mm,
+        topMargin=8 * mm, bottomMargin=8 * mm,
     )
 
     styles = getSampleStyleSheet()
-
-    # Все стили — с нашим шрифтом (иначе кириллица снова будет квадратиками)
-    h1 = ParagraphStyle(
-        "h1", parent=styles["Heading1"], fontName=ACTIVE_FONT,
-        fontSize=14, textColor=colors.HexColor("#1F4E78"),
-    )
-    h2 = ParagraphStyle(
-        "h2", parent=styles["Heading2"], fontName=ACTIVE_FONT,
-        fontSize=9, textColor=colors.grey,
-    )
-    warn_style = ParagraphStyle(
-        "warn", parent=styles["Normal"], fontName=ACTIVE_FONT,
-        fontSize=8, textColor=colors.HexColor("#B71C1C"),
-    )
-    cell_style = ParagraphStyle(
-        "cell", parent=styles["Normal"], fontName=ACTIVE_FONT,
-        fontSize=7, leading=9,
-    )
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"],
+                        fontName=ACTIVE_FONT, fontSize=14,
+                        textColor=colors.HexColor("#1F4E78"))
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"],
+                        fontName=ACTIVE_FONT, fontSize=9,
+                        textColor=colors.grey)
+    warn_style = ParagraphStyle("warn", parent=styles["Normal"],
+                                fontName=ACTIVE_FONT, fontSize=8,
+                                textColor=colors.HexColor("#B71C1C"))
+    cell_style = ParagraphStyle("cell", parent=styles["Normal"],
+                                fontName=ACTIVE_FONT, fontSize=7, leading=9)
 
     story = [Paragraph(title, h1)]
     if subtitle:
@@ -183,18 +243,20 @@ def build_pdf(title: str, df: pd.DataFrame, subtitle: str = "",
             warn_style,
         ))
 
-    story.append(Spacer(1, 4*mm))
+    story.append(Spacer(1, 4 * mm))
 
     if df.empty:
-        story.append(Paragraph("Нет данных для отображения.",
-                               ParagraphStyle("normal", parent=styles["Normal"],
-                                              fontName=ACTIVE_FONT, fontSize=10)))
+        story.append(Paragraph(
+            "Нет данных для отображения.",
+            ParagraphStyle("normal", parent=styles["Normal"],
+                           fontName=ACTIVE_FONT, fontSize=10),
+        ))
         doc.build(story)
         buf.seek(0)
         return buf.getvalue()
 
     n_cols = len(df.columns)
-    total_width = page_size[0] - 16*mm
+    total_width = page_size[0] - 16 * mm
     col_width = total_width / n_cols
 
     header = [Paragraph(f"<b>{_trim_cell(c, 60)}</b>", cell_style)
@@ -209,7 +271,7 @@ def build_pdf(title: str, df: pd.DataFrame, subtitle: str = "",
             data.append([Paragraph(_trim_cell(v), cell_style) for v in row])
         story.append(_build_table(data, [col_width] * n_cols))
         if chunk_idx < len(chunks) - 1:
-            story.append(Spacer(1, 3*mm))
+            story.append(Spacer(1, 3 * mm))
 
     doc.build(story)
     buf.seek(0)

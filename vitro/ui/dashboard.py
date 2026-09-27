@@ -24,6 +24,7 @@ from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.workdays import add_workdays, parse_date, workdays_between
 from vitro.ui._utils import download_plotly
+from vitro.pdf_builder import draw_header_footer
 
 
 # ---------------------------------------------------------------------------
@@ -717,8 +718,9 @@ def _build_dashboard_pdf(data: dict) -> bytes:
     buf = _io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(A4),
-        leftMargin=12*mm, rightMargin=12*mm,
-        topMargin=10*mm, bottomMargin=10*mm,
+        leftMargin=12 * mm, rightMargin=12 * mm,
+        topMargin=22 * mm,  # ← было 10
+        bottomMargin=15 * mm,  # ← было 10
     )
 
     styles = getSampleStyleSheet()
@@ -906,7 +908,13 @@ def _build_dashboard_pdf(data: dict) -> bytes:
     # =================================================================
     #  6. Финализация
     # =================================================================
-    doc.build(story)
+    doc.build(
+        story,
+        onFirstPage=lambda c, d: draw_header_footer(
+            c, d, "Дашборд РП — АТП ТЛП"),
+        onLaterPages=lambda c, d: draw_header_footer(
+            c, d, "Дашборд РП — АТП ТЛП"),
+    )
     buf.seek(0)
     return buf.getvalue()
 
