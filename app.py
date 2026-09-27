@@ -32,7 +32,7 @@ st.set_page_config(
     page_title="Замечания АТП ТЛП",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="collapsed",   # сайдбар не нужен
 )
 
 init_db()
@@ -50,65 +50,198 @@ if LOGO_PATH.exists():
         LOGO_B64 = ""
 
 # ---------------------------------------------------------------------------
+#  Модальный диалог ввода имени
+# ---------------------------------------------------------------------------
+@st.dialog("👤 Представьтесь")
+def ask_user_name():
+    """Модальное окно для ввода имени."""
+    st.write(
+        "Имя сохраняется вместе с категориями замечаний. "
+        "Оно будет отображаться в хедере и футере."
+    )
+    name = st.text_input(
+        "Фамилия и имя",
+        value=st.session_state.get("user", "")
+              if st.session_state.get("user") != "инженер" else "",
+        key="dialog_user_input",
+        placeholder="Например: Иванов Пётр",
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("💾 Сохранить", type="primary",
+                     use_container_width=True):
+            if name.strip():
+                st.session_state["user"] = name.strip()
+                st.session_state["user_confirmed"] = True
+                st.rerun()
+            else:
+                st.error("Введите имя")
+
+    with col2:
+        if st.button("Отмена", use_container_width=True):
+            if not st.session_state.get("user"):
+                st.session_state["user"] = "инженер"
+            st.session_state["user_confirmed"] = True
+            st.rerun()
+
+    # Инициализация session_state
+
+
+if "user" not in st.session_state:
+    st.session_state["user"] = ""
+if "user_confirmed" not in st.session_state:
+    st.session_state["user_confirmed"] = False
+
+    # Показываем диалог, если имя ещё не подтверждено
+if not st.session_state.get("user_confirmed"):
+    ask_user_name()
+
+user_label = st.session_state.get("user", "инженер")
+
+# ---------------------------------------------------------------------------
+#  Высота хедера
+# ---------------------------------------------------------------------------
+HEADER_HEIGHT_PX = 64
+
+# ---------------------------------------------------------------------------
 #  CSS
 # ---------------------------------------------------------------------------
-st.markdown("""
+st.markdown(f"""
 <style>
-    /* Убираем служебный хедер Streamlit */
-    header[data-testid="stHeader"] {
+    /* Скрываем служебный хедер Streamlit */
+    header[data-testid="stHeader"] {{
         display: none;
-    }
-    button[kind="header"] {
+    }}
+    button[kind="header"] {{
         display: none;
-    }
+    }}
 
-    /* Основной контейнер: отступы сверху (под хедер) и снизу (под футер) */
-    .block-container {
-        padding-top: 0.4rem !important;
+    /* Основной контейнер */
+    .block-container {{
+        padding-top: 5rem !important;
         padding-bottom: 3.5rem !important;
         max-width: 100% !important;
-    }
+    }}
 
-    /* Заголовок-хедер */
-    .app-title {
-        font-size: 0.95rem;
-        font-weight: 600;
-        color: #1F4E78;
-        line-height: 1.1;
-        margin: 0;
-    }
-    .app-subtitle {
-        font-size: 0.68rem;
-        color: #888;
-        margin-top: 2px;
-    }
-    .app-logo {
-        height: 42px;
-        margin-right: 12px;
-    }
+    /* Вкладки — прижаты к хедеру */
+    div[data-testid="stTabs"] div[data-baseweb="tab-list"],
+    div[data-baseweb="tab-list"],
+    [role="tablist"] {{
+        position: sticky !important;
+        top: {HEADER_HEIGHT_PX}px !important;
+        background: #ffffff !important;
+        z-index: 9999 !important;
+        padding: 4px 0 0 0 !important;
+        margin: 0 !important;
+        border-bottom: 1px solid #d0d0d0 !important;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05) !important;
+    }}
 
-    /* Компактные вкладки */
-    button[data-baseweb="tab"] {
+    div[data-baseweb="tab-list"] button[role="tab"],
+    button[role="tab"] {{
         font-size: 0.82rem !important;
         padding: 6px 10px !important;
-    }
+    }}
 
-    /* Компактные заголовки внутри вкладок */
-    h2 { font-size: 1.05rem !important; margin-top: 0.4rem !important; }
-    h3 { font-size: 0.95rem !important; }
+    h2 {{ font-size: 1.05rem !important; margin-top: 0.4rem !important; }}
+    h3 {{ font-size: 0.95rem !important; }}
+    div[data-testid="stMetricValue"] {{ font-size: 1.25rem !important; }}
+    div[data-testid="stMetricLabel"] {{ font-size: 0.7rem !important; }}
+    a.header-anchor {{ display: none !important; }}
 
-    /* Компактные метрики */
-    div[data-testid="stMetricValue"] { font-size: 1.25rem !important; }
-    div[data-testid="stMetricLabel"] { font-size: 0.7rem !important; }
+    /* Кнопка смены пользователя в хедере (правый верхний угол) */
+    .st-key-change_user_header_btn button {{
+        position: fixed !important;
+        top: 16px !important;
+        right: 16px !important;
+        z-index: 2147483647 !important;
+        width: auto !important;
+        height: 32px !important;
+        padding: 0 12px !important;
+        font-size: 12px !important;
+        background: #ffffff !important;
+        border: 1px solid #d0d0d0 !important;
+        border-radius: 6px !important;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05) !important;
+        color: #1F4E78 !important;
+    }}
+
+    .st-key-change_user_header_btn button:hover {{
+        background: #f0f0f0 !important;
+        border-color: #1F4E78 !important;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-#  ФУТЕР — через st.html, рендерим ДО вкладок,
-#  чтобы он не попал в контейнер контента
+#  ХЕДЕР
 # ---------------------------------------------------------------------------
-user_label = st.session_state.get("user", "инженер")
+HEADER_HTML = f"""
+<style>
+    .atp-header {{
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: #ffffff;
+        border-bottom: 1px solid #d0d0d0;
+        padding: 8px 200px 8px 16px;   /* правый отступ 200px под кнопку */
+        z-index: 2147483646;
+        height: {HEADER_HEIGHT_PX}px;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+    }}
+    .atp-header .logo {{
+        height: 42px;
+        margin-right: 14px;
+    }}
+    .atp-header .title {{
+        font-size: 14px;
+        font-weight: 600;
+        color: #1F4E78;
+        line-height: 1.2;
+    }}
+    .atp-header .subtitle {{
+        font-size: 11px;
+        color: #888;
+        margin-top: 2px;
+    }}
+</style>
+<div class="atp-header">
+    {'<img src="data:image/png;base64,' + LOGO_B64 + '" class="logo" alt="АТП ТЛП"/>' if LOGO_B64 else ''}
+    <div>
+        <div class="title">Замечания по комплектам РД — АТП ТЛП</div>
+        <div class="subtitle">Витрокад / SharePoint → SQLite → Аналитика</div>
+    </div>
+</div>
+"""
 
+try:
+    st.html(HEADER_HTML)
+except AttributeError:
+    st.markdown(HEADER_HTML, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+#  Кнопка смены пользователя (правый верхний угол, через CSS fixed)
+# ---------------------------------------------------------------------------
+def _open_user_dialog():
+    st.session_state["user_confirmed"] = False
+    st.rerun()
+
+st.button(
+    f"👤 {user_label}",
+    key="change_user_header_btn",
+    on_click=_open_user_dialog,
+)
+
+# ---------------------------------------------------------------------------
+#  ФУТЕР
+# ---------------------------------------------------------------------------
 FOOTER_HTML = f"""
 <style>
     .atp-footer {{
@@ -140,48 +273,10 @@ FOOTER_HTML = f"""
 try:
     st.html(FOOTER_HTML)
 except AttributeError:
-    # Fallback для Streamlit < 1.35
     st.markdown(FOOTER_HTML, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-#  ХЕДЕР
-# ---------------------------------------------------------------------------
-header_left, header_right = st.columns([5, 1])
-
-with header_left:
-    if LOGO_B64:
-        st.markdown(
-            f"""
-            <div style="display: flex; align-items: center;">
-                <img src="data:image/png;base64,{LOGO_B64}"
-                     class="app-logo" alt="АТП ТЛП"/>
-                <div>
-                    <div class="app-title">Замечания по комплектам РД — АТП ТЛП</div>
-                    <div class="app-subtitle">Витрокад / SharePoint → SQLite → Аналитика</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            "<div class='app-title'>📊 Замечания по комплектам РД — АТП ТЛП</div>"
-            "<div class='app-subtitle'>Витрокад / SharePoint → SQLite → Аналитика</div>",
-            unsafe_allow_html=True,
-        )
-
-with header_right:
-    user = st.text_input(
-        "Пользователь",
-        value=st.session_state.get("user", ""),
-        key="user_input",
-        placeholder="Введите имя",
-        label_visibility="collapsed",
-    )
-    st.session_state["user"] = user.strip() or "инженер"
-
-# ---------------------------------------------------------------------------
-#  Вкладки (13 штук)
+#  Вкладки (14 штук)
 # ---------------------------------------------------------------------------
 tabs = st.tabs([
     "📊 Дашборд РП",
@@ -194,7 +289,7 @@ tabs = st.tabs([
     "🔍 Поиск",
     "📈 Динамика",
     "🔁 Ревизии",
-    "🔮 Прогноз",     # ← новая
+    "🔮 Прогноз",
     "📄 Экспорт",
     "📜 Логи",
     "⚙️ Управление",
@@ -210,7 +305,7 @@ with tabs[6]:  authors.render()
 with tabs[7]:  search.render()
 with tabs[8]:  dynamics.render()
 with tabs[9]:  revisions.render()
-with tabs[10]: forecast.render()   # ← новая
+with tabs[10]: forecast.render()
 with tabs[11]: export.render()
 with tabs[12]: logs.render()
 with tabs[13]: admin.render()

@@ -169,81 +169,72 @@ def _render_kpi(data: dict) -> dict:
 #  Прогноз на 6 месяцев вперёд
 # ---------------------------------------------------------------------------
 def _build_forecast(data: dict, kpi: dict) -> pd.DataFrame:
-    """Линейная экстраполяция на 6 месяцев вперёд."""
+    """
+    Экстраполяция активных замечаний при разных сценариях ускорения.
+
+    Для каждого сценария (uplift %) рассчитываем, как меняется
+    количество активных замечаний по месяцам вперёд до нуля.
+    """
     monthly = data["monthly"]
     if monthly.empty or not kpi:
         return pd.DataFrame()
-
-    # Последний месяц в данных
-    last_ym = monthly["ym"].iloc[-1]
-    last_date = datetime.strptime(last_ym + "-01", "%Y-%m-%d").date()
-
-    # Генерируем 6 месяцев вперёд
-    months_forward = []
-    for i in range(1, 7):
-        d = last_date + timedelta(days=30 * i)
-        months_forward.append(d.strftime("%Y-%m"))
 
     avg_issue = kpi["avg_issue"]
     avg_fix = kpi["avg_fix"]
     current_active = kpi["active"]
 
+    # Последний месяц в данных
+    last_ym = monthly["ym"].iloc[-1]
+    last_date = datetime.strptime(last_ym + "-01", "%Y-%m-%d").date()
+
+    # Максимум 60 месяцев (5 лет) — чтобы график не тянулся бесконечно
+    MAX_MONTHS = 60
+
+    # Сценарии ускорения (в %)
+    scenarios = [
+        ("+0% (текущий)", 0, "#E57373"),
+        ("+50%", 50, "#FFB74D"),
+        ("+100%", 100, "#FFD54F"),
+        ("+150%", 150, "#A5D6A7"),
+        ("+200%", 200, "#4CAF50"),
+        ("+300%", 300, "#1B5E20"),
+    ]
+
     rows = []
-    # Начинаем с текущего месяца (реальные данные)
+
+    # Точка «сейчас»
     rows.append({
         "ym": last_ym,
-        "Сценарий": "История",
-        "Выдано": int(monthly["Выдано"].iloc[-1]),
-        "Отвечено": int(monthly["Отвечено"].iloc[-1]),
+        "Сценарий": "Сейчас",
         "Активных": int(current_active),
-        "Накоплено": 0,
+        "Цвет": "#1F4E78",
     })
 
-    cumulative_backlog = 0
-    active_now = current_active
+    for scenario_name, uplift_pct, color in scenarios:
+        # Темп ответов с учётом ускорения
+        rate = avg_fix * (1 + uplift_pct / 100)
+        delta = avg_issue - rate  # положительное = задолженность растёт
 
-    # Базовый сценарий
-    for i, ym in enumerate(months_forward, start=1):
-        cumulative_backlog += (avg_issue - avg_fix)
-        active_now += (avg_issue - avg_fix)
-        rows.append({
-            "ym": ym,
-            "Сценарий": "Базовый",
-            "Выдано": int(avg_issue),
-            "Отвечено": int(avg_fix),
-            "Активных": int(max(active_now, 0)),
-            "Накоплено": int(cumulative_backlog),
-        })
+        active = current_active
+        for i in range(1, MAX_MONTHS + 1):
+            # Через 30*i дней от последнего месяца
+            d = last_date + timedelta(days=30 * i)
+            ym = d.strftime("%Y-%m")
 
-    # Оптимистичный (+20% к темпам ответов)
-    cumulative_opt = 0
-    active_opt = current_active
-    for ym in months_forward:
-        cumulative_opt += (avg_issue - avg_fix * 1.2)
-        active_opt += (avg_issue - avg_fix * 1.2)
-        rows.append({
-            "ym": ym,
-            "Сценарий": "Оптимистичный",
-            "Выдано": int(avg_issue),
-            "Отвечено": int(avg_fix * 1.2),
-            "Активных": int(max(active_opt, 0)),
-            "Накоплено": int(cumulative_opt),
-        })
+            active = active + (avg_issue - rate)
+            if active < 0:
+                active = 0
 
-    # Пессимистичный (−20%)
-    cumulative_pess = 0
-    active_pess = current_active
-    for ym in months_forward:
-        cumulative_pess += (avg_issue - avg_fix * 0.8)
-        active_pess += (avg_issue - avg_fix * 0.8)
-        rows.append({
-            "ym": ym,
-            "Сценарий": "Пессимистичный",
-            "Выдано": int(avg_issue),
-            "Отвечено": int(avg_fix * 0.8),
-            "Активных": int(max(active_pess, 0)),
-            "Накоплено": int(cumulative_pess),
-        })
+            rows.append({
+                "ym": ym,
+                "Сценарий": scenario_name,
+                "Активных": int(active),
+                "Цвет": color,
+            })
+
+            # Прекращаем, когда дошли до нуля
+            if active <= 0:
+                break
 
     return pd.DataFrame(rows)
 
@@ -252,111 +243,194 @@ def _build_forecast(data: dict, kpi: dict) -> pd.DataFrame:
 #  KPI прогноза
 # ---------------------------------------------------------------------------
 def _render_forecast_kpi(forecast: pd.DataFrame, kpi: dict):
+    """Компактные метрики текущего состояния."""
     if forecast.empty:
         return
 
-    st.markdown("##### 🔮 Прогноз")
-
-    # Найти базовый сценарий через 6 месяцев
-    base_6m = forecast[(forecast["Сценарий"] == "Базовый")].iloc[-1]
-    opt_6m = forecast[(forecast["Сценарий"] == "Оптимистичный")].iloc[-1]
-    pess_6m = forecast[(forecast["Сценарий"] == "Пессимистичный")].iloc[-1]
-
     active_now = kpi["active"]
+    avg_issue = kpi["avg_issue"]
+    avg_fix = kpi["avg_fix"]
+    avg_delta = avg_issue - avg_fix
+
+    st.markdown("##### 🔮 Текущее состояние")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Активных сейчас",
               f"{int(active_now):,}".replace(",", " "))
-    c2.metric("Базовый через 6 мес",
-              f"{int(base_6m['Активных']):,}".replace(",", " "),
-              delta=f"+{int(base_6m['Активных'] - active_now):,}"
-                    .replace(",", " ") if base_6m['Активных'] > active_now else "стабильно",
-              delta_color="inverse")
-    c3.metric("Оптимистичный",
-              f"{int(opt_6m['Активных']):,}".replace(",", " "),
-              delta=f"+{int(opt_6m['Активных'] - active_now):,}"
-                    .replace(",", " ") if opt_6m['Активных'] > active_now else "стабильно",
-              delta_color="inverse")
-    c4.metric("Пессимистичный",
-              f"{int(pess_6m['Активных']):,}".replace(",", " "),
-              delta=f"+{int(pess_6m['Активных'] - active_now):,}"
-                    .replace(",", " ") if pess_6m['Активных'] > active_now else "стабильно",
-              delta_color="inverse")
+    c2.metric("Приходит в месяц",
+              f"{int(avg_issue):,}".replace(",", " "))
+    c3.metric("Отвечаем в месяц",
+              f"{int(avg_fix):,}".replace(",", " "))
+    c4.metric(
+        "Баланс",
+        f"{int(avg_delta):+,}".replace(",", " "),
+        delta="задолженность растёт" if avg_delta > 0 else "разгребаем",
+        delta_color="inverse" if avg_delta > 0 else "normal",
+    )
 
 
 # ---------------------------------------------------------------------------
 #  График прогноза
 # ---------------------------------------------------------------------------
 def _render_forecast_chart(forecast: pd.DataFrame, kpi: dict):
-    st.markdown("### 📈 Прогноз накопления активных замечаний (6 месяцев)")
+    """График прогноза полного устранения замечаний при разных сценариях."""
+    st.markdown("### 📈 Прогноз полного устранения замечаний")
 
     if forecast.empty:
         st.info("Нет данных.")
         return
 
-    # Фильтруем только нужные сценарии (без истории)
-    fc = forecast[forecast["Сценарий"] != "История"]
+    # Убираем точку «Сейчас» из линий — она только для отметки
+    fc = forecast[forecast["Сценарий"] != "Сейчас"].copy()
+    if fc.empty:
+        return
+
+    # Цвета по сценариям (первое вхождение)
+    color_map = (
+        fc[["Сценарий", "Цвет"]]
+        .drop_duplicates("Сценарий")
+        .set_index("Сценарий")["Цвет"]
+        .to_dict()
+    )
 
     fig = go.Figure()
 
-    color_map = {
-        "Базовый": "#FF9800",
-        "Оптимистичный": "#4CAF50",
-        "Пессимистичный": "#E57373",
-    }
-
-    for scenario in ["Оптимистичный", "Базовый", "Пессимистичный"]:
-        sub = fc[fc["Сценарий"] == scenario]
-        fig.add_trace(go.Scatter(
-            x=sub["ym"], y=sub["Активных"],
-            mode="lines+markers",
-            name=scenario,
-            line=dict(color=color_map[scenario], width=3),
-            marker=dict(size=8),
-        ))
-
-    # Точка «сейчас»
+    # Точка «Сейчас»
     fig.add_trace(go.Scatter(
         x=[forecast.iloc[0]["ym"]],
         y=[kpi["active"]],
         mode="markers",
         name="Сейчас",
-        marker=dict(color="#1F4E78", size=14, symbol="diamond"),
+        marker=dict(color="#1F4E78", size=14, symbol="diamond",
+                    line=dict(color="white", width=2)),
+        hovertemplate="<b>Сейчас</b><br>%{y:,} активных<extra></extra>",
     ))
 
+    # Линии сценариев
+    for scenario in fc["Сценарий"].unique():
+        sub = fc[fc["Сценарий"] == scenario]
+        color = color_map.get(scenario, "#888")
+
+        # Определяем дату завершения (последняя точка на нуле)
+        last_row = sub[sub["Активных"] == 0]
+        end_label = ""
+        if not last_row.empty:
+            end_ym = last_row.iloc[0]["ym"]
+            end_label = f" → 0 к {end_ym}"
+
+        fig.add_trace(go.Scatter(
+            x=sub["ym"], y=sub["Активных"],
+            mode="lines+markers",
+            name=scenario + end_label,
+            line=dict(color=color, width=3),
+            marker=dict(size=6),
+            hovertemplate=(
+                f"<b>{scenario}</b><br>"
+                "%{x}<br>%{y:,} активных<extra></extra>"
+            ),
+        ))
+
+    # Горизонтальная линия y=0 — «всё закрыто»
+    fig.add_hline(
+        y=0,
+        line_dash="dash",
+        line_color="#2E7D32",
+        line_width=2,
+        annotation_text="Процесс завершён",
+        annotation_position="right",
+        annotation_font_color="#2E7D32",
+        annotation_font_size=11,
+    )
+
     fig.update_layout(
-        height=450,
+        height=550,
         xaxis_title="Месяц",
         yaxis_title="Активных замечаний",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom",
-                    y=1.02, xanchor="right", x=1),
+        legend=dict(
+            orientation="v",
+            yanchor="top", y=1,
+            xanchor="left", x=1.02,
+            font=dict(size=11),
+        ),
+        margin=dict(l=60, r=200, t=40, b=60),
     )
     st.plotly_chart(fig, use_container_width=True)
-    download_plotly(fig, "Прогноз_активных", "forecast_active",
-                    width=1400, height=600)
+    download_plotly(fig, "Прогноз_устранения", "forecast_cleanup",
+                    width=1400, height=700)
+
+    # Пояснение
+    st.caption(
+        "**Как читать:** каждая линия — сценарий ускорения команды. "
+        "**Пересечение с пунктирной линией** — месяц, когда все замечания "
+        "будут закрыты. **Красная линия (+0%)** — текущий темп: "
+        "задолженность не уменьшается, процесс никогда не завершится. "
+        "**Зелёные линии** — реалистичные сценарии с разным уровнем ресурсов."
+    )
+
+    # Сводка по сценариям
+    st.markdown("#### 📊 Сценарии завершения")
+
+    summary = []
+    for scenario in fc["Сценарий"].unique():
+        sub = fc[fc["Сценарий"] == scenario]
+        last = sub.iloc[-1]
+
+        if last["Активных"] == 0:
+            # Нашли дату завершения
+            end_ym = last["ym"]
+            months = len(sub)
+            summary.append({
+                "Сценарий": scenario,
+                "Месяцев": months,
+                "Дата завершения": end_ym,
+            })
+        else:
+            summary.append({
+                "Сценарий": scenario,
+                "Месяцев": "—",
+                "Дата завершения": f"не завершится",
+            })
+
+    if summary:
+        df_summary = pd.DataFrame(summary)
+        st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
     # Вывод
-    base_6m = fc[fc["Сценарий"] == "Базовый"].iloc[-1]
-    growth = base_6m["Активных"] - kpi["active"]
+    st.divider()
+    st.markdown("#### 🎯 Ключевые выводы")
 
-    if growth > kpi["active"] * 0.5:
+    # Проверяем, сколько сценариев доходят до нуля
+    resolved = [s for s in summary if s["Месяцев"] != "—"]
+
+    if not resolved:
         st.error(
-            f"🔴 **Базовый сценарий: рост на {int(growth):,} замечаний "
-            f"за 6 месяцев.** Если темп не изменится, задолженность вырастет "
-            f"с {int(kpi['active']):,} до {int(base_6m['Активных']):,}."
-            .replace(",", " ")
-        )
-    elif growth > 0:
-        st.warning(
-            f"🟡 **Задолженность медленно растёт:** +{int(growth):,} "
-            f"за 6 месяцев. Рекомендуется усилить команду."
-            .replace(",", " ")
+            "🔴 **Ни один сценарий не завершает процесс за 5 лет.** "
+            "Темп ответов нужно увеличить значительно — минимум в "
+            "2 раза. Обратитесь к руководству за расширением команды."
         )
     else:
+        fastest = min(resolved, key=lambda x: x["Месяцев"])
+        slowest = max(resolved, key=lambda x: x["Месяцев"])
+
+        c1, c2 = st.columns(2)
+        c1.metric(
+            "Самый быстрый сценарий",
+            fastest["Сценарий"],
+            delta=f"{fastest['Месяцев']} мес. → {fastest['Дата завершения']}",
+            delta_color="off",
+        )
+        c2.metric(
+            "Самый долгий из реалистичных",
+            slowest["Сценарий"],
+            delta=f"{slowest['Месяцев']} мес. → {slowest['Дата завершения']}",
+            delta_color="off",
+        )
+
         st.success(
-            f"✅ **Тренд положительный:** задолженность не растёт. "
-            f"Даже в пессимистичном сценарии команда справляется."
+            f"✅ **Реалистичные сценарии:** проект можно завершить за "
+            f"**{fastest['Месяцев']}–{slowest['Месяцев']}** месяцев "
+            f"при ускорении команды."
         )
 
 
@@ -364,58 +438,160 @@ def _render_forecast_chart(forecast: pd.DataFrame, kpi: dict):
 #  «Когда разгребём задолженность»
 # ---------------------------------------------------------------------------
 def _render_cleanup_eta(kpi: dict):
-    st.markdown("### ⏳ Когда разгребём текущую задолженность?")
+    """
+    Отвечает на вопрос: «Когда завершится процесс устранения замечаний?»
+
+    Три сценария:
+      1. Текущий темп — никогда.
+      2. Целевой темп (+20%) — через N месяцев.
+      3. Ускорение x раз — через M месяцев.
+    """
+    st.markdown("### ⏳ Когда завершится устранение замечаний?")
 
     active = kpi["active"]
+    avg_issue = kpi["avg_issue"]
+    avg_fix = kpi["avg_fix"]
     avg_delta = kpi["avg_delta"]
 
-    if active == 0:
-        st.success("🎉 Задолженности нет!")
-        return
+    # Сценарий 1: текущий темп
+    st.markdown("#### 🔴 Сценарий 1: текущий темп")
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Активных сейчас", f"{int(active):,}".replace(",", " "))
+    c2.metric("Выдача в месяц", f"{int(avg_issue):,}/мес".replace(",", " "))
+    c3.metric("Наши ответы в месяц", f"{int(avg_fix):,}/мес".replace(",", " "))
 
-    # Если дельта положительная — разгрести не получится
     if avg_delta >= 0:
-        with c1:
-            st.error(
-                f"🔴 **При текущем темпе задолженность НЕ уменьшится.** "
-                f"Ежемесячный прирост: **+{int(avg_delta)}** замечаний. "
-                f"Выдаём больше, чем отвечаем."
-            )
-        with c2:
-            # Сколько нужно ускориться
-            current_fix = kpi["avg_fix"]
-            target_fix = kpi["avg_issue"] + 200
-            needed = round((target_fix / current_fix - 1) * 100)
-
-            st.metric(
-                "Нужно ускориться на",
-                f"{needed}%",
-                help=f"Сейчас отвечаем {int(current_fix)}/мес, "
-                     f"нужно {int(target_fix)}/мес, чтобы разгребать",
-            )
+        st.error(
+            f"🔴 **Процесс НЕ завершится в текущем темпе.** "
+            f"Задолженность растёт на **+{int(avg_delta):,}/мес**. "
+            f"Мы отвечаем на **{int(avg_fix)}** замечаний, а приходит "
+            f"**{int(avg_issue)}** — не успеваем.".replace(",", " ")
+        )
     else:
-        # Разгребаем
         months = int(active / abs(avg_delta))
-        eta_date = date.today() + timedelta(days=30 * months)
+        eta = date.today() + timedelta(days=30 * months)
+        st.success(
+            f"✅ **Процесс завершится через {months} мес.** "
+            f"При текущем темпе задолженность уменьшается на "
+            f"**{int(abs(avg_delta))}/мес**."
+            .replace(",", " ")
+        )
+        st.info(f"📅 Ожидаемая дата завершения: **{eta.strftime('%m.%Y')}**")
 
-        with c1:
-            st.success(
-                f"✅ **Задолженность уменьшается на "
-                f"{int(abs(avg_delta))}/мес.** "
-                f"При текущем темпе разгребём через **{months} мес.**"
-                .replace(",", " ")
-            )
-        with c2:
-            st.metric("Прогноз «нуля»",
-                      f"{eta_date.strftime('%m.%Y')}",
-                      help=f"Месяцев до полного закрытия: {months}")
+    st.divider()
+
+    # Сценарий 2: целевой темп (выдача + 20%)
+    st.markdown("#### 🟢 Сценарий 2: целевой темп (разгребаем)")
+
+    target_rate = avg_issue * 1.2
+    needed_uplift = round((target_rate / avg_fix - 1) * 100)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Целевой темп ответов",
+        f"{int(target_rate):,}/мес".replace(",", " "),
+        help="Выдача × 1.2 — чтобы задолженность уменьшалась",
+    )
+    c2.metric(
+        "Нужно ускориться на",
+        f"{needed_uplift}%",
+        delta="проблема" if needed_uplift > 100 else None,
+        delta_color="inverse",
+    )
+
+    # Сколько месяцев до нуля при целевом темпе
+    cleanup_speed = target_rate - avg_issue
+    if cleanup_speed > 0:
+        months_target = int(active / cleanup_speed)
+        eta_target = date.today() + timedelta(days=30 * months_target)
+
+        c3.metric(
+            "Закроем через",
+            f"{months_target} мес.",
+            help=f"Ожидаемая дата: {eta_target.strftime('%m.%Y')}",
+        )
+
+        st.success(
+            f"✅ **Если ускоримся на {needed_uplift}%** — закроем "
+            f"все {int(active):,} замечаний за **{months_target} мес.** "
+            f"(к {eta_target.strftime('%m.%Y')})."
+            .replace(",", " ")
+        )
+    else:
+        st.warning("Не удалось рассчитать — данные недостаточны.")
+
+    st.divider()
+
+    # Сценарий 3: разные варианты ускорения
+    st.markdown("#### 📊 Таблица сценариев ускорения")
+
+    rows = []
+    for uplift_pct in [0, 20, 50, 100, 150, 200]:
+        rate = avg_fix * (1 + uplift_pct / 100)
+        delta = rate - avg_issue
+
+        if delta > 0:
+            months = int(active / delta)
+            eta = date.today() + timedelta(days=30 * months)
+            rows.append({
+                "Ускорение": f"+{uplift_pct}%",
+                "Темп ответов": f"{int(rate):,}/мес".replace(",", " "),
+                "Скорость разгребания": f"−{int(delta):,}/мес".replace(",", " "),
+                "Месяцев до нуля": months,
+                "Дата завершения": eta.strftime("%m.%Y"),
+            })
+        else:
+            rows.append({
+                "Ускорение": f"+{uplift_pct}%",
+                "Темп ответов": f"{int(rate):,}/мес".replace(",", " "),
+                "Скорость разгребания": f"+{int(-delta):,}/мес (рост)".replace(",", " "),
+                "Месяцев до нуля": "никогда",
+                "Дата завершения": "—",
+            })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.caption(
-        "**Допущения:** темп не меняется, заказчик не присылает новые "
-        "замечания сверх текущего. На практике прогноз может сдвигаться."
+        "**Как читать:** таблица показывает, при каком ускорении команды "
+        "мы закроем все замечания и когда. Строка с **+0%** — это текущий "
+        "темп (задолженность растёт). Строки с положительными процентами — "
+        "разные сценарии ускорения."
     )
+
+    st.divider()
+
+    # Практические рекомендации
+    st.markdown("#### 💡 Что это значит")
+
+    if needed_uplift > 100:
+        st.error(
+            f"🔴 **Нужно ускориться в **{round(target_rate / avg_fix, 1)} раза**. "
+            f"Текущего состава команды недостаточно — требуется "
+            f"дополнительно **{round((target_rate - avg_fix) / avg_fix, 1)}×** "
+            f"к мощности. Варианты:\n\n"
+            f"1. Привлечь **{int((target_rate - avg_fix) / avg_fix * 10)}** "
+            f"дополнительных специалистов\n"
+            f"2. Автоматизировать типовые ответы\n"
+            f"3. Пересмотреть процесс приёмки замечаний с заказчиком"
+        )
+    elif needed_uplift > 50:
+        st.warning(
+            f"🟡 **Нужно ускориться на {needed_uplift}%**. "
+            f"Это возможно при небольшой оптимизации процесса: "
+            f"дополнительный специалист или перераспределение нагрузки."
+        )
+    elif needed_uplift > 0:
+        st.success(
+            f"✅ **Достаточно ускориться на {needed_uplift}%** — это "
+            f"реалистично без расширения команды. Можно разгрести."
+        )
+    else:
+        st.success(
+            "✅ Команда уже разгребает задолженность. "
+            "Темп достаточный."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -500,37 +676,246 @@ def _render_risk_complexes():
 #  По дисциплинам
 # ---------------------------------------------------------------------------
 def _render_by_discipline(data: dict):
-    st.markdown("### 🏷 Прогноз по дисциплинам")
+    """
+    Прогноз по дисциплинам с акцентом на % покрытия темпа.
+    """
+    st.markdown("### 🏷 Покрытие темпа по дисциплинам")
 
-    df = data["by_disc"]
-    if df.empty:
-        st.info("Нет данных.")
+    st.caption(
+        "**Что это значит:** для каждой дисциплины сравниваем, сколько "
+        "замечаний приходит (выдача) и сколько мы успеваем закрыть (ответы). "
+        "**100%** — успеваем закрывать все новые замечания, долг не растёт. "
+        "**<50%** — отстаём сильно."
+    )
+
+    df_disc = data["by_disc"]
+
+    if df_disc.empty:
+        st.info("Нет данных по дисциплинам.")
         return
 
-    df = df.copy()
+    # Темпы за последние 3 месяца
+    with get_conn() as conn:
+        rates = pd.read_sql("""
+            SELECT
+                d.discipline AS discipline,
+                SUM(CASE WHEN substr(c.created, 1, 7) >=
+                         strftime('%Y-%m', 'now', '-3 months')
+                         THEN 1 ELSE 0 END) AS issue_3m,
+                SUM(CASE WHEN substr(c.fix_date, 1, 7) >=
+                         strftime('%Y-%m', 'now', '-3 months')
+                         AND c.status IN ('Закрыто', 'Выполнено')
+                         THEN 1 ELSE 0 END) AS fix_3m
+            FROM comments c
+            JOIN documents d ON c.doc_id = d.id
+            WHERE d.discipline IS NOT NULL
+            GROUP BY d.discipline
+        """, conn)
+
+    if rates.empty:
+        st.warning("Нет данных по темпам за последние 3 месяца.")
+        return
+
+    df = df_disc.merge(rates, on="discipline", how="left").fillna(0)
+
+    df["issue_month"] = (df["issue_3m"] / 3).round(0).astype(int)
+    df["fix_month"] = (df["fix_3m"] / 3).round(0).astype(int)
+
+    df["coverage"] = df.apply(
+        lambda r: round(r["fix_month"] / r["issue_month"] * 100, 1)
+        if r["issue_month"] > 0 else 100.0,
+        axis=1,
+    )
+    df["delta_month"] = df["issue_month"] - df["fix_month"]
     df["pct"] = df.apply(
         lambda r: round(r["closed"] / r["total"] * 100, 1) if r["total"] else 0,
         axis=1,
     )
-    df["name"] = df["discipline"].apply(discipline_name)
-    df = df.sort_values("active", ascending=False)
 
-    fig = px.bar(
-        df, x="discipline", y=["closed", "active"],
-        barmode="stack",
-        labels={"discipline": "Дисциплина", "value": "Замечаний",
-                "variable": "Статус"},
-        color_discrete_map={"closed": "#2E7D32", "active": "#E57373"},
-        title="Закрыто vs Активных по дисциплинам",
+    df = df.sort_values("coverage", ascending=True)
+
+    # =====================================================================
+    #  ГРАФИК: % покрытия
+    # =====================================================================
+    st.markdown("#### 📊 Покрытие темпа по дисциплинам")
+
+    def _coverage_color(c):
+        if c >= 90:  return "#2E7D32"
+        if c >= 70:  return "#A5D6A7"
+        if c >= 50:  return "#FFD54F"
+        if c >= 30:  return "#FFB74D"
+        return "#E57373"
+
+    chart_df = df.copy()
+    chart_df["color"] = chart_df["coverage"].apply(_coverage_color)
+    chart_df = chart_df.sort_values("coverage", ascending=True)
+
+    fig = go.Figure()
+    for _, row in chart_df.iterrows():
+        fig.add_trace(go.Bar(
+            x=[row["coverage"]],
+            y=[row["discipline"]],
+            orientation="h",
+            marker=dict(color=row["color"]),
+            text=[f"{row['coverage']:.0f}%"],
+            textposition="outside",
+            hovertemplate=(
+                f"<b>{row['discipline']}</b><br>"
+                f"Приходит: {row['issue_month']}/мес<br>"
+                f"Отвечаем: {row['fix_month']}/мес<br>"
+                f"Покрытие: {row['coverage']:.1f}%<br>"
+                f"Активных: {row['active']:,}"
+                "<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
+    fig.add_vline(
+        x=100, line_dash="dash", line_color="#2E7D32", line_width=2,
+        annotation_text="100% — успеваем",
+        annotation_position="top right",
+        annotation_font_color="#2E7D32", annotation_font_size=11,
     )
+
     fig.update_layout(
-        height=450, xaxis_tickangle=-45,
-        legend=dict(orientation="h", yanchor="bottom",
-                    y=1.02, xanchor="right", x=1),
+        height=max(400, 40 * len(chart_df)),
+        xaxis_title="Покрытие темпа, % (отвечаем / приходит)",
+        yaxis_title="",
+        bargap=0.3,
+        xaxis=dict(range=[0, 130]),
+        margin=dict(l=120, r=60, t=30, b=40),
     )
     st.plotly_chart(fig, use_container_width=True)
-    download_plotly(fig, "Прогноз_по_дисциплинам", "forecast_disc",
-                    width=1400, height=600)
+    download_plotly(fig, "Прогноз_покрытие_по_дисциплинам",
+                    "fc_disc_coverage", width=1400, height=600)
+
+    st.caption(
+        "**Как читать:** полоса **до 100%** — дисциплина успевает "
+        "закрывать новые замечания. **Меньше 100%** — задолженность растёт."
+    )
+
+    # =====================================================================
+    #  ГРУППЫ
+    # =====================================================================
+    st.divider()
+    st.markdown("#### 🎯 Группировка по состоянию")
+
+    good = df[df["coverage"] >= 80]
+    ok = df[(df["coverage"] >= 50) & (df["coverage"] < 80)]
+    bad = df[df["coverage"] < 50]
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"##### 🟢 Успевают ({len(good)})")
+        if good.empty:
+            st.caption("Нет таких дисциплин.")
+        else:
+            for _, r in good.iterrows():
+                st.caption(f"**{r['discipline']}** — {r['coverage']:.0f}%")
+    with c2:
+        st.markdown(f"##### 🟡 Частично ({len(ok)})")
+        if ok.empty:
+            st.caption("Нет таких дисциплин.")
+        else:
+            for _, r in ok.iterrows():
+                st.caption(f"**{r['discipline']}** — {r['coverage']:.0f}%")
+    with c3:
+        st.markdown(f"##### 🔴 Отстают ({len(bad)})")
+        if bad.empty:
+            st.caption("Нет таких дисциплин.")
+        else:
+            for _, r in bad.iterrows():
+                st.caption(f"**{r['discipline']}** — {r['coverage']:.0f}%")
+
+    # =====================================================================
+    #  ТАБЛИЦА
+    # =====================================================================
+    st.divider()
+    st.markdown("#### 📋 Детали")
+
+    table = df[[
+        "discipline", "total", "closed", "pct", "active",
+        "issue_month", "fix_month", "delta_month", "coverage",
+    ]].copy()
+
+    def _status(c):
+        if c >= 90: return "🟢"
+        if c >= 70: return "🟡"
+        if c >= 50: return "🟠"
+        return "🔴"
+
+    table.insert(0, "🚦", table["coverage"].apply(_status))
+
+    table = table.rename(columns={
+        "discipline": "Дисциплина",
+        "total": "Всего",
+        "closed": "Закрыто",
+        "pct": "% вып.",
+        "active": "Активных",
+        "issue_month": "Приходит/мес",
+        "fix_month": "Отвечаем/мес",
+        "delta_month": "Баланс/мес",
+        "coverage": "Покрытие %",
+    })
+
+    st.dataframe(
+        table, use_container_width=True, hide_index=True,
+        column_config={
+            "% вып.": st.column_config.ProgressColumn(
+                "% вып.", min_value=0, max_value=100, format="%.1f%%"),
+            "Покрытие %": st.column_config.ProgressColumn(
+                "Покрытие %", min_value=0, max_value=130, format="%.1f%%"),
+            "Баланс/мес": st.column_config.NumberColumn(
+                "Баланс/мес", format="%+d"),
+        },
+    )
+
+    # =====================================================================
+    #  ВЫВОД
+    # =====================================================================
+    st.divider()
+    st.markdown("#### 🎯 Ключевые выводы")
+
+    total_issue = df["issue_month"].sum()
+    total_fix = df["fix_month"].sum()
+    overall_coverage = round(total_fix / total_issue * 100, 1) if total_issue else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Приходит/мес", f"{int(total_issue):,}".replace(",", " "))
+    c2.metric("Отвечаем/мес", f"{int(total_fix):,}".replace(",", " "))
+    c3.metric("Общее покрытие", f"{overall_coverage}%",
+              delta="отстаём" if overall_coverage < 100 else "успеваем",
+              delta_color="inverse" if overall_coverage < 100 else "normal")
+
+    if overall_coverage >= 90:
+        st.success(
+            "✅ Команда почти успевает. Небольшая оптимизация — и выйдем в ноль."
+        )
+    elif overall_coverage >= 60:
+        st.warning(
+            f"🟡 **Отставание на {100 - overall_coverage:.0f}%**. "
+            f"Нужен 1–2 дополнительных специалиста или оптимизация процесса."
+        )
+    else:
+        st.error(
+            f"🔴 **Критическое отставание.** Покрытие всего "
+            f"**{overall_coverage:.0f}%** — команда отвечает только на "
+            f"{overall_coverage:.0f}% новых замечаний. Задолженность растёт. "
+            f"Требуется:\n\n"
+            f"1. Расширение команды в **{round(100 / overall_coverage, 1)}×**\n"
+            f"2. Пересмотр процесса приёмки с заказчиком\n"
+            f"3. Эскалация к руководству"
+        )
+
+def _status_icon(pct: float, delta: int, months) -> str:
+    """Светофор для дисциплины."""
+    if months is None:
+        return "🔴"  # никогда не закроется
+    if delta > 0:
+        return "🟠"  # задолженность растёт
+    if pct < 50:
+        return "🟡"  # низкий %, но разгребаем
+    return "🟢"       # всё в порядке
 
 
 # ---------------------------------------------------------------------------

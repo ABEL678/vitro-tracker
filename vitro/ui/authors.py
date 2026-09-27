@@ -184,6 +184,70 @@ def _load_authors(disciplines: tuple = (), sections: tuple = (),
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _load_author_timing() -> pd.DataFrame:
+    """
+    Метрики времени по авторам:
+      - avg_our_response_days: сколько мы в среднем отвечаем (в кал. днях)
+      - avg_customer_wait_days: сколько заказчик ждёт после нашего ответа
+      - pct_overdue_customer: доля замечаний, где заказчик тянет >10 р.д.
+      - n_with_fix: сколько замечаний с нашим ответом
+    """
+    with get_conn() as conn:
+        # 1. Наш ответ: fix_date - created
+        our = pd.read_sql("""
+            SELECT
+                c.author AS author,
+                COUNT(c.id) AS n_with_fix,
+                AVG(
+                    CAST(julianday(c.fix_date) - julianday(c.created)
+                         AS REAL)
+                ) AS avg_our_response_days
+            FROM comments c
+            WHERE c.author IS NOT NULL AND c.author <> ''
+              AND c.created IS NOT NULL AND c.created <> ''
+              AND c.fix_date IS NOT NULL AND c.fix_date <> ''
+              AND c.status IN ('Закрыто', 'Выполнено')
+            GROUP BY c.author
+        """, conn)
+
+        # 2. Ждём заказчика: сегодня - fix_date, только для статуса «Выполнено»
+        waiting = pd.read_sql("""
+            SELECT
+                c.author AS author,
+                COUNT(c.id) AS n_waiting,
+                AVG(
+                    CAST(julianday('now') - julianday(c.fix_date)
+                         AS REAL)
+                ) AS avg_customer_wait_days,
+                SUM(
+                    CASE WHEN julianday('now') - julianday(c.fix_date) > 14
+                         THEN 1 ELSE 0 END
+                ) AS n_overdue_customer
+            FROM comments c
+            WHERE c.author IS NOT NULL AND c.author <> ''
+              AND c.fix_date IS NOT NULL AND c.fix_date <> ''
+              AND c.status = 'Выполнено'
+            GROUP BY c.author
+        """, conn)
+
+    # Объединяем
+    df = our.merge(waiting, on="author", how="outer").fillna(0)
+
+    # Доля просроченных
+    df["pct_overdue"] = df.apply(
+        lambda r: round(r["n_overdue_customer"] / r["n_waiting"] * 100, 1)
+        if r["n_waiting"] else 0,
+        axis=1,
+    )
+
+    # Округляем средние
+    df["avg_our_response_days"] = df["avg_our_response_days"].round(1)
+    df["avg_customer_wait_days"] = df["avg_customer_wait_days"].round(1)
+
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _load_author_by_discipline(author: str) -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""
@@ -266,6 +330,248 @@ def _render_quality(df: pd.DataFrame, limit: int = 20):
                      "% непринятых": st.column_config.NumberColumn(format="%.1f%%"),
                      "% активных": st.column_config.NumberColumn(format="%.1f%%"),
                  })
+
+
+def _render_author_timing():
+    """Метрики сроков по авторам — два понятных графика вместо скаттера."""
+    st.markdown("### ⏸ Сроки рассмотрения по авторам")
+
+    df = _load_author_timing()
+    if df.empty:
+        st.info("Нет данных по срокам.")
+        return
+
+    # Отсеиваем авторов с малым объёмом
+    df = df[df["n_waiting"] >= 5].copy()
+    if df.empty:
+        st.info("Нет данных для отображения.")
+        return
+
+    st.caption(
+        "**Две разные проблемы:**\n\n"
+        "🟠 **Мы медленно отвечаем** — по замечаниям этих авторов наша "
+        "команда тратит много времени. Это **наша** проблема.\n\n"
+        "🔴 **Заказчик тянет** — мы ответили, а автор не рассматривает "
+        "ответ. Это **его** проблема. **SLA = 14 календарных дней** "
+        "(≈10 рабочих)."
+    )
+
+    st.divider()
+
+    # =====================================================================
+    #  БЛОК 1: Мы медленно отвечаем
+    # =====================================================================
+    st.markdown("#### 🟠 Мы медленно отвечаем")
+    st.caption("Топ-10 авторов, по чьим замечаниям **наша команда** "
+               "тратит больше всего времени на ответ.")
+
+    our_slow = df.nlargest(10, "avg_our_response_days").sort_values(
+        "avg_our_response_days", ascending=True)
+
+    fig_ours = px.bar(
+        our_slow,
+        x="avg_our_response_days",
+        y="author",
+        orientation="h",
+        text="avg_our_response_days",
+        labels={"avg_our_response_days": "Дней до нашего ответа",
+                "author": ""},
+        color="avg_our_response_days",
+        color_continuous_scale=["#FFD54F", "#FFB74D", "#E57373"],
+    )
+    fig_ours.update_traces(texttemplate="%{text:.0f} дн.",
+                           textposition="outside")
+
+    # SLA для нашей стороны — тоже 14 календарных дней
+    fig_ours.add_vline(
+        x=14, line_dash="dash", line_color="#2E7D32", line_width=2,
+        annotation_text="Цель — 14 дн.",
+        annotation_position="top right",
+        annotation_font_color="#2E7D32", annotation_font_size=11,
+    )
+
+    fig_ours.update_layout(
+        height=max(350, 35 * len(our_slow)),
+        coloraxis_showscale=False,
+        margin=dict(l=150, r=80, t=20, b=40),
+    )
+    st.plotly_chart(fig_ours, use_container_width=True)
+    download_plotly(fig_ours, "Авторы_мы_медленные", "auth_ours",
+                    width=1400, height=600)
+
+    # Проверка — есть ли проблема
+    over_14 = (our_slow["avg_our_response_days"] > 14).sum()
+    if over_14 > 0:
+        st.warning(
+            f"⚠️ По замечаниям **{over_14} из 10** авторов мы отвечаем "
+            f"дольше **14 дней**. Нужно разобраться, почему: сложные "
+            f"замечания, нехватка специалистов или процесс?"
+        )
+    else:
+        st.success("✅ По всем топ-авторам мы отвечаем в пределах нормы.")
+
+    st.divider()
+
+    # =====================================================================
+    #  БЛОК 2: Заказчик тянет
+    # =====================================================================
+    st.markdown("#### 🔴 Заказчик тянет с рассмотрением")
+    st.caption("Топ-10 авторов, чьи ответы **они** держат у себя дольше "
+               "всего. SLA = 14 календарных дней (≈10 рабочих).")
+
+    cust_slow = df.nlargest(10, "avg_customer_wait_days").sort_values(
+        "avg_customer_wait_days", ascending=True)
+
+    fig_cust = px.bar(
+        cust_slow,
+        x="avg_customer_wait_days",
+        y="author",
+        orientation="h",
+        text="avg_customer_wait_days",
+        labels={"avg_customer_wait_days": "Дней ожидания рассмотрения",
+                "author": ""},
+        color="avg_customer_wait_days",
+        color_continuous_scale=["#A5D6A7", "#FFD54F", "#E57373"],
+    )
+    fig_cust.update_traces(texttemplate="%{text:.0f} дн.",
+                           textposition="outside")
+
+    fig_cust.add_vline(
+        x=14, line_dash="dash", line_color="#2E7D32", line_width=2,
+        annotation_text="SLA 14 дн.",
+        annotation_position="top right",
+        annotation_font_color="#2E7D32", annotation_font_size=11,
+    )
+
+    fig_cust.update_layout(
+        height=max(350, 35 * len(cust_slow)),
+        coloraxis_showscale=False,
+        margin=dict(l=150, r=80, t=20, b=40),
+    )
+    st.plotly_chart(fig_cust, use_container_width=True)
+    download_plotly(fig_cust, "Авторы_заказчик_тянет", "auth_cust",
+                    width=1400, height=600)
+
+    # Проверка
+    overdue = (cust_slow["avg_customer_wait_days"] > 14).sum()
+    if overdue > 0:
+        st.error(
+            f"🔴 **{overdue} из 10** авторов держат наши ответы дольше "
+            f"**14 дней** (SLA). Это **их** задержка — готовим "
+            f"письмо-предъявление с приложением списка замечаний."
+        )
+    else:
+        st.success("✅ Заказчик рассматривает наши ответы в срок.")
+
+    st.divider()
+
+    # =====================================================================
+    #  СВОДНАЯ ТАБЛИЦА
+    # =====================================================================
+    st.markdown("#### 📋 Полная таблица по авторам")
+
+    table = df[[
+        "author", "n_waiting", "avg_our_response_days",
+        "avg_customer_wait_days", "pct_overdue",
+    ]].copy()
+
+    # Определяем статус: чья вина
+    def _verdict(row):
+        our_slow = row["avg_our_response_days"] > 14
+        cust_slow = row["avg_customer_wait_days"] > 14
+
+        if our_slow and cust_slow:
+            return "🔴 Оба тормозят"
+        if our_slow:
+            return "🟠 Мы тормозим"
+        if cust_slow:
+            return "🔵 Заказчик тянет"
+        return "🟢 Всё в норме"
+
+    table["verdict"] = table.apply(_verdict, axis=1)
+
+    table = table[[
+        "verdict", "author", "n_waiting", "avg_our_response_days",
+        "avg_customer_wait_days", "pct_overdue",
+    ]]
+
+    table = table.rename(columns={
+        "verdict": "🚦",
+        "author": "Автор",
+        "n_waiting": "Замечаний",
+        "avg_our_response_days": "Мы отвечаем (дн.)",
+        "avg_customer_wait_days": "Ждём заказчика (дн.)",
+        "pct_overdue": "Просрочено (%)",
+    })
+
+    # Сортируем по ожиданию заказчика
+    table = table.sort_values("Ждём заказчика (дн.)", ascending=False)
+
+    st.dataframe(
+        table.head(30),
+        use_container_width=True, hide_index=True, height=500,
+        column_config={
+            "Мы отвечаем (дн.)": st.column_config.NumberColumn(
+                "Мы отвечаем (дн.)", format="%.1f"),
+            "Ждём заказчика (дн.)": st.column_config.NumberColumn(
+                "Ждём заказчика (дн.)", format="%.1f"),
+            "Просрочено (%)": st.column_config.ProgressColumn(
+                "Просрочено (%)", min_value=0, max_value=100,
+                format="%.0f%%"),
+        },
+    )
+
+    st.caption(
+        "**🚦 Светофор:**\n"
+        "- 🟢 **Всё в норме** — мы отвечаем быстро, он рассматривает быстро.\n"
+        "- 🟠 **Мы тормозим** — наша команда долго отвечает.\n"
+        "- 🔵 **Заказчик тянет** — держит наши ответы, не рассматривает.\n"
+        "- 🔴 **Оба тормозят** — сложные замечания или плохой процесс."
+    )
+
+    # =====================================================================
+    #  ИТОГОВЫЙ ВЫВОД
+    # =====================================================================
+    st.divider()
+    st.markdown("#### 🎯 Что делать")
+
+    n_total = len(df)
+    n_our = ((df["avg_our_response_days"] > 14) &
+             (df["avg_customer_wait_days"] <= 14)).sum()
+    n_cust = ((df["avg_customer_wait_days"] > 14) &
+              (df["avg_our_response_days"] <= 14)).sum()
+    n_both = ((df["avg_customer_wait_days"] > 14) &
+              (df["avg_our_response_days"] > 14)).sum()
+    n_ok = n_total - n_our - n_cust - n_both
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🟢 Всё в норме", n_ok)
+    c2.metric("🟠 Мы тормозим", n_our)
+    c3.metric("🔵 Заказчик тянет", n_cust)
+    c4.metric("🔴 Оба тормозят", n_both)
+
+    actions = []
+    if n_our > 0:
+        actions.append(
+            f"🟠 **{n_our} авторов** — мы отвечаем им медленно. "
+            f"Разобраться с проектировщиками."
+        )
+    if n_cust > 0:
+        actions.append(
+            f"🔵 **{n_cust} авторов** — заказчик тянет рассмотрение. "
+            f"Письмо-предъявление."
+        )
+    if n_both > 0:
+        actions.append(
+            f"🔴 **{n_both} авторов** — сложные замечания. "
+            f"Разбор с обеих сторон."
+        )
+
+    if actions:
+        for a in actions:
+            st.markdown(f"- {a}")
+    else:
+        st.success("✅ Все авторы в норме. Срочных действий не требуется.")
 
 
 def _render_drilldown(df: pd.DataFrame):
@@ -395,5 +701,7 @@ def render():
     _render_top_authors(df, limit)
     st.divider()
     _render_quality(df, limit)
+    st.divider()
+    _render_author_timing()  # ← НОВОЕ
     st.divider()
     _render_drilldown(df)
