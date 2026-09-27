@@ -17,7 +17,7 @@ import streamlit as st
 
 from vitro.sqlite_db import init_db
 from vitro.ui import (
-    overview, complexes, categories, deadlines, lagging,
+    dashboard, overview, complexes, categories, deadlines, lagging,
     authors, search, dynamics, revisions, export, logs, admin,
 )
 
@@ -106,6 +106,7 @@ with hc2:
 
 # --- Вкладки ---
 tabs = st.tabs([
+    "📊 Дашборд РП",
     "📊 Обзор",
     "🏗 Комплекты",
     "🏷 Категории",
@@ -120,18 +121,19 @@ tabs = st.tabs([
     "⚙️ Управление",
 ])
 
-with tabs[0]:  overview.render()
-with tabs[1]:  complexes.render()
-with tabs[2]:  categories.render()
-with tabs[3]:  deadlines.render()
-with tabs[4]:  lagging.render()
-with tabs[5]:  authors.render()
-with tabs[6]:  search.render()
-with tabs[7]:  dynamics.render()
-with tabs[8]:  revisions.render()   # ← новая
-with tabs[9]:  export.render()
-with tabs[10]: logs.render()
-with tabs[11]: admin.render()
+with tabs[0]:  dashboard.render()
+with tabs[1]:  overview.render()
+with tabs[2]:  complexes.render()
+with tabs[3]:  categories.render()
+with tabs[4]:  deadlines.render()
+with tabs[5]:  lagging.render()
+with tabs[6]:  authors.render()
+with tabs[7]:  search.render()
+with tabs[8]:  dynamics.render()
+with tabs[9]:  revisions.render()
+with tabs[10]: export.render()
+with tabs[11]: logs.render()
+with tabs[12]: admin.render()
 
 # --- Футер ---
 user_label = st.session_state.get("user", "инженер")
