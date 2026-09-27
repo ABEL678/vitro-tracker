@@ -34,23 +34,17 @@ def _fig_id(fig) -> str:
 def download_plotly(fig, filename: str, key: str,
                     width: int = 1400, height: int = 700, scale: int = 2):
     """
-    Кнопка скачивания графика в PNG.
-
-    Механика:
-      1. Сначала показывается «📷 Подготовить PNG».
-      2. По нажатию — генерируется PNG (2–3 сек) и сохраняется в session_state.
-      3. Кнопка превращается в «⬇️ Скачать PNG».
-      4. Есть кнопка «✖» — убрать PNG из памяти.
+    Кнопки скачивания графика в PNG (компактные, чтобы не обрезались).
     """
     fig_hash = _fig_id(fig)
     state_key = f"png_ready_{key}_{fig_hash}"
 
-    col1, col2, _ = st.columns([1, 1, 6])
+    col1, col2, _ = st.columns([2, 2, 6])
 
     with col1:
         if state_key not in st.session_state:
             if st.button(
-                "📷 Подготовить PNG",
+                "📷 PNG",
                 key=f"prep_{key}",
                 use_container_width=True,
                 help="Сгенерировать PNG (2–3 секунды)",
@@ -67,7 +61,7 @@ def download_plotly(fig, filename: str, key: str,
                         st.error(f"Ошибка PNG: {e}")
         else:
             st.download_button(
-                "⬇️ Скачать PNG",
+                "⬇️ PNG",
                 data=st.session_state[state_key],
                 file_name=f"{filename}.png",
                 mime="image/png",
@@ -78,7 +72,7 @@ def download_plotly(fig, filename: str, key: str,
     with col2:
         if state_key in st.session_state:
             if st.button(
-                "✖ Сбросить",
+                "✖",
                 key=f"clear_{key}",
                 use_container_width=True,
                 help="Убрать PNG из памяти",

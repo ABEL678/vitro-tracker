@@ -17,7 +17,7 @@ import streamlit as st
 
 from vitro.sqlite_db import init_db
 from vitro.ui import (
-    overview, complexes, categories, stale, lagging,
+    overview, complexes, categories, deadlines, lagging,
     authors, search, dynamics, export, logs, admin,
 )
 
@@ -109,7 +109,7 @@ tabs = st.tabs([
     "📊 Обзор",
     "🏗 Комплекты",
     "🏷 Категории",
-    "⏳ Зависшие",
+    "⏰ Сроки",
     "⚠️ Отстающие",
     "👤 Авторы",
     "🔍 Поиск",
@@ -122,7 +122,7 @@ tabs = st.tabs([
 with tabs[0]:  overview.render()
 with tabs[1]:  complexes.render()
 with tabs[2]:  categories.render()
-with tabs[3]:  stale.render()
+with tabs[3]:  deadlines.render()
 with tabs[4]:  lagging.render()
 with tabs[5]:  authors.render()
 with tabs[6]:  search.render()
