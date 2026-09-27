@@ -533,42 +533,46 @@ def _render_export_pdf(data: dict):
 
 def _build_dashboard_pdf(data: dict) -> bytes:
     """
-    Сборка PDF: KPI + таблица + графики.
-    Графики генерируются через kaleido в PNG и вставляются как картинки.
-    """
-    from vitro.pdf_builder import build_pdf
+    Сборка PDF-отчёта дашборда: KPI + таблица + графики.
+    Графики генерируются через kaleido и вставляются как PNG.
 
+    Особенности вёрстки:
+      - Каждый график начинается с новой страницы (PageBreak) для читаемости.
+      - Увеличенный margin слева (220) — чтобы длинные шифры комплектов
+        не обрезались на горизонтальных барах.
+      - Без эмодзи в тексте — DejaVu Sans их не поддерживает.
+    """
+    import io as _io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image,
+        PageBreak,
+    )
+    from vitro.pdf_builder import ACTIVE_FONT, _trim_cell
+
+    # =================================================================
+    #  1. Подготовка данных
+    # =================================================================
     totals = data["totals"]
     total = totals["total"] or 0
     closed = totals["closed"] or 0
     annulled = totals["annulled"] or 0
     pct = round((closed + annulled) / total * 100, 1) if total else 0
 
-    # --- Сводка по KPI ---
-    kpi_df = pd.DataFrame([{
-        "Показатель": "Всего замечаний",
-        "Значение": f"{total:,}".replace(",", " "),
-    }, {
-        "Показатель": "Закрыто",
-        "Значение": f"{closed:,}".replace(",", " "),
-    }, {
-        "Показатель": "% выполнения",
-        "Значение": f"{pct}%",
-    }, {
-        "Показатель": "🔴 Ждут нашего ответа",
-        "Значение": f"{data['overdue_ours']:,}".replace(",", " "),
-    }, {
-        "Показатель": "🔵 Ждут заказчика",
-        "Значение": f"{data['waiting_customer']:,}".replace(",", " "),
-    }, {
-        "Показатель": "🟡 Заброшено",
-        "Значение": f"{data['abandoned']:,}".replace(",", " "),
-    }, {
-        "Показатель": "🟢 В работе, в срок",
-        "Значение": f"{data['in_progress']:,}".replace(",", " "),
-    }])
+    kpi_rows = [
+        ("Всего замечаний", f"{total:,}".replace(",", " ")),
+        ("Закрыто", f"{closed:,}".replace(",", " ")),
+        ("% выполнения", f"{pct}%"),
+        ("", ""),
+        ("Ждут нашего ответа", f"{data['overdue_ours']:,}".replace(",", " ")),
+        ("Ждут заказчика", f"{data['waiting_customer']:,}".replace(",", " ")),
+        ("Заброшено", f"{data['abandoned']:,}".replace(",", " ")),
+        ("В работе, в срок", f"{data['in_progress']:,}".replace(",", " ")),
+    ]
 
-    # --- Таблица по дисциплинам ---
     by_disc = data["by_disc"]
     disc_rows = []
     for disc, s in by_disc.items():
@@ -582,21 +586,138 @@ def _build_dashboard_pdf(data: dict) -> bytes:
     disc_df = pd.DataFrame(disc_rows).sort_values(
         "Ждут нас", ascending=False) if disc_rows else pd.DataFrame()
 
-    # --- Сборка PDF через reportlab напрямую ---
-    import io as _io
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import mm
-    from reportlab.platypus import (
-        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image,
-    )
-    from vitro.pdf_builder import ACTIVE_FONT, _trim_cell, _build_table
+    # =================================================================
+    #  2. Генерация графиков как PNG (единый стиль)
+    # =================================================================
+    def _fig_to_png(fig, width: int = 1400, height: int = 600):
+        """
+        Конвертирует Plotly-фигуру в PNG с едиными настройками:
+          - margin 220 слева — для длинных подписей;
+          - margin 100 справа/снизу — чтобы метки и пики не обрезались;
+          - font 16 — для читаемости в PDF.
+        """
+        try:
+            fig.update_layout(
+                margin=dict(l=220, r=100, t=60, b=100),
+                font=dict(size=16),
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+            )
+            return fig.to_image(format="png", width=width,
+                                height=height, scale=1.5)
+        except Exception:
+            return None
 
+    monthly = data["monthly"]
+    images = {}
+
+    if not monthly.empty:
+        # -------------------------------------------------------------
+        #  График 1: потоки (выдача vs ответы)
+        # -------------------------------------------------------------
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(
+            x=monthly["ym"], y=monthly["Выдано"],
+            name="Выдано замечаний",
+            marker_color="#64B5F6",
+            text=monthly["Выдано"], textposition="outside",
+        ))
+        fig1.add_trace(go.Bar(
+            x=monthly["ym"], y=monthly["Закрыто"],
+            name="Наши ответы",
+            marker_color="#2E7D32",
+            text=monthly["Закрыто"], textposition="outside",
+        ))
+        fig1.update_layout(
+            barmode="group",
+            xaxis_tickangle=-45,
+            xaxis_title="Месяц",
+            yaxis_title="Замечаний",
+            legend=dict(orientation="h", y=-0.35,
+                        x=0.5, xanchor="center"),
+        )
+        png = _fig_to_png(fig1, 1400, 600)
+        if png:
+            images["flows"] = png
+
+        # -------------------------------------------------------------
+        #  График 2: отставание по месяцам
+        # -------------------------------------------------------------
+        monthly_d = monthly.copy()
+        monthly_d["Отставание"] = monthly_d["Выдано"] - monthly_d["Закрыто"]
+        colors_list = ["#E57373" if v > 0 else "#2E7D32"
+                       for v in monthly_d["Отставание"]]
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(
+            x=monthly_d["ym"], y=monthly_d["Отставание"],
+            marker_color=colors_list,
+            text=monthly_d["Отставание"], textposition="outside",
+        ))
+        fig2.add_hline(y=0, line_dash="dash", line_color="#888")
+        fig2.update_layout(
+            xaxis_tickangle=-45,
+            xaxis_title="Месяц",
+            yaxis_title="Отставание",
+            showlegend=False,
+        )
+        png = _fig_to_png(fig2, 1400, 550)
+        if png:
+            images["delta"] = png
+
+        # -------------------------------------------------------------
+        #  График 3: накопленное отставание
+        # -------------------------------------------------------------
+        monthly_cum = monthly_d.copy()
+        monthly_cum["Накоплено"] = monthly_cum["Отставание"].cumsum()
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
+            x=monthly_cum["ym"], y=monthly_cum["Накоплено"],
+            mode="lines+markers",
+            line=dict(color="#E57373", width=4),
+            fill="tozeroy",
+            fillcolor="rgba(229,115,115,0.2)",
+            marker=dict(size=10),
+        ))
+        fig3.update_layout(
+            xaxis_tickangle=-45,
+            xaxis_title="Месяц",
+            yaxis_title="Накопленное отставание",
+            showlegend=False,
+        )
+        png = _fig_to_png(fig3, 1400, 550)
+        if png:
+            images["cumulative"] = png
+
+    # -------------------------------------------------------------
+    #  График 4: топ-5 комплектов
+    # -------------------------------------------------------------
+    top_cx = data["top_overdue_complex"]
+    if not top_cx.empty:
+        top_cx_sorted = top_cx.sort_values("n", ascending=True)
+
+        fig4 = px.bar(
+            top_cx_sorted, x="n", y="complex", orientation="h",
+            text="n",
+            color_discrete_sequence=["#E57373"],
+        )
+        fig4.update_traces(textposition="outside")
+        fig4.update_layout(
+            xaxis_title="Количество просрочек",
+            yaxis_title="",
+        )
+        png = _fig_to_png(fig4, 1400, 500)
+        if png:
+            images["top_complexes"] = png
+
+    # =================================================================
+    #  3. Сборка PDF
+    # =================================================================
     buf = _io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(A4),
-        leftMargin=10*mm, rightMargin=10*mm,
+        leftMargin=12*mm, rightMargin=12*mm,
         topMargin=10*mm, bottomMargin=10*mm,
     )
 
@@ -605,51 +726,64 @@ def _build_dashboard_pdf(data: dict) -> bytes:
                         fontName=ACTIVE_FONT, fontSize=16,
                         textColor=colors.HexColor("#1F4E78"))
     h2 = ParagraphStyle("h2", parent=styles["Heading2"],
-                        fontName=ACTIVE_FONT, fontSize=12,
+                        fontName=ACTIVE_FONT, fontSize=13,
                         textColor=colors.HexColor("#1F4E78"))
+    h3 = ParagraphStyle("h3", parent=styles["Heading3"],
+                        fontName=ACTIVE_FONT, fontSize=11,
+                        textColor=colors.HexColor("#333333"))
+    sub = ParagraphStyle("sub", parent=styles["Normal"],
+                         fontName=ACTIVE_FONT, fontSize=9,
+                         textColor=colors.grey)
     cell_style = ParagraphStyle("cell", parent=styles["Normal"],
-                                fontName=ACTIVE_FONT, fontSize=9, leading=11)
+                                fontName=ACTIVE_FONT, fontSize=10,
+                                leading=13)
 
     story = [
         Paragraph("Дашборд руководителя проекта", h1),
         Paragraph(
             f"АТП ТЛП · сформировано {datetime.now():%d.%m.%Y %H:%M}",
-            ParagraphStyle("sub", parent=styles["Normal"],
-                           fontName=ACTIVE_FONT, fontSize=9,
-                           textColor=colors.grey),
+            sub,
         ),
-        Spacer(1, 8*mm),
+        Spacer(1, 6*mm),
 
-        Paragraph("Ключевые показатели", h2),
+        Paragraph("1. Ключевые показатели", h2),
         Spacer(1, 3*mm),
     ]
 
-    # KPI таблица
-    kpi_data = [[Paragraph(f"<b>{c}</b>", cell_style) for c in kpi_df.columns]]
-    for _, row in kpi_df.iterrows():
-        kpi_data.append([Paragraph(str(v), cell_style) for v in row.values])
-    kpi_table = Table(kpi_data, colWidths=[120*mm, 60*mm])
+    # --- KPI таблица ---
+    kpi_data = [[Paragraph("<b>Показатель</b>", cell_style),
+                 Paragraph("<b>Значение</b>", cell_style)]]
+    for k, v in kpi_rows:
+        kpi_data.append([
+            Paragraph(k or "&nbsp;", cell_style),
+            Paragraph(v or "&nbsp;", cell_style),
+        ])
+    kpi_table = Table(kpi_data, colWidths=[110*mm, 50*mm])
     kpi_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0070C0")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [colors.white, colors.HexColor("#F2F2F2")]),
     ]))
     story.append(kpi_table)
     story.append(Spacer(1, 8*mm))
 
-    # Таблица по дисциплинам
+    # --- Таблица по дисциплинам ---
     if not disc_df.empty:
-        story.append(Paragraph("Проблемы по дисциплинам", h2))
+        story.append(Paragraph("2. Проблемы по дисциплинам", h2))
         story.append(Spacer(1, 3*mm))
+
         data_disc = [[Paragraph(f"<b>{c}</b>", cell_style)
                       for c in disc_df.columns]]
         for _, row in disc_df.iterrows():
             data_disc.append([Paragraph(_trim_cell(v), cell_style)
                               for v in row.values])
         n_cols = len(disc_df.columns)
-        col_w = (doc.pagesize[0] - 20*mm) / n_cols
-        disc_table = Table(data_disc, colWidths=[col_w] * n_cols, repeatRows=1)
+        col_w = (doc.pagesize[0] - 24*mm) / n_cols
+        disc_table = Table(data_disc, colWidths=[col_w] * n_cols,
+                           repeatRows=1)
         disc_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0070C0")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -657,7 +791,121 @@ def _build_dashboard_pdf(data: dict) -> bytes:
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ]))
         story.append(disc_table)
+        story.append(Spacer(1, 8*mm))
 
+    # =================================================================
+    #  4. Графики — каждый с новой страницы
+    # =================================================================
+    if images:
+        page_width = doc.pagesize[0] - 24*mm
+
+        # --- График 3.1: потоки ---
+        if "flows" in images:
+            story.append(PageBreak())
+            story.append(Paragraph("3. Динамика и графики", h2))
+            story.append(Spacer(1, 4*mm))
+            story.append(Paragraph(
+                "3.1. Выдача замечаний vs Наши ответы", h3))
+            story.append(Spacer(1, 4*mm))
+            img = Image(_io.BytesIO(images["flows"]),
+                        width=page_width, height=page_width * 0.42)
+            story.append(img)
+
+        # --- График 3.2: отставание ---
+        if "delta" in images:
+            story.append(PageBreak())
+            story.append(Paragraph(
+                "3.2. Отставание по месяцам "
+                "(красное — задолженность растёт)", h3))
+            story.append(Spacer(1, 4*mm))
+            img = Image(_io.BytesIO(images["delta"]),
+                        width=page_width, height=page_width * 0.42)
+            story.append(img)
+
+        # --- График 3.3: накопленное ---
+        if "cumulative" in images:
+            story.append(PageBreak())
+            story.append(Paragraph(
+                "3.3. Накопленное отставание", h3))
+            story.append(Spacer(1, 4*mm))
+            img = Image(_io.BytesIO(images["cumulative"]),
+                        width=page_width, height=page_width * 0.42)
+            story.append(img)
+
+        # --- График 3.4: топ-5 комплектов ---
+        if "top_complexes" in images:
+            story.append(PageBreak())
+            story.append(Paragraph(
+                "3.4. Топ-5 комплектов с просрочками", h3))
+            story.append(Spacer(1, 4*mm))
+            img = Image(_io.BytesIO(images["top_complexes"]),
+                        width=page_width,
+                        height=page_width * 0.45)
+            story.append(img)
+
+    # =================================================================
+    #  5. Вывод — без эмодзи
+    # =================================================================
+    story.append(PageBreak())
+    story.append(Paragraph("4. Вывод", h2))
+    story.append(Spacer(1, 4*mm))
+
+    conclusions = []
+    conclusions.append(
+        f"Всего замечаний: <b>{total:,}</b>. "
+        f"Закрыто: <b>{closed:,}</b> ({pct}%).".replace(",", " ")
+    )
+
+    if data["overdue_ours"] > 5000:
+        conclusions.append(
+            f"<b>КРИТИЧНО:</b> {data['overdue_ours']:,} замечаний "
+            f"ждут нашего ответа более 10 рабочих дней.".replace(",", " ")
+        )
+    elif data["overdue_ours"] > 1000:
+        conclusions.append(
+            f"{data['overdue_ours']:,} замечаний ждут нашего ответа."
+            .replace(",", " ")
+        )
+
+    if data["waiting_customer"] > 5000:
+        conclusions.append(
+            f"{data['waiting_customer']:,} замечаний ждут рассмотрения "
+            f"заказчиком — готовим письмо-предъявление.".replace(",", " ")
+        )
+
+    if data["abandoned"] > 1000:
+        conclusions.append(
+            f"{data['abandoned']:,} заброшенных замечаний "
+            f"(более 90 дней без движения) — кандидаты на снятие."
+            .replace(",", " ")
+        )
+
+    if not monthly.empty and len(monthly) >= 3:
+        last3 = monthly.tail(3).copy()
+        last3["Отставание"] = last3["Выдано"] - last3["Закрыто"]
+        total_delta = last3["Отставание"].sum()
+        avg_delta = total_delta / 3
+
+        if avg_delta > 500:
+            conclusions.append(
+                f"<b>Команда отстаёт от темпа выдачи.</b> "
+                f"В среднем <b>+{int(avg_delta):,}</b> незакрытых в месяц. "
+                f"При сохранении темпа к концу года задолженность вырастет."
+                .replace(",", " ")
+            )
+        elif avg_delta < -500:
+            conclusions.append(
+                f"Команда разгребает задолженность: "
+                f"{int(avg_delta):,} в месяц в среднем.".replace(",", " ")
+            )
+
+    for c in conclusions:
+        story.append(Paragraph(f"• {c}", cell_style))
+        story.append(Spacer(1, 3*mm))
+
+    # =================================================================
+    #  6. Финализация
+    # =================================================================
     doc.build(story)
     buf.seek(0)
     return buf.getvalue()
