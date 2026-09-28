@@ -186,6 +186,39 @@ def update_category_safe(comment_id: int, category: str, user: str,
     return True, "OK"
 
 
+def update_category_force(comment_id: int, category: str,
+                          user: str) -> tuple[bool, str]:
+    """
+    Принудительно обновляет категорию, игнорируя версию.
+    Используется при импорте с флагом «Перезаписать».
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        old_row = conn.execute(
+            "SELECT category FROM comments WHERE id = ?", (comment_id,)
+        ).fetchone()
+        old_cat = old_row["category"] if old_row else None
+
+        cur = conn.execute("""
+            UPDATE comments
+            SET category = ?, category_user = ?, category_date = ?,
+                category_version = COALESCE(category_version, 0) + 1,
+                category_updated_at = ?
+            WHERE id = ?
+        """, (category, user, now, now, comment_id))
+
+        if cur.rowcount == 0:
+            return False, "Строка не найдена"
+
+        conn.execute("""
+            INSERT INTO users_activity (timestamp, user, comment_id,
+                                        old_cat, new_cat)
+            VALUES (?, ?, ?, ?, ?)
+        """, (now, user, comment_id, old_cat, category))
+
+    return True, "OK"
+
+
 # ---------------------------------------------------------------------------
 #  Загрузка среза замечаний для st.data_editor
 # ---------------------------------------------------------------------------

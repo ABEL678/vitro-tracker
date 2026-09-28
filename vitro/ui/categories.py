@@ -18,7 +18,9 @@ from vitro.sqlite_db import (
     get_conn,
     load_remarks_for_editor,
     update_category_safe,
+    update_category_force,
 )
+from vitro.ui._utils import download_plotly
 from vitro.disciplines import discipline_name
 
 
@@ -151,16 +153,32 @@ def _load_kit_options(disciplines: tuple[str, ...] = (),
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_overall_distribution() -> pd.DataFrame:
+    """Распределение по категориям с принудительным включением всех 4."""
     with get_conn() as conn:
-        return pd.read_sql("""
+        df = pd.read_sql("""
             SELECT
                 CASE WHEN category IS NULL OR category = ''
                      THEN 'Без категории' ELSE category END AS "Категория",
                 COUNT(*) AS "Количество"
             FROM comments
             GROUP BY "Категория"
-            ORDER BY "Количество" DESC
         """, conn)
+
+    # Добавляем все 4 категории, даже с 0
+    existing = dict(zip(df["Категория"], df["Количество"]))
+    rows = []
+    for cat in CAT_OPTIONS_RAW:  # 4 наши категории
+        rows.append({
+            "Категория": cat,
+            "Количество": existing.get(cat, 0),
+        })
+    # Без категории — если есть
+    if "Без категории" in existing:
+        rows.append({
+            "Категория": "Без категории",
+            "Количество": existing["Без категории"],
+        })
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -233,31 +251,82 @@ def _load_user_activity() -> pd.DataFrame:
 
 
 def _render_analysis():
-    # Кнопка принудительного обновления данных (сброс кэша)
-    col_refresh, _ = st.columns([1, 4])
-    with col_refresh:
-        if st.button("🔄 Обновить данные", key="cat_refresh"):
-            st.cache_data.clear()
-            st.rerun()
+    """Аналитика по категоризации — не дублирует Обзор."""
+    from datetime import datetime, timedelta
+
+    # =====================================================================
+    #  Прогресс категоризации
+    # =====================================================================
+    st.markdown("### 🎯 Прогресс категоризации")
 
     prog = _load_categorization_progress()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Всего замечаний", f"{prog['total']:,}".replace(",", " "))
-    c2.metric("С категорией",    f"{prog['done']:,}".replace(",", " "))
-    c3.metric("Осталось",        f"{prog['left']:,}".replace(",", " "))
+    total = prog["total"]
+    done = prog["done"]
+    left = prog["left"]
+    pct = round(done / total * 100, 1) if total else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Всего замечаний", f"{total:,}".replace(",", " "))
+    c2.metric("Разобрано", f"{done:,}".replace(",", " "))
+    c3.metric("Осталось", f"{left:,}".replace(",", " "))
+    c4.metric(
+        "Прогресс",
+        f"{pct}%",
+        help="Сколько замечаний уже имеют категорию",
+    )
+
+    # Прогресс-бар
+    st.progress(pct / 100)
+
+    # Прогноз завершения
+    activity = _load_user_activity()
+    if not activity.empty and done > 0:
+        # Средний темп за последние 7 дней
+        from datetime import datetime, timedelta
+
+        with get_conn() as conn:
+            recent = conn.execute("""
+                SELECT COUNT(*) FROM users_activity
+                WHERE timestamp >= datetime('now', '-7 days')
+            """).fetchone()[0]
+
+        if recent > 0:
+            per_day = recent / 7
+            days_left = int(left / per_day) if per_day > 0 else 0
+            eta = datetime.now() + timedelta(days=days_left)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Темп (7 дн.)",
+                      f"{per_day:.0f}/день".replace(",", " "))
+            c2.metric("Осталось дней",
+                      f"{days_left:,}".replace(",", " "))
+            c3.metric("Прогноз завершения",
+                      eta.strftime("%d.%m.%Y"))
+        else:
+            st.info(
+                "📌 Нет данных за последние 7 дней. "
+                "Начните категоризировать — появится прогноз."
+            )
 
     st.divider()
 
+    # =====================================================================
+    #  Распределение по категориям
+    # =====================================================================
+    st.markdown("### 🏷 Распределение")
+
     col1, col2 = st.columns(2)
+
     with col1:
         dist = _load_overall_distribution()
         if not dist.empty:
             fig = px.pie(
                 dist, names="Категория", values="Количество", hole=0.45,
                 color="Категория", color_discrete_map=CAT_COLORS,
-                title="Распределение по категориям",
+                title="По категориям",
             )
             st.plotly_chart(fig, use_container_width=True)
+            download_plotly(fig, "Категории_распределение", "cat_dist")
 
     with col2:
         by_disc = _load_by_discipline()
@@ -275,22 +344,120 @@ def _render_analysis():
                 category_orders={"Категория": [
                     "Принято", "Формальное", "Доп.треб.",
                     "Не принято", "Без категории"]},
-                title="Категории по дисциплинам",
+                title="По дисциплинам",
             )
             fig.update_layout(legend_title_text="")
             st.plotly_chart(fig, use_container_width=True)
+            download_plotly(fig, "Категории_по_дисциплинам", "cat_disc")
 
-    st.subheader("Категории по авторам замечаний")
+    st.divider()
+
+    # =====================================================================
+    #  Топ комплектов — где больше всего некатегоризированных
+    # =====================================================================
+    st.markdown("### 🏗 Где нужна работа — топ комплектов")
+    st.caption(
+        "Комплекты с наибольшим числом **некатегоризированных** замечаний. "
+        "Сюда стоит направить специалистов."
+    )
+
+    with get_conn() as conn:
+        top_rows = pd.read_sql("""
+            SELECT
+                d.discipline AS discipline,
+                d.complex AS complex,
+                COUNT(c.id) AS total,
+                SUM(CASE WHEN c.category IS NULL OR c.category = ''
+                         THEN 1 ELSE 0 END) AS uncategorized,
+                SUM(CASE WHEN c.category IS NOT NULL AND c.category <> ''
+                         THEN 1 ELSE 0 END) AS categorized
+            FROM documents d
+            JOIN comments c ON c.doc_id = d.id
+            WHERE c.status IN ('Новое','Принято в работу','Не принято',
+                                'К обсуждению','Выполнено')
+            GROUP BY d.discipline, d.complex
+            HAVING uncategorized > 0
+            ORDER BY uncategorized DESC
+            LIMIT 20
+        """, conn)
+
+    if not top_rows.empty:
+        top_rows["pct"] = top_rows.apply(
+            lambda r: round(r["categorized"] / r["total"] * 100, 1)
+            if r["total"] else 0,
+            axis=1,
+        )
+
+        chart_df = top_rows.sort_values("uncategorized", ascending=True)
+
+        fig = px.bar(
+            chart_df,
+            x="uncategorized", y="complex", orientation="h",
+            text="uncategorized",
+            color="pct",
+            color_continuous_scale=["#E57373", "#FFB74D", "#A5D6A7"],
+            labels={"uncategorized": "Без категории",
+                    "complex": "",
+                    "pct": "% разобрано"},
+            title="Топ-20 комплектов по некатегоризированным",
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=max(500, 25 * len(chart_df)),
+                          coloraxis_showscale=True)
+        st.plotly_chart(fig, use_container_width=True)
+        download_plotly(fig, "Категории_топ_неразобранных",
+                        "cat_top_uncat", width=1400, height=700)
+
+        # Таблица
+        table = top_rows[["discipline", "complex", "total",
+                           "categorized", "uncategorized", "pct"]]
+        table.columns = ["Дисциплина", "Комплект", "Всего",
+                          "Разобрано", "Осталось", "% разобрано"]
+
+        st.dataframe(
+            table, use_container_width=True, hide_index=True,
+            column_config={
+                "% разобрано": st.column_config.ProgressColumn(
+                    "% разобрано", min_value=0, max_value=100,
+                    format="%.1f%%"),
+            },
+        )
+    else:
+        st.success("🎉 Все замечания категоризированы!")
+
+    st.divider()
+
+    # =====================================================================
+    #  По авторам замечаний
+    # =====================================================================
+    st.markdown("### 👤 Категории по авторам замечаний")
     by_author = _load_by_author(limit=30)
     if not by_author.empty:
         st.dataframe(by_author, use_container_width=True, hide_index=True)
     else:
         st.info("Нет данных по авторам.")
 
-    st.subheader("Активность специалистов по категоризации")
+    st.divider()
+
+    # =====================================================================
+    #  Активность специалистов
+    # =====================================================================
+    st.markdown("### 🎯 Активность специалистов по категоризации")
     activity = _load_user_activity()
     if not activity.empty:
         st.dataframe(activity, use_container_width=True, hide_index=True)
+
+        # График
+        fig = px.bar(
+            activity.sort_values("Изменений", ascending=True),
+            x="Изменений", y="Специалист", orientation="h",
+            text="Изменений",
+            color_discrete_sequence=["#64B5F6"],
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=max(300, 30 * len(activity)))
+        st.plotly_chart(fig, use_container_width=True)
+        download_plotly(fig, "Категории_активность", "cat_activity")
     else:
         st.info("Пока никто не назначал категории.")
 
@@ -570,75 +737,148 @@ def _find_column(df: pd.DataFrame, aliases: list[str]) -> str | None:
 
 def _parse_excel_file(uploaded_file) -> pd.DataFrame:
     """
-    Читает Excel-файл, ищет колонки по алиасам.
-    Возвращает DataFrame с колонками:
-      id, category_raw, category, user_raw, date_raw, source_sheet, source_file
+    Читает только ВИДИМЫЕ листы Excel-файла.
+    Из каждого листа берёт колонки «ИД» и «Категория».
+    Скрытые листы (Data_Zamechaniya и т. д.) игнорируются.
     """
+    import io
+    from openpyxl import load_workbook
+
     rows = []
+
+    # Загружаем книгу
     try:
-        xls = pd.ExcelFile(uploaded_file)
+        data = uploaded_file.read()
+        uploaded_file.seek(0)
+        wb = load_workbook(
+            io.BytesIO(data),
+            data_only=True,     # значения, не формулы
+            read_only=True,     # быстрее
+        )
     except Exception as e:
         st.error(f"Не удалось открыть файл {uploaded_file.name}: {e}")
         return pd.DataFrame()
 
-    for sheet in xls.sheet_names:
-        if sheet.startswith("Сводка") or sheet.startswith("Свод"):
+    # Служебные листы, которые пропускаем
+    SKIP_SHEETS = {
+        "Ведомость листов",
+        "Управление",
+    }
+
+    processed_sheets = 0
+    sheets_with_data = []
+
+    # Проходим по всем листам
+    for sheet_name in wb.sheetnames:
+        # 1. Пропускаем служебные по имени
+        if sheet_name in SKIP_SHEETS:
+            continue
+        if sheet_name.startswith("Сводка") or sheet_name.startswith("Свод"):
             continue
 
-        # Пробуем header=1 и header=0 — что найдёт нужные колонки, то и берём
-        df = None
-        for header_row in (1, 0):
-            try:
-                candidate = pd.read_excel(xls, sheet_name=sheet, header=header_row)
-            except Exception:
-                continue
-            if _find_column(candidate, COL_ID_ALIASES) and \
-               _find_column(candidate, COL_CAT_ALIASES):
-                df = candidate
+        ws = wb[sheet_name]
+
+        # 2. Пропускаем НЕ видимые (скрытые и very hidden)
+        if ws.sheet_state != "visible":
+            continue
+
+        processed_sheets += 1
+
+        # 3. Ищем шапку с "ИД" и "Категория" в первых 15 строках
+        header_row = None
+        header_idx = None
+
+        # Функция нормализации — убирает все невидимые символы
+        def _norm(s):
+            if s is None:
+                return ""
+            # Убираем: пробелы, non-breaking space, табы, переносы
+            s = str(s)
+            s = s.replace("\xa0", " ")  # NBSP → обычный пробел
+            s = s.replace("\u200b", "")  # zero-width space
+            s = " ".join(s.split())  # все пробелы → один
+            return s.strip()
+
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i > 15:
+                break
+            row_str = [_norm(c) for c in row]
+            # Ищем "ИД" или "ID" — регистронезависимо
+            has_id = any(c.upper() in ("ИД", "ID") for c in row_str)
+            # Ищем "катег" — регистронезависимо
+            has_cat = any("катег" in c.lower() for c in row_str)
+            if has_id and has_cat:
+                header_row = row_str
+                header_idx = i
                 break
 
-        if df is None:
+        if header_row is None:
             continue
 
-        id_col  = _find_column(df, COL_ID_ALIASES)
-        cat_col = _find_column(df, COL_CAT_ALIASES)
-        usr_col = _find_column(df, COL_USER_ALIASES)
-        dat_col = _find_column(df, COL_DATE_ALIASES)
+        # 4. Ищем индексы колонок "ИД" и "Категория"
+        id_col = None
+        cat_col = None
 
-        # Оставляем только строки с заполненной категорией
-        mask = df[cat_col].notna() & (df[cat_col].astype(str).str.strip() != "")
-        filled = df[mask]
+        for j, h in enumerate(header_row):
+            h_norm = _norm(h).upper()
+            h_low = _norm(h).lower()
+            # "ИД" или "ID"
+            if h_norm in ("ИД", "ID"):
+                id_col = j
+            # "катег" в любом регистре
+            if "катег" in h_low and cat_col is None:
+                cat_col = j
 
-        for _, row in filled.iterrows():
+        if id_col is None or cat_col is None:
+            continue
+
+        # 5. Читаем данные ниже шапки — только эти две колонки
+        sheet_rows = 0
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i <= header_idx:
+                continue
+            if row is None or len(row) <= max(id_col, cat_col):
+                continue
+
+            id_val = row[id_col]
+            cat_val = row[cat_col]
+
+            # Пропускаем пустые
+            if id_val is None:
+                continue
+            if cat_val is None or str(cat_val).strip() == "":
+                continue
+
+            # ID должен быть числом
             try:
-                cid = int(row[id_col])
+                cid = int(id_val)
             except (ValueError, TypeError):
                 continue
 
-            cat_raw = str(row[cat_col]).strip()
-            cat_norm = _normalize_category(cat_raw)
-
-            user_raw = None
-            if usr_col:
-                v = row.get(usr_col)
-                if v is not None and str(v).strip() and str(v).strip().lower() != "none":
-                    user_raw = str(v).strip()
-
-            date_raw = None
-            if dat_col:
-                v = row.get(dat_col)
-                if v is not None and str(v).strip() and str(v).strip().lower() != "none":
-                    date_raw = str(v).strip()
+            cat_str = str(cat_val).strip()
+            cat_norm = _normalize_category(cat_str)
 
             rows.append({
                 "id": cid,
-                "category_raw": cat_raw,
+                "category_raw": cat_str,
                 "category": cat_norm,
-                "user_raw": user_raw,
-                "date_raw": date_raw,
-                "source_sheet": sheet,
+                "source_sheet": sheet_name,
                 "source_file": uploaded_file.name,
             })
+            sheet_rows += 1
+
+        if sheet_rows > 0:
+            sheets_with_data.append((sheet_name, sheet_rows))
+
+    wb.close()
+
+    # Диагностика — временно
+    if sheets_with_data:
+        total = sum(n for _, n in sheets_with_data)
+        st.caption(
+            f"Прочитано листов: {len(sheets_with_data)}, "
+            f"всего строк: {total}"
+        )
 
     return pd.DataFrame(rows)
 
@@ -655,17 +895,19 @@ def _render_import():
         )
 
     st.caption(
-        "Перетащите один или несколько Excel-файлов. Мы ищем колонки "
-        "«ИД» (или ID/Код/№) и «Категория». Если в файле есть колонки "
-        "«Кто изменил» и «Когда изменил» — они используются как автор "
-        "и дата; иначе берётся имя из сайдбара и текущее время."
+        "Перетащите один или несколько Excel-файлов. Мы читаем "
+        "**только видимые листы** и берём из каждого колонки "
+        "**«ИД»** и **«Категория замечания»**. "
+        "Скрытые листы (Data_Zamechaniya, История и т. п.) — игнорируются."
     )
 
     uploaded = st.file_uploader(
         "Файлы Excel",
-        type=["xlsx", "xls"],
+        type=["xlsx", "xls", "xlsm", "xlsb"],
         accept_multiple_files=True,
         key="cat_import_files",
+        help="Поддерживаются xlsx, xls, xlsm (с макросами). "
+             "Читаются все листы, включая скрытые.",
     )
 
     if not uploaded:
@@ -677,10 +919,27 @@ def _render_import():
     # --- Предпросмотр ---
     with st.expander("🔍 Предпросмотр распознанных категорий", expanded=True):
         all_rows = []
+        file_stats = []
+
         for f in uploaded:
             df_file = _parse_excel_file(f)
+            n_rows = len(df_file)
+            n_sheets = df_file["source_sheet"].nunique() if not df_file.empty else 0
+
+            file_stats.append({
+                "Файл": f.name,
+                "Строк": n_rows,
+                "Листов с данными": n_sheets,
+            })
+
             if not df_file.empty:
                 all_rows.append(df_file)
+
+        # Диагностика
+        if file_stats:
+            st.markdown("**Диагностика файлов:**")
+            st.dataframe(pd.DataFrame(file_stats),
+                         use_container_width=True, hide_index=True)
 
         if not all_rows:
             st.warning("Ни в одном файле не найдено колонок «ИД» и «Категория».")
@@ -689,18 +948,17 @@ def _render_import():
         combined = pd.concat(all_rows, ignore_index=True)
         combined_unique = combined.drop_duplicates(subset=["id"], keep="last")
 
+        # Диагностика
         total_rows = len(combined)
         unique_rows = len(combined_unique)
         unknown_cat = combined_unique["category"].isna().sum()
-        users_from_file = combined_unique["user_raw"].notna().sum()
-        dates_from_file = combined_unique["date_raw"].notna().sum()
+        n_sheets = combined_unique["source_sheet"].nunique()
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Всего строк", total_rows)
         c2.metric("Уникальных ID", unique_rows)
         c3.metric("Нераспознанных", int(unknown_cat))
-        c4.metric("«Кто» из файла", int(users_from_file))
-        c5.metric("«Когда» из файла", int(dates_from_file))
+        c4.metric("Листов", n_sheets)
 
         dist = combined_unique["category"].value_counts(dropna=False).reset_index()
         dist.columns = ["Категория", "Количество"]
@@ -714,12 +972,11 @@ def _render_import():
             st.dataframe(unknown_df, use_container_width=True, hide_index=True)
 
         with st.expander("Первые 10 строк для контроля", expanded=False):
+            cols = ["id", "category", "category_raw",
+                    "source_file", "source_sheet"]
+            available = [c for c in cols if c in combined_unique.columns]
             st.dataframe(
-                combined_unique.head(10)[
-                    ["id", "category", "category_raw",
-                     "user_raw", "date_raw",
-                     "source_file", "source_sheet"]
-                ],
+                combined_unique.head(10)[available],
                 use_container_width=True, hide_index=True,
             )
 
@@ -727,25 +984,28 @@ def _render_import():
     st.divider()
     st.markdown("#### 👤 Автор импорта")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        import_user = st.text_input(
-            "Кто выполняет импорт (имя для записи)",
-            value=user_default if user_default != "инженер" else "",
-            placeholder="Фамилия Имя Отчество",
-            key="cat_import_user",
-        )
-    with c2:
-        use_file_author = st.checkbox(
-            "Использовать «Кто изменил» из файла, если заполнено",
-            value=True,
-            key="cat_import_use_file_author",
-            help="Если в Excel заполнена колонка «Кто изменил» — она имеет приоритет над полем слева",
-        )
+    import_user = st.text_input(
+        "Кто выполняет импорт (имя для записи)",
+        value=user_default if user_default != "инженер" else "",
+        placeholder="Фамилия Имя Отчество",
+        key="cat_import_user",
+        help="Имя будет записано как автор всех категорий из этого импорта",
+    )
+
+    force_overwrite = st.checkbox(
+        "🔄 Перезаписать существующие категории",
+        value=False,
+        key="cat_import_force",
+        help="Если включено — импорт перезапишет категории, даже если "
+             "они уже были назначены другим специалистом. "
+             "По умолчанию — выключено (безопасный режим).",
+    )
 
     st.caption(
-        f"Итоговая логика: **{'из файла → иначе из поля «Кто выполняет импорт»' if use_file_author else 'всегда из поля «Кто выполняет импорт»'}**. "
-        f"Дата: из файла (если есть) → иначе текущее время."
+        f"**Автор** — из поля «Кто выполняет импорт». "
+        f"**Дата** — текущее время на момент импорта. "
+        f"**Режим** — "
+        f"{'🔄 принудительная перезапись' if force_overwrite else '🔒 безопасный (без перезаписи)'}."
     )
 
     # --- Применение ---
@@ -789,16 +1049,21 @@ def _render_import():
                 skipped_missing += 1
                 continue
 
-            # Определяем автора: из файла или из поля
-            if use_file_author and row.get("user_raw"):
-                row_user = str(row["user_raw"])
-            else:
-                row_user = import_user.strip()
+            # Автор — из поля «Кто выполняет импорт»
+            row_user = import_user.strip()
 
-            ok, msg = update_category_safe(
-                cid, cat, user=row_user,
-                expected_version=existing[cid],
-            )
+            if force_overwrite:
+                # Принудительная перезапись (игнорирует версию)
+                ok, msg = update_category_force(
+                    cid, cat, user=row_user,
+                )
+            else:
+                # Безопасный режим (проверка версии)
+                ok, msg = update_category_safe(
+                    cid, cat, user=row_user,
+                    expected_version=existing[cid],
+                )
+
             if ok:
                 saved += 1
                 existing[cid] = existing[cid] + 1
@@ -811,6 +1076,20 @@ def _render_import():
             f"Нераспознанных: **{skipped_unknown}** · "
             f"Конфликтов: **{len(conflicts)}**"
         )
+
+        if conflicts:
+            with st.expander(f"⚠️ Конфликты ({len(conflicts)})",
+                             expanded=True):
+                st.warning(
+                    "Эти ID уже были категоризированы другим пользователем. "
+                    "Перезапись не выполнена — сохранилась более ранняя "
+                    "категория. Если нужно перезаписать — сделайте это "
+                    "вручную на вкладке «Работа с замечаниями»."
+                )
+                for c in conflicts[:50]:
+                    st.write(f"- {c}")
+                if len(conflicts) > 50:
+                    st.caption(f"... и ещё {len(conflicts) - 50}")
 
         if conflicts:
             with st.expander("⚠️ Конфликты (первые 30)"):
