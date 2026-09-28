@@ -31,25 +31,36 @@ from vitro.ui._utils import download_plotly
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_data() -> dict:
-    """Собирает всё, что нужно для прогноза."""
+    """
+    Собирает все данные для прогноза.
+
+    Использует категоризацию из deadlines для точного подсчёта
+    реально активных (без A/B-учтённых и хронических).
+    """
+    from vitro.ui.deadlines import _load_all_categorized
+
     result = {}
 
+    # =====================================================================
+    #  1. Категоризация из deadlines (единый источник истины)
+    # =====================================================================
+    cats_df = _load_all_categorized()
+
     with get_conn() as conn:
-        # --- Общее состояние ---
-        result["totals"] = dict(conn.execute("""
+        # Базовые метрики из БД
+        base = dict(conn.execute("""
             SELECT
                 COUNT(*) AS total,
                 SUM(CASE WHEN status IN ('Закрыто','Выполнено')
                          THEN 1 ELSE 0 END) AS closed,
-                SUM(CASE WHEN status IN ('Новое','Принято в работу',
-                                          'Не принято','К обсуждению')
-                         THEN 1 ELSE 0 END) AS active,
                 SUM(CASE WHEN status = 'Аннулировано'
                          THEN 1 ELSE 0 END) AS annulled
             FROM comments
         """).fetchone())
 
-        # --- Темпы выдачи по месяцам ---
+        # =================================================================
+        #  2. Темпы выдачи (по created)
+        # =================================================================
         issue = pd.read_sql("""
             SELECT substr(created, 1, 7) AS ym, COUNT(*) AS n
             FROM comments
@@ -58,17 +69,21 @@ def _load_data() -> dict:
             ORDER BY ym
         """, conn)
 
-        # --- Темпы ответов по месяцам ---
+        # =================================================================
+        #  3. Темпы наших ответов (по fix_date + статус)
+        # =================================================================
         fix = pd.read_sql("""
             SELECT substr(fix_date, 1, 7) AS ym, COUNT(*) AS n
             FROM comments
             WHERE fix_date IS NOT NULL AND fix_date <> ''
-              AND status IN ('Закрыто','Выполнено')
+              AND status IN ('Закрыто', 'Выполнено')
             GROUP BY ym
             ORDER BY ym
         """, conn)
 
-        # --- Темпы закрытия по месяцам (Закрыто) ---
+        # =================================================================
+        #  4. Темпы закрытия заказчиком (только «Закрыто»)
+        # =================================================================
         closed = pd.read_sql("""
             SELECT substr(fix_date, 1, 7) AS ym, COUNT(*) AS n
             FROM comments
@@ -78,7 +93,9 @@ def _load_data() -> dict:
             ORDER BY ym
         """, conn)
 
-        # --- По дисциплинам (для зоны риска) ---
+        # =================================================================
+        #  5. По дисциплинам (для прогноза покрытия)
+        # =================================================================
         by_disc = pd.read_sql("""
             SELECT
                 d.discipline AS discipline,
@@ -95,7 +112,66 @@ def _load_data() -> dict:
             ORDER BY d.discipline
         """, conn)
 
-    # Объединяем выдачи/ответы/закрытия в один DataFrame
+    # =====================================================================
+    #  6. Реально активные (с учётом категорий из deadlines)
+    # =====================================================================
+    if not cats_df.empty:
+        # Реально активные = наша сторона + ждут заказчика (без хроники)
+        real_active_flags = [
+            # Наша сторона
+            "new_overdue", "new_in_progress",
+            "in_work_overdue", "in_work_in_progress",
+            "rejected_overdue", "rejected_in_progress",
+            "discussion_overdue", "discussion_in_progress",
+            # Заказчик (без хронических)
+            "waiting_customer", "waiting_customer_overdue",
+            "waiting_customer_ontime",
+        ]
+
+        real_active_df = cats_df[cats_df["category_flag"].isin(real_active_flags)]
+        real_active = len(real_active_df)
+
+        # Учтённые (лист A/B) — фактически приняты, но не закрыты формально
+        closed_by_doc = cats_df[
+            cats_df["category_flag"] == "closed_by_doc_status"
+        ].shape[0]
+
+        # Хронические (>90 р.д.) — ждут заказчика, но не реальные
+        chronic = cats_df[
+            cats_df["category_flag"] == "waiting_customer_chronic"
+        ].shape[0]
+
+        # Наша сторона (сумма 4 категорий)
+        ours = cats_df[cats_df["category_flag"].isin([
+            "new_overdue", "new_in_progress",
+            "in_work_overdue", "in_work_in_progress",
+            "rejected_overdue", "rejected_in_progress",
+            "discussion_overdue", "discussion_in_progress",
+        ])].shape[0]
+
+        # Ждут заказчика (без хроники)
+        waiting = cats_df[cats_df["category_flag"].isin([
+            "waiting_customer", "waiting_customer_overdue",
+            "waiting_customer_ontime",
+        ])].shape[0]
+    else:
+        real_active = closed_by_doc = chronic = ours = waiting = 0
+
+    result["totals"] = {
+        "total": base["total"] or 0,
+        "closed": base["closed"] or 0,
+        "annulled": base["annulled"] or 0,
+        "active": real_active,
+        # Расширенные категории
+        "ours": ours,
+        "waiting": waiting,
+        "closed_by_doc": closed_by_doc,
+        "chronic": chronic,
+    }
+
+    # =====================================================================
+    #  7. Объединение выдачи/ответов/закрытий в одну таблицу по месяцам
+    # =====================================================================
     merged = pd.merge(
         issue.rename(columns={"n": "Выдано"}),
         fix.rename(columns={"n": "Отвечено"}),
@@ -114,7 +190,6 @@ def _load_data() -> dict:
     result["by_disc"] = by_disc
 
     return result
-
 
 # ---------------------------------------------------------------------------
 #  KPI — средние темпы
@@ -153,6 +228,17 @@ def _render_kpi(data: dict) -> dict:
               delta="плохо" if avg_delta > 0 else "хорошо",
               delta_color="inverse" if avg_delta > 0 else "normal",
               help="Если положительное — задолженность растёт")
+
+    # Разъяснение
+    totals = data["totals"]
+    st.caption(
+        f"**Активных сейчас: {int(totals['active']):,}** "
+        f"(из них **наша сторона: {int(totals['ours']):,}**, "
+        f"**ждут заказчика: {int(totals['waiting']):,}**).\n"
+        f"Не учитываются: **{int(totals['closed_by_doc']):,}** фактически "
+        f"принятых (лист A/B) и **{int(totals['chronic']):,}** хронических "
+        f"(> 90 р.д.) — они не влияют на прогноз.".replace(",", " ")
+    )
 
     return {
         "avg_issue": avg_issue,
