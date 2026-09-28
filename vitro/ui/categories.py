@@ -224,13 +224,38 @@ def _load_by_author(limit: int = 30) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_categorization_progress() -> dict:
+    """
+    Прогресс категоризации — только по активным статусам.
+    Закрытые и аннулированные не считаются.
+    """
     with get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
-        done  = conn.execute(
-            "SELECT COUNT(*) FROM comments "
-            "WHERE category IS NOT NULL AND category <> ''"
+        # Всего активных
+        total = conn.execute("""
+            SELECT COUNT(*) FROM comments
+            WHERE status IN ('Новое', 'Принято в работу',
+                              'Не принято', 'К обсуждению', 'Выполнено')
+        """).fetchone()[0]
+
+        # Из них с категорией
+        done = conn.execute("""
+            SELECT COUNT(*) FROM comments
+            WHERE status IN ('Новое', 'Принято в работу',
+                              'Не принято', 'К обсуждению', 'Выполнено')
+              AND category IS NOT NULL AND category <> ''
+        """).fetchone()[0]
+
+        # Для справки — сколько всего в БД (включая закрытые)
+        total_all = conn.execute(
+            "SELECT COUNT(*) FROM comments"
         ).fetchone()[0]
-        return {"total": total, "done": done, "left": total - done}
+
+    return {
+        "total": total,
+        "done": done,
+        "left": total - done,
+        "total_all": total_all,
+        "closed_for_ref": total_all - total,
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -265,14 +290,23 @@ def _render_analysis():
     left = prog["left"]
     pct = round(done / total * 100, 1) if total else 0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Всего замечаний", f"{total:,}".replace(",", " "))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Активных замечаний",
+              f"{total:,}".replace(",", " "),
+              help="Новое, Принято в работу, Не принято, "
+                   "К обсуждению, Выполнено")
     c2.metric("Разобрано", f"{done:,}".replace(",", " "))
     c3.metric("Осталось", f"{left:,}".replace(",", " "))
     c4.metric(
         "Прогресс",
         f"{pct}%",
-        help="Сколько замечаний уже имеют категорию",
+        help="Сколько активных замечаний уже имеют категорию",
+    )
+    c5.metric(
+        "Закрыто (для справки)",
+        f"{prog['closed_for_ref']:,}".replace(",", " "),
+        help="Закрыто + Аннулировано — не входит в прогресс, "
+             "используется только в общих отчётах",
     )
 
     # Прогресс-бар
@@ -481,11 +515,13 @@ def _collapse_repeats(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 #  Редактор
 # ---------------------------------------------------------------------------
 def _render_editor():
+    """Редактор категорий — только активные замечания."""
     st.markdown("### 📝 Работа с замечаниями")
     st.caption(
-        "Выберите дисциплину → раздел → комплект, заполните колонку «Категория» "
-        "и нажмите «Сохранить». Пустая ячейка в колонках комплекта/листа "
-        "означает «то же, что выше»."
+        "Редактор показывает **только активные замечания** "
+        "(Новое, Принято в работу, Не принято, К обсуждению). "
+        "Закрытые и аннулированные сюда не попадают. "
+        "Чтобы увидеть «Выполнено» (ждут заказчика) — включите чекбокс ниже."
     )
 
     st.markdown("""
@@ -501,83 +537,121 @@ def _render_editor():
     </style>
     """, unsafe_allow_html=True)
 
+    # =================================================================
+    #  НАСТРОЙКИ
+    # =================================================================
+    c_show, c_only = st.columns([2, 1])
+
+    with c_show:
+        show_waiting = st.checkbox(
+            "🔵 Показать «Выполнено» (ждут заказчика)",
+            value=False,
+            key="cat_show_waiting",
+            help="Если выключено — в редакторе только 4 активных статуса. "
+                 "Если включено — добавляются замечания со статусом "
+                 "«Выполнено» (мы ответили, ждём рассмотрения).",
+        )
+
+    with c_only:
+        only_uncategorized = st.checkbox(
+            "Только без категории",
+            value=False,
+            key="cat_only_uncat",
+        )
+
+    # =================================================================
+    #  ФИЛЬТРЫ ПО ИЕРАРХИИ
+    # =================================================================
     disc_options = _load_discipline_options()
 
-    # --- Каскад: Дисциплина → Раздел → Комплект ---
-    c1, c2, c3 = st.columns(3)
+    with st.expander("🎛 Фильтры", expanded=False):
+        c1, c2, c3 = st.columns(3)
 
-    with c1:
-        sel_disc_labels = st.multiselect(
-            "Дисциплина",
-            options=list(disc_options.values()),
-            placeholder="Все дисциплины",
-            key="cat_disc",
-        )
-        sel_disc = [code for code, label in disc_options.items()
-                    if label in sel_disc_labels]
-
-    section_options = _load_section_options(tuple(sel_disc) if sel_disc else ())
-
-    with c2:
-        if section_options:
-            sel_section_labels = st.multiselect(
-                "Раздел",
-                options=list(section_options.values()),
-                placeholder="Все разделы",
-                key="cat_section",
+        with c1:
+            sel_disc_labels = st.multiselect(
+                "Дисциплина",
+                options=list(disc_options.values()),
+                placeholder="Все дисциплины",
+                key="cat_disc",
             )
-            sel_section = [code for code, label in section_options.items()
-                           if label in sel_section_labels]
-        else:
-            sel_section = []
-            # Заглушка-мультиселект: визуально такой же, но отключён
-            st.multiselect(
-                "Раздел",
-                options=[],
-                placeholder="Разделы не применимы (нет у выбранных дисциплин)",
-                disabled=True,
-                key="cat_section_empty",
+            sel_disc = [code for code, label in disc_options.items()
+                        if label in sel_disc_labels]
+
+        section_options = _load_section_options(
+            tuple(sel_disc) if sel_disc else ())
+
+        with c2:
+            if section_options:
+                sel_section_labels = st.multiselect(
+                    "Раздел",
+                    options=list(section_options.values()),
+                    placeholder="Все разделы",
+                    key="cat_section",
+                )
+                sel_section = [code for code, label in section_options.items()
+                               if label in sel_section_labels]
+            else:
+                sel_section = []
+                st.multiselect(
+                    "Раздел", options=[],
+                    placeholder="Разделы не применимы",
+                    disabled=True,
+                    key="cat_section_empty",
+                )
+
+        kit_options = _load_kit_options(
+            tuple(sel_disc) if sel_disc else (),
+            tuple(sel_section) if sel_section else ())
+
+        with c3:
+            sel_kit_labels = st.multiselect(
+                "Комплект",
+                options=list(kit_options.values()),
+                placeholder="Все комплекты",
+                key="cat_kit",
+            )
+            sel_kit = [code for code, label in kit_options.items()
+                       if label in sel_kit_labels]
+
+        c4, c5 = st.columns(2)
+        with c4:
+            # Список статусов зависит от show_waiting
+            if show_waiting:
+                status_options = [
+                    "Новое", "Принято в работу", "Не принято",
+                    "К обсуждению", "Выполнено",
+                ]
+            else:
+                status_options = [
+                    "Новое", "Принято в работу",
+                    "Не принято", "К обсуждению",
+                ]
+
+            sel_status = st.multiselect(
+                "Статус замечания",
+                options=status_options,
+                default=status_options,
+                placeholder="Все доступные статусы",
+                key="cat_status",
             )
 
-    kit_options = _load_kit_options(
-        tuple(sel_disc) if sel_disc else (),
-        tuple(sel_section) if sel_section else (),
-    )
+        with c5:
+            limit = st.number_input(
+                "Лимит строк",
+                min_value=50, max_value=2000,
+                value=300, step=50, key="cat_limit",
+            )
 
-    with c3:
-        sel_kit_labels = st.multiselect(
-            "Комплект",
-            options=list(kit_options.values()),
-            placeholder="Все комплекты",
-            key="cat_kit",
-        )
-        sel_kit = [code for code, label in kit_options.items()
-                   if label in sel_kit_labels]
-
-    # --- Статус и лимит ---
-    c4, c5 = st.columns([2, 1])
-    with c4:
-        sel_status = st.multiselect(
-            "Текущий статус замечания",
-            API_STATUSES,
-            default=[],
-            placeholder="Все статусы",
-            key="cat_status",
-        )
-    with c5:
-        limit = st.number_input("Лимит строк", min_value=50, max_value=2000,
-                                value=300, step=50, key="cat_limit")
-
-    only_uncat = st.checkbox("Только без категории", value=False,
-                             key="cat_only_uncat")
-
-    # --- Загрузка ---
+    # =================================================================
+    #  ЗАГРУЗКА СРЕЗА
+    # =================================================================
     df = load_remarks_for_editor(
-        disciplines=sel_disc or None,
-        sections=sel_section or None,
-        kits=sel_kit or None,
-        statuses=sel_status or None,
-        only_uncategorized=only_uncat,
+        disciplines=tuple(sel_disc) if sel_disc else None,
+        sections=tuple(sel_section) if sel_section else None,
+        kits=tuple(sel_kit) if sel_kit else None,
+        statuses=tuple(sel_status) if sel_status else None,
+        only_uncategorized=only_uncategorized,
+        show_waiting=show_waiting,
         limit=int(limit),
     )
 
@@ -591,11 +665,14 @@ def _render_editor():
         f"«Лист», «Название листа» означают, что значение совпадает с ячейкой выше."
     )
 
+    # Эмодзи-префиксы для категорий
     df["category"] = df["category"].apply(_add_prefix)
 
+    # Скрытие повторов для визуальной группировки
     group_cols = ["discipline", "section", "complex", "sheet", "sheet_name"]
     view = _collapse_repeats(df, group_cols)
 
+    # Порядок колонок
     desired_order = [
         "id", "discipline", "section", "complex",
         "sheet", "sheet_name", "comment",
@@ -604,24 +681,41 @@ def _render_editor():
     ]
     view = view[[c for c in desired_order if c in view.columns]]
 
+    # =================================================================
+    #  РЕДАКТОР
+    # =================================================================
     edited = st.data_editor(
         view,
         column_config={
-            "id":               st.column_config.NumberColumn("ID", disabled=True, width="small"),
-            "discipline":       st.column_config.TextColumn("Дисциплина", disabled=True, width="small"),
-            "section":          st.column_config.TextColumn("Раздел", disabled=True, width="small"),
-            "complex":          st.column_config.TextColumn("Комплект", disabled=True, width="medium"),
-            "sheet":            st.column_config.TextColumn("Лист", disabled=True, width="medium"),
-            "sheet_name":       st.column_config.TextColumn("Название листа", disabled=True, width="large"),
-            "comment":          st.column_config.TextColumn("Замечание", disabled=True, width="large"),
-            "api_status":       st.column_config.TextColumn("Текущий статус замечания", disabled=True),
-            "author":           st.column_config.TextColumn("Автор", disabled=True),
-            "created":          st.column_config.TextColumn("Создано", disabled=True, width="small"),
+            "id":               st.column_config.NumberColumn(
+                                    "ID", disabled=True, width="small"),
+            "discipline":       st.column_config.TextColumn(
+                                    "Дисциплина", disabled=True, width="small"),
+            "section":          st.column_config.TextColumn(
+                                    "Раздел", disabled=True, width="small"),
+            "complex":          st.column_config.TextColumn(
+                                    "Комплект", disabled=True, width="medium"),
+            "sheet":            st.column_config.TextColumn(
+                                    "Лист", disabled=True, width="medium"),
+            "sheet_name":       st.column_config.TextColumn(
+                                    "Название листа", disabled=True, width="large"),
+            "comment":          st.column_config.TextColumn(
+                                    "Замечание", disabled=True, width="large"),
+            "api_status":       st.column_config.TextColumn(
+                                    "Текущий статус замечания", disabled=True),
+            "author":           st.column_config.TextColumn(
+                                    "Автор", disabled=True),
+            "created":          st.column_config.TextColumn(
+                                    "Создано", disabled=True, width="small"),
             "category":         st.column_config.SelectboxColumn(
-                                    "Категория", options=CAT_OPTIONS_DISPLAY,
-                                    required=False, help="Выберите категорию"),
-            "category_user":    st.column_config.TextColumn("Кто", disabled=True, width="small"),
-            "category_date":    st.column_config.TextColumn("Когда", disabled=True, width="small"),
+                                    "Категория",
+                                    options=CAT_OPTIONS_DISPLAY,
+                                    required=False,
+                                    help="Выберите категорию"),
+            "category_user":    st.column_config.TextColumn(
+                                    "Кто", disabled=True, width="small"),
+            "category_date":    st.column_config.TextColumn(
+                                    "Когда", disabled=True, width="small"),
             "category_version": None,
         },
         disabled=["id", "discipline", "section", "complex", "sheet",
@@ -632,6 +726,9 @@ def _render_editor():
         key="categorization_editor",
     )
 
+    # =================================================================
+    #  СОХРАНЕНИЕ
+    # =================================================================
     col_save, _ = st.columns([1, 3])
     with col_save:
         save_clicked = st.button("💾 Сохранить изменения", type="primary",

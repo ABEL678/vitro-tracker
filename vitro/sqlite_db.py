@@ -224,14 +224,18 @@ def update_category_force(comment_id: int, category: str,
 # ---------------------------------------------------------------------------
 def load_remarks_for_editor(disciplines=None, kits=None, sections=None,
                             statuses=None, only_uncategorized=False,
-                            limit: int = 500):
+                            show_waiting=False, limit: int = 500):
     """
-    Возвращает срез замечаний с учётом каскадных фильтров.
+    Возвращает срез замечаний для редактора.
 
-    Поля:
-      id, discipline, section, complex, sheet (без .pdf), sheet_name,
-      comment, api_status, author, created (дд.мм.гггг),
-      category, category_user, category_date, category_version
+    Параметры:
+      disciplines, kits, sections — фильтры по иерархии.
+      statuses — список статусов.
+      only_uncategorized — только без категории.
+      show_waiting — если False, статус «Выполнено» исключается.
+      limit — максимум строк.
+
+    НИКОГДА не возвращает: Закрыто, Аннулировано.
     """
     import pandas as pd
 
@@ -242,6 +246,7 @@ def load_remarks_for_editor(disciplines=None, kits=None, sections=None,
                d.complex,
                REPLACE(REPLACE(d.leaf, '.pdf', ''), '.PDF', '') AS sheet,
                d.name AS sheet_name,
+               d.status AS doc_status,
                c.comment,
                c.status AS api_status,
                c.author,
@@ -256,6 +261,31 @@ def load_remarks_for_editor(disciplines=None, kits=None, sections=None,
     """
     params: list = []
 
+    # Жёсткое ограничение: НИКОГДА не показываем Закрыто / Аннулировано
+    q += " AND c.status NOT IN ('Закрыто', 'Аннулировано')"
+
+    # Статусы: если show_waiting=False — исключаем «Выполнено»
+    if show_waiting:
+        allowed_statuses = [
+            "Новое", "Принято в работу", "Не принято",
+            "К обсуждению", "Выполнено",
+        ]
+    else:
+        allowed_statuses = [
+            "Новое", "Принято в работу", "Не принято", "К обсуждению",
+        ]
+
+    if statuses:
+        effective = [s for s in statuses if s in allowed_statuses]
+        if effective:
+            q += f" AND c.status IN ({','.join('?' * len(effective))})"
+            params += effective
+        else:
+            q += " AND 1=0"
+    else:
+        q += f" AND c.status IN ({','.join('?' * len(allowed_statuses))})"
+        params += allowed_statuses
+
     if disciplines:
         q += f" AND d.discipline IN ({','.join('?' * len(disciplines))})"
         params += list(disciplines)
@@ -265,13 +295,10 @@ def load_remarks_for_editor(disciplines=None, kits=None, sections=None,
     if kits:
         q += f" AND d.complex IN ({','.join('?' * len(kits))})"
         params += list(kits)
-    if statuses:
-        q += f" AND c.status IN ({','.join('?' * len(statuses))})"
-        params += list(statuses)
     if only_uncategorized:
         q += " AND (c.category IS NULL OR c.category = '')"
 
-    q += " ORDER BY d.discipline, d.section, d.complex, d.leaf, c.id LIMIT ?"
+    q += " ORDER BY d.complex, d.leaf, c.id LIMIT ?"
     params.append(limit)
 
     with get_conn() as conn:
