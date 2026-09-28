@@ -65,12 +65,31 @@ def _load_all_categorized() -> pd.DataFrame:
     """
     Возвращает все активные замечания с рассчитанными полями
     и категорией (category_flag).
+
+    Категории:
+      НАША сторона:
+        new_overdue / new_in_progress
+        in_work_overdue / in_work_in_progress
+        rejected_overdue / rejected_in_progress
+        discussion_overdue / discussion_in_progress
+
+      ЗАКАЗЧИК:
+        waiting_customer / waiting_customer_overdue /
+        waiting_customer_ontime (все — «Выполнено» < 90 р.д.)
+        waiting_customer_chronic (> 90 р.д.)
+
+      УЧТЁННЫЕ:
+        closed_by_doc_status (лист A/B, статус «Выполнено»)
+
+      АРХИВ:
+        abandoned (> 90 календарных дней без движения)
     """
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT
                 c.id, c.doc_id, c.comment, c.status, c.author, c.created,
-                c.fix_date, c.category_date, c.category,
+                c.fix_date, c.category, c.category_date,
+                c.category_user, c.category_version,
                 d.discipline, d.section, d.complex,
                 REPLACE(REPLACE(d.leaf, '.pdf', ''), '.PDF', '') AS sheet,
                 d.name AS sheet_name,
@@ -202,11 +221,15 @@ def _load_all_categorized() -> pd.DataFrame:
             "created_d": created,
             "fix_date": r["fix_date"],
             "fix_date_d": fix_d,
+            "category": r["category"],
+            "category_date": r["category_date"],
             "category_date_d": cat_d,
+            "category_user": r["category_user"],
+            "category_version": r["category_version"],
             "due_date_d": due,
             "customer_due_d": cust_due,
             "days_overdue_work": wd_overdue_work,
-            "days_waiting_customer": wd_waiting_customer,
+            "days_waiting_customer": wd_waiting_customer,  # ← ВАЖНО
             "wd_since_created": workdays_between(created, today),
             "days_since_movement": days_since_movement,
             "category_flag": category,
@@ -408,6 +431,7 @@ def _render_category(df: pd.DataFrame,
 #  Ждут заказчика (свежие + просроченные, без хронических)
 # ---------------------------------------------------------------------------
 def _render_waiting_customer(df: pd.DataFrame):
+    """Под-вкладка «Ждут заказчика» — свежие + просроченные (без хронических)."""
     st.markdown("### 🔵 Ждут заказчика")
     st.info(
         "**Что это значит:** мы ответили (статус «Выполнено»), но заказчик "
@@ -415,83 +439,122 @@ def _render_waiting_customer(df: pd.DataFrame):
         "статус A или B. **Это его вина.**"
     )
 
-    sub = df[df["category_flag"].isin(
-        ["waiting_customer", "waiting_customer_overdue"])].copy()
+    waiting_flags = [
+        "waiting_customer",
+        "waiting_customer_overdue",
+        "waiting_customer_ontime",
+    ]
+    sub = df[df["category_flag"].isin(waiting_flags)].copy()
 
     if sub.empty:
         st.success("🎉 Нет замечаний, ждущих заказчика.")
         return
 
-    def _bucket(days):
-        if days <= 30:
-            return "🟡 Свежие (10–30 р.д.)"
-        else:
-            return "🟠 Просроченные (30–90 р.д.)"
+    # ============================================================
+    #  KPI
+    # ============================================================
+    fresh = (sub["category_flag"] == "waiting_customer").sum()
+    overdue = (sub["category_flag"] == "waiting_customer_overdue").sum()
+    ontime = (sub["category_flag"] == "waiting_customer_ontime").sum()
 
-    sub["Возраст"] = sub["days_waiting_customer"].apply(_bucket)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Всего", f"{len(sub):,}".replace(",", " "))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Всего ждут", f"{len(sub):,}".replace(",", " "))
     c2.metric("🟡 Свежие (10–30 р.д.)",
-              f"{(sub['Возраст'] == '🟡 Свежие (10–30 р.д.)').sum():,}"
-              .replace(",", " "))
+              f"{fresh:,}".replace(",", " "))
     c3.metric("🟠 Просроченные (30–90 р.д.)",
-              f"{(sub['Возраст'] == '🟠 Просроченные (30–90 р.д.)').sum():,}"
-              .replace(",", " "))
+              f"{overdue:,}".replace(",", " "))
+    c4.metric("🟢 Ещё в сроке (≤10 р.д.)",
+              f"{ontime:,}".replace(",", " "),
+              help="Мы ответили недавно, заказчик ещё в сроке")
 
     st.divider()
 
-    # График по возрастным бакетам
-    bucket_counts = sub["Возраст"].value_counts().reset_index()
-    bucket_counts.columns = ["Возраст", "Количество"]
+    # ============================================================
+    #  График распределения по возрасту
+    # ============================================================
+    st.markdown("##### 📊 Распределение по возрасту ожидания")
 
-    order = ["🟡 Свежие (10–30 р.д.)", "🟠 Просроченные (30–90 р.д.)"]
-    bucket_counts["Возраст"] = pd.Categorical(
-        bucket_counts["Возраст"], categories=order, ordered=True)
-    bucket_counts = bucket_counts.sort_values("Возраст")
+    # Группируем по бакету
+    def _bucket(row):
+        days = row["days_waiting_customer"]
+        if days <= 10:
+            return "🟢 ≤10 р.д."
+        elif days <= 30:
+            return "🟡 10–30 р.д."
+        elif days <= 90:
+            return "🟠 30–90 р.д."
+        else:
+            return "🔴 >90 р.д. (хроника)"
 
+    sub["_bucket"] = sub.apply(_bucket, axis=1)
+
+    bucket_counts = (sub.groupby("_bucket").size()
+                        .reset_index(name="Количество"))
+
+    order = ["🟢 ≤10 р.д.", "🟡 10–30 р.д.",
+             "🟠 30–90 р.д.", "🔴 >90 р.д. (хроника)"]
     color_map = {
-        "🟡 Свежие (10–30 р.д.)": "#FFD54F",
-        "🟠 Просроченные (30–90 р.д.)": "#FFB74D",
+        "🟢 ≤10 р.д.": "#A5D6A7",
+        "🟡 10–30 р.д.": "#FFD54F",
+        "🟠 30–90 р.д.": "#FFB74D",
+        "🔴 >90 р.д. (хроника)": "#E57373",
     }
 
     fig = px.bar(
-        bucket_counts, x="Возраст", y="Количество",
+        bucket_counts, x="_bucket", y="Количество",
         text="Количество",
-        color="Возраст",
+        color="_bucket",
         color_discrete_map=color_map,
+        category_orders={"_bucket": order},
     )
     fig.update_traces(textposition="outside")
-    fig.update_layout(showlegend=False, height=350)
+    fig.update_layout(showlegend=False, height=350,
+                       xaxis_title="", yaxis_title="Замечаний")
     st.plotly_chart(fig, use_container_width=True)
     download_plotly(fig, "Сроки_ждут_заказчика_возраст", "dl_wait_age")
 
     st.divider()
 
-    # Топ авторов
-    st.markdown("##### 👤 Топ-10 авторов")
-    top_authors = (sub.groupby("author").size()
-                      .reset_index(name="Ожидают")
-                      .sort_values("Ожидают", ascending=True)
-                      .tail(10))
+    # ============================================================
+    #  Топ-10 авторов
+    # ============================================================
+    st.markdown("##### 👤 Топ-10 авторов, чьи ответы ждут решения")
 
-    fig = px.bar(
-        top_authors, x="Ожидают", y="author", orientation="h",
-        text="Ожидают",
-        labels={"author": ""},
-        color_discrete_sequence=["#64B5F6"],
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(height=max(300, 30 * len(top_authors)))
-    st.plotly_chart(fig, use_container_width=True)
-    download_plotly(fig, "Сроки_ждут_авторы", "dl_wait_authors")
+    top_auth = (sub.groupby("author").size()
+                   .reset_index(name="Ожидают")
+                   .sort_values("Ожидают", ascending=True)
+                   .tail(10))
 
-    # Таблица
+    if not top_auth.empty:
+        fig = px.bar(
+            top_auth, x="Ожидают", y="author", orientation="h",
+            text="Ожидают",
+            color_discrete_sequence=["#64B5F6"],
+            labels={"author": ""},
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=max(300, 30 * len(top_auth)))
+        st.plotly_chart(fig, use_container_width=True)
+        download_plotly(fig, "Сроки_ждут_авторы", "dl_wait_authors")
+
+    st.divider()
+
+    # ============================================================
+    #  Таблица
+    # ============================================================
     st.markdown(f"##### 📋 Список ({len(sub):,})".replace(",", " "))
+
+    # Сортируем по убыванию возраста ожидания
+    sub = sub.sort_values("days_waiting_customer", ascending=False)
+
+    # Явно формируем таблицу — без потери колонок
     table = sub[[
         "id", "discipline", "complex", "sheet",
-        "comment", "author", "fix_date", "days_waiting_customer", "Возраст",
-    ]].copy().rename(columns={
+        "comment", "author", "fix_date",
+        "days_waiting_customer", "_bucket",
+    ]].copy()
+
+    table = table.rename(columns={
         "id": "ID",
         "discipline": "Дисциплина",
         "complex": "Комплект",
@@ -500,9 +563,8 @@ def _render_waiting_customer(df: pd.DataFrame):
         "author": "Автор",
         "fix_date": "Наш ответ",
         "days_waiting_customer": "Ждём (р.д.)",
-        "Возраст": "Категория",
+        "_bucket": "Возраст",
     })
-    table = table.sort_values("Ждём (р.д.)", ascending=False)
 
     st.dataframe(
         table.head(500),
@@ -512,9 +574,13 @@ def _render_waiting_customer(df: pd.DataFrame):
             "Ждём (р.д.)": st.column_config.NumberColumn(format="%d"),
         },
     )
+    if len(table) > 500:
+        st.caption(f"Показаны первые 500 из {len(table):,}.".replace(",", " "))
 
-    # Экспорт
-    with st.expander("📧 Выгрузить для письма", expanded=False):
+    # ============================================================
+    #  Экспорт
+    # ============================================================
+    with st.expander("📧 Выгрузить для письма заказчику", expanded=False):
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             table.to_excel(writer, index=False, sheet_name="Ждут заказчика")
@@ -527,7 +593,6 @@ def _render_waiting_customer(df: pd.DataFrame):
                   ".spreadsheetml.sheet"),
             use_container_width=True,
         )
-
 
 # ---------------------------------------------------------------------------
 #  Хронические

@@ -3,20 +3,39 @@
 👤 Авторы — аналитика по инженерам.
 """
 
+import io
+from datetime import date, datetime
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from vitro.sqlite_db import get_conn
+from vitro.sqlite_db import get_conn, update_category_safe
+from vitro.workdays import parse_date, workdays_between
 from vitro.disciplines import discipline_name
 from vitro.ui._utils import download_plotly, safe_filename
 
 
+# ---- Категории замечаний ----
 CAT_1 = "Принято/корректное"
 CAT_2 = "Формальное/нет влияния на СМР"
 CAT_3 = "Доп.требование/отсутствует в ТЗ"
 CAT_4 = "Не принято/нарушение ТНПА"
 
+# Эмодзи-префиксы
+CAT_PREFIX = {
+    CAT_1: "🟢",
+    CAT_2: "🟡",
+    CAT_3: "🔵",
+    CAT_4: "🔴",
+}
+
+# Отображаемые варианты (с эмодзи)
+CAT_OPTIONS_DISPLAY = [
+    f"{CAT_PREFIX[c]}" + f" {c}" for c in [CAT_1, CAT_2, CAT_3, CAT_4]
+]
+
+# Цвета для графиков (короткие подписи)
 CAT_COLORS = {
     "Принято":       "#C6EFCE",
     "Формальное":    "#FFEB9C",
@@ -24,6 +43,27 @@ CAT_COLORS = {
     "Не принято":    "#FFC7CE",
     "Без категории": "#D9D9D9",
 }
+
+
+# ---- Вспомогательные функции ----
+def _strip_prefix(display_value: str) -> str:
+    """Убирает эмодзи-префикс."""
+    if not display_value:
+        return ""
+    for prefix in CAT_PREFIX.values():
+        if display_value.startswith(prefix):
+            return display_value[len(prefix):].strip()
+    return display_value.strip()
+
+
+def _add_prefix(raw_value):
+    """Добавляет эмодзи-префикс."""
+    if not raw_value or pd.isna(raw_value):
+        return None
+    for cat, prefix in CAT_PREFIX.items():
+        if raw_value == cat:
+            return f"{prefix} {cat}"
+    return raw_value
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -300,6 +340,66 @@ def _load_author_comments(author: str) -> pd.DataFrame:
             FROM comments c JOIN documents d ON c.doc_id = d.id
             WHERE c.author = ? ORDER BY c.created DESC LIMIT 500
         """, conn, params=(author,))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_waiting_review(disciplines=None, kits=None,
+                         sections=None) -> pd.DataFrame:
+    """
+    Загружает замечания «Выполнено» из единого источника —
+    `deadlines._load_all_categorized`. Синхронизировано с дашбордом.
+    Исключает архивные (abandoned).
+    """
+    from vitro.ui.deadlines import _load_all_categorized
+
+    df = _load_all_categorized()
+    if df.empty:
+        return df
+
+    # Оставляем только «Выполнено» из релевантных категорий
+    waiting_flags = [
+        "waiting_customer",
+        "waiting_customer_overdue",
+        "waiting_customer_ontime",
+        "waiting_customer_chronic",
+        "closed_by_doc_status",
+    ]
+    df = df[df["category_flag"].isin(waiting_flags)].copy()
+
+    if df.empty:
+        return df
+
+    # Фильтры по иерархии
+    if disciplines:
+        df = df[df["discipline"].isin(disciplines)]
+    if sections:
+        df = df[df["section"].isin(sections)]
+    if kits:
+        df = df[df["complex"].isin(kits)]
+
+    # Человеческие бакеты
+    def _bucket(row):
+        flag = row["category_flag"]
+        if flag == "closed_by_doc_status":
+            return "🟢 Учтено (A/B)"
+        if flag == "waiting_customer_chronic":
+            return "🔴 Хронические (> 90 р.д.)"
+        if flag == "waiting_customer_overdue":
+            return "🟠 Просроченные (30–90 р.д.)"
+        if flag == "waiting_customer":
+            return "🟡 Свежие (10–30 р.д.)"
+        if flag == "waiting_customer_ontime":
+            return "🟡 Свежие (в сроке)"
+        return "Прочее"
+
+    df["bucket"] = df.apply(_bucket, axis=1)
+
+    # Переименовываем колонки для UI
+    df["fix_date"] = df["fix_date"].fillna("")
+    df["days_waiting"] = df["days_waiting_customer"]
+
+    return df
+
 
 
 def _render_top_authors(df: pd.DataFrame, limit: int = 20):
@@ -681,10 +781,304 @@ def _render_drilldown(df: pd.DataFrame):
                  })
 
 
+def _render_waiting_review():
+    """Под-вкладка «Ответ дан, ожидают рассмотрения заказчика»."""
+    st.markdown("### 🔵 Ответ дан, ожидают рассмотрения заказчика")
+    st.caption(
+        "Замечания в статусе **«Выполнено»**. Мы ответили — ждём решения "
+        "заказчика. Это **его вина**, если долго не рассматривает. "
+        "Категорию можно поставить или изменить — если нужно."
+    )
+
+    # =================================================================
+    #  Фильтры
+    # =================================================================
+    disc_options = _load_discipline_options()
+
+    with st.expander("🎛 Фильтры", expanded=False):
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            sel_disc_labels = st.multiselect(
+                "Дисциплина",
+                options=list(disc_options.values()),
+                placeholder="Все дисциплины",
+                key="wait_disc",
+            )
+            sel_disc = [code for code, label in disc_options.items()
+                        if label in sel_disc_labels]
+
+        section_options = _load_section_options(
+            tuple(sel_disc) if sel_disc else ())
+
+        with c2:
+            if section_options:
+                sel_section_labels = st.multiselect(
+                    "Раздел",
+                    options=list(section_options.values()),
+                    placeholder="Все разделы",
+                    key="wait_section",
+                )
+                sel_section = [code for code, label in section_options.items()
+                               if label in sel_section_labels]
+            else:
+                sel_section = []
+                st.multiselect(
+                    "Раздел", options=[],
+                    placeholder="Разделы не применимы",
+                    disabled=True,
+                    key="wait_section_empty",
+                )
+
+        kit_options = _load_kit_options(
+            tuple(sel_disc) if sel_disc else (),
+            tuple(sel_section) if sel_section else ())
+
+        with c3:
+            sel_kit_labels = st.multiselect(
+                "Комплект",
+                options=list(kit_options.values()),
+                placeholder="Все комплекты",
+                key="wait_kit",
+            )
+            sel_kit = [code for code, label in kit_options.items()
+                       if label in sel_kit_labels]
+
+    # =================================================================
+    #  Загрузка
+    # =================================================================
+    df = _load_waiting_review(
+        disciplines=tuple(sel_disc) if sel_disc else None,
+        kits=tuple(sel_kit) if sel_kit else None,
+        sections=tuple(sel_section) if sel_section else None,
+    )
+
+    if df.empty:
+        st.success("🎉 Нет замечаний, ожидающих рассмотрения заказчика.")
+        return
+
+    # =================================================================
+    #  KPI по 4 подкатегориям
+    # =================================================================
+    buckets_order = [
+        "🟡 Свежие (10–30 р.д.)",
+        "🟠 Просроченные (30–90 р.д.)",
+        "🔴 Хронические (> 90 р.д.)",
+        "🟢 Учтено (A/B)",
+    ]
+
+    counts = {b: 0 for b in buckets_order}
+    for b in buckets_order:
+        counts[b] = (df["bucket"] == b).sum()
+
+    st.markdown("##### 📊 Классификация")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Всего «Выполнено»", f"{len(df):,}".replace(",", " "))
+    st.caption(
+        "**Из них:** активное ожидание (свежие + просроченные + в сроке) — "
+        f"{(df['bucket'].isin(['🟡 Свежие (10–30 р.д.)', '🟠 Просроченные (30–90 р.д.)', '🟡 Свежие (в сроке)'])).sum():,}. "
+        f"Хронические — {(df['bucket'] == '🔴 Хронические (> 90 р.д.)').sum():,}. "
+        f"Учтено (A/B) — {(df['bucket'] == '🟢 Учтено (A/B)').sum():,}."
+    )
+    c2.metric("🟡 Свежие",
+              f"{counts['🟡 Свежие (10–30 р.д.)']:,}".replace(",", " "),
+              help="10–30 р.д. — недавно ответили")
+    c3.metric("🟠 Просроченные",
+              f"{counts['🟠 Просроченные (30–90 р.д.)']:,}".replace(",", " "),
+              help="30–90 р.д. — пора напоминать")
+    c4.metric("🔴 Хронические",
+              f"{counts['🔴 Хронические (> 90 р.д.)']:,}".replace(",", " "),
+              delta="эскалация", delta_color="inverse",
+              help="> 90 р.д. — эскалация")
+    c5.metric("🟢 Учтено (A/B)",
+              f"{counts['🟢 Учтено (A/B)']:,}".replace(",", " "),
+              help="Лист A/B — надо дожать на «Закрыто»")
+
+    st.divider()
+
+    # =================================================================
+    #  Топ-10 авторов
+    # =================================================================
+    st.markdown("##### 👤 Топ-10 авторов, чьи ответы ждут решения")
+    top_auth = (df.groupby("author").size()
+                   .reset_index(name="Ожидают")
+                   .sort_values("Ожидают", ascending=True)
+                   .tail(10))
+
+    fig = px.bar(
+        top_auth, x="Ожидают", y="author", orientation="h",
+        text="Ожидают",
+        color_discrete_sequence=["#64B5F6"],
+        labels={"author": ""},
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=max(300, 30 * len(top_auth)))
+    st.plotly_chart(fig, use_container_width=True)
+    download_plotly(fig, "Авторы_ждут_рассмотрения", "auth_wait_rev")
+
+    st.divider()
+
+    # =================================================================
+    #  Таблица с редактором
+    # =================================================================
+    st.markdown(f"##### 📋 Список ({len(df):,})".replace(",", " "))
+
+    # Эмодзи-префиксы для категорий
+    df["category"] = df["category"].apply(_add_prefix)
+
+    # Сортировка: хронические → просроченные → свежие → учтено
+    bucket_priority = {
+        "🔴 Хронические (> 90 р.д.)": 0,
+        "🟠 Просроченные (30–90 р.д.)": 1,
+        "🟡 Свежие (10–30 р.д.)": 2,
+        "🟢 Учтено (A/B)": 3,
+    }
+    df["_sort"] = df["bucket"].map(bucket_priority)
+    df = df.sort_values(["_sort", "days_waiting"],
+                        ascending=[True, False]).drop(columns=["_sort"])
+
+    display_cols = [
+        "id", "bucket", "discipline", "complex", "sheet",
+        "comment", "author", "fix_date", "days_waiting",
+        "category", "category_user", "category_date",
+        "category_version",
+    ]
+    display_cols = [c for c in display_cols if c in df.columns]
+    view = df[display_cols].copy()
+
+    edited = st.data_editor(
+        view,
+        column_config={
+            "id":           st.column_config.NumberColumn(
+                                "ID", disabled=True, width="small"),
+            "bucket":       st.column_config.TextColumn(
+                                "Категория ожидания", disabled=True),
+            "discipline":   st.column_config.TextColumn(
+                                "Дисц.", disabled=True, width="small"),
+            "complex":      st.column_config.TextColumn(
+                                "Комплект", disabled=True, width="medium"),
+            "sheet":        st.column_config.TextColumn(
+                                "Лист", disabled=True, width="medium"),
+            "comment":      st.column_config.TextColumn(
+                                "Замечание", disabled=True, width="large"),
+            "author":       st.column_config.TextColumn(
+                                "Автор", disabled=True),
+            "fix_date":     st.column_config.TextColumn(
+                                "Наш ответ", disabled=True, width="small"),
+            "days_waiting": st.column_config.NumberColumn(
+                                "Ждём (р.д.)", disabled=True, width="small"),
+            "category":     st.column_config.SelectboxColumn(
+                                "Категория",
+                                options=CAT_OPTIONS_DISPLAY,
+                                required=False,
+                                help="Можно поставить или изменить категорию"),
+            "category_user": st.column_config.TextColumn(
+                                "Кто", disabled=True, width="small"),
+            "category_date": st.column_config.TextColumn(
+                                "Когда", disabled=True, width="small"),
+            "category_version": None,
+        },
+        disabled=["id", "bucket", "discipline", "complex", "sheet",
+                  "comment", "author", "fix_date", "days_waiting",
+                  "category_user", "category_date"],
+        hide_index=True,
+        use_container_width=True,
+        height=600,
+        key="waiting_review_editor",
+    )
+
+    # =================================================================
+    #  Сохранение
+    # =================================================================
+    col_save, col_exp = st.columns([1, 1])
+
+    with col_save:
+        if st.button("💾 Сохранить изменения", type="primary",
+                     use_container_width=True, key="wait_save"):
+            user = st.session_state.get("user", "инженер")
+            saved, conflicts = 0, []
+
+            for _, row in edited.iterrows():
+                orig = df[df["id"] == row["id"]].iloc[0]
+
+                new_cat_display = (None if pd.isna(row["category"])
+                                    else str(row["category"]))
+                new_cat = (_strip_prefix(new_cat_display)
+                            if new_cat_display else None)
+
+                old_cat_display = (None if pd.isna(orig["category"])
+                                    else str(orig["category"]))
+                old_cat = (_strip_prefix(old_cat_display)
+                            if old_cat_display else None)
+
+                if new_cat == old_cat:
+                    continue
+                if new_cat is None:
+                    new_cat = ""
+
+                ok, msg = update_category_safe(
+                    int(row["id"]), new_cat, user=user,
+                    expected_version=int(orig["category_version"] or 0),
+                )
+                if ok:
+                    saved += 1
+                else:
+                    conflicts.append(f"ID {row['id']}: {msg}")
+
+            if saved:
+                st.success(f"✅ Сохранено: {saved} строк(и)")
+                st.cache_data.clear()
+                st.rerun()
+
+            if conflicts:
+                st.warning("⚠️ Конфликты:")
+                for c in conflicts[:20]:
+                    st.write(f"- {c}")
+
+    # =================================================================
+    #  Экспорт
+    # =================================================================
+    with col_exp:
+        buf = io.BytesIO()
+        export = df[display_cols].copy()
+        if "category" in export.columns:
+            export["category"] = export["category"].apply(
+                lambda x: _strip_prefix(str(x)) if x else x)
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            export.to_excel(writer, index=False,
+                            sheet_name="Ждут заказчика")
+        buf.seek(0)
+        st.download_button(
+            "📥 Скачать Excel",
+            data=buf.getvalue(),
+            file_name=f"Ждут_заказчика_{datetime.now():%Y%m%d}.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            use_container_width=True,
+        )
+
+
+
 def render():
     st.header("👤 Авторы замечаний")
-    st.caption("Аналитика по инженерам: активность, качество, категории.")
+    st.caption(
+        "Аналитика по инженерам заказчика: сколько выдают, "
+        "как быстро рассматривают наши ответы."
+    )
 
+    tab_analytics, tab_waiting = st.tabs([
+        "📊 Аналитика авторов",
+        "🔵 Ждут заказчика",
+    ])
+
+    with tab_analytics:
+        _render_analytics_tab()
+    with tab_waiting:
+        _render_waiting_review()
+
+
+def _render_analytics_tab():
+    """Существующая аналитика — обёрнута в функцию."""
     disc_options = _load_discipline_options()
 
     c1, c2, c3 = st.columns(3)
@@ -742,6 +1136,6 @@ def render():
     st.divider()
     _render_quality(df, limit)
     st.divider()
-    _render_author_timing()  # ← НОВОЕ
+    _render_author_timing()
     st.divider()
     _render_drilldown(df)

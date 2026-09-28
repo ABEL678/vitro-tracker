@@ -33,52 +33,172 @@ from vitro.pdf_builder import draw_header_footer
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_full_state() -> dict:
     """
-    Возвращает словарь со всеми данными для дашборда.
-    Использует централизованную логику из deadlines._load_all_categorized.
+    Возвращает все данные для дашборда.
+
+    Использует единый источник — `_load_all_categorized` из deadlines.py,
+    чтобы все цифры сходились с вкладками «Сроки» и «Авторы».
     """
     from vitro.ui.deadlines import _load_all_categorized
 
     result = {}
 
-    # --- 1. Общая сводка (из БД) ---
+    # =====================================================================
+    #  1. Категоризация (единый источник истины)
+    # =====================================================================
+    cats_df = _load_all_categorized()
+
+    if not cats_df.empty:
+        def count_by(*flags):
+            return cats_df[cats_df["category_flag"].isin(flags)].shape[0]
+
+        # Наша сторона (4 категории)
+        result["new_total"] = count_by("new_overdue", "new_in_progress")
+        result["new_overdue"] = count_by("new_overdue")
+
+        result["in_work_total"] = count_by("in_work_overdue",
+                                           "in_work_in_progress")
+        result["in_work_overdue"] = count_by("in_work_overdue")
+
+        result["rejected_total"] = count_by("rejected_overdue",
+                                             "rejected_in_progress")
+        result["rejected_overdue"] = count_by("rejected_overdue")
+
+        result["discussion_total"] = count_by("discussion_overdue",
+                                                "discussion_in_progress")
+        result["discussion_overdue"] = count_by("discussion_overdue")
+
+        # Наша сторона — всего
+        ours_total = (result["new_total"] +
+                      result["in_work_total"] +
+                      result["rejected_total"] +
+                      result["discussion_total"])
+        result["ours_total"] = ours_total
+
+        # Заказчик
+        result["waiting_customer"] = count_by(
+            "waiting_customer", "waiting_customer_overdue",
+            "waiting_customer_ontime")
+        result["chronic"] = count_by("waiting_customer_chronic")
+        result["waiting_total"] = result["waiting_customer"] + result["chronic"]
+
+        # Учтённые и архив
+        result["closed_by_doc"] = count_by("closed_by_doc_status")
+        result["abandoned"] = count_by("abandoned")
+
+        # Активные (5 статусов = наши + ждут заказчика + хроника + A/B)
+        result["active_total"] = (ours_total +
+                                    result["waiting_customer"] +
+                                    result["chronic"] +
+                                    result["closed_by_doc"])
+    else:
+        for k in ["new_total", "new_overdue", "in_work_total",
+                   "in_work_overdue", "rejected_total", "rejected_overdue",
+                   "discussion_total", "discussion_overdue",
+                   "ours_total", "waiting_customer", "chronic",
+                   "waiting_total", "closed_by_doc", "abandoned",
+                   "active_total"]:
+            result[k] = 0
+
+    # =====================================================================
+    #  2. Общая сводка (всего/закрыто/аннулировано) — для справки
+    # =====================================================================
     with get_conn() as conn:
-        result["totals"] = dict(conn.execute("""
+        base = dict(conn.execute("""
             SELECT
                 COUNT(*) AS total,
-                SUM(CASE WHEN status IN ('Закрыто','Выполнено')
+                SUM(CASE WHEN status IN ('Закрыто', 'Выполнено')
+                         THEN 1 ELSE 0 END) AS closed_or_wait,
+                SUM(CASE WHEN status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
-                SUM(CASE WHEN status IN ('Новое','Принято в работу',
-                                          'Не принято','К обсуждению')
-                         THEN 1 ELSE 0 END) AS active,
                 SUM(CASE WHEN status = 'Аннулировано'
                          THEN 1 ELSE 0 END) AS annulled
             FROM comments
         """).fetchone())
 
-        # Топ-5 комплектов по просрочкам
-        result["top_overdue_complex"] = pd.read_sql("""
-            SELECT d.complex, COUNT(*) AS n
-            FROM comments c
-            JOIN documents d ON c.doc_id = d.id
-            WHERE c.status IN ('Новое','Принято в работу',
-                                'Не принято','К обсуждению')
-            GROUP BY d.complex
-            ORDER BY n DESC
-            LIMIT 5
-        """, conn)
+    result["total_all"] = base["total"] or 0
+    result["closed"] = base["closed"] or 0
+    result["annulled"] = base["annulled"] or 0
+    # Закрыто для справки = Закрыто + Аннулировано
+    result["closed_for_ref"] = result["closed"] + result["annulled"]
 
-        # Топ-5 авторов, чьи замечания ждут заказчика
-        result["top_waiting_authors"] = pd.read_sql("""
-            SELECT c.author, COUNT(*) AS n
-            FROM comments c
-            WHERE c.status = 'Выполнено'
-              AND c.author IS NOT NULL AND c.author <> ''
-            GROUP BY c.author
-            ORDER BY n DESC
-            LIMIT 5
-        """, conn)
+    # =====================================================================
+    #  3. По дисциплинам (для таблицы «Где болит»)
+    # =====================================================================
+    if not cats_df.empty:
+        by_disc = {}
+        for disc in cats_df["discipline"].dropna().unique():
+            if not disc:
+                continue
+            sub = cats_df[cats_df["discipline"] == disc]
 
-        # Динамика 12 месяцев
+            ours = sub[sub["category_flag"].isin([
+                "new_overdue", "new_in_progress",
+                "in_work_overdue", "in_work_in_progress",
+                "rejected_overdue", "rejected_in_progress",
+                "discussion_overdue", "discussion_in_progress",
+            ])].shape[0]
+
+            waiting = sub[sub["category_flag"].isin([
+                "waiting_customer", "waiting_customer_overdue",
+                "waiting_customer_ontime",
+            ])].shape[0]
+
+            chronic = sub[sub["category_flag"] ==
+                            "waiting_customer_chronic"].shape[0]
+            closed_doc = sub[sub["category_flag"] ==
+                                "closed_by_doc_status"].shape[0]
+            abandoned = sub[sub["category_flag"] == "abandoned"].shape[0]
+
+            by_disc[disc] = {
+                "ours": ours,
+                "waiting": waiting,
+                "chronic": chronic,
+                "closed_doc": closed_doc,
+                "abandoned": abandoned,
+                "total": len(sub),
+            }
+        result["by_disc"] = by_disc
+    else:
+        result["by_disc"] = {}
+
+    # =====================================================================
+    #  4. Топ-5 комплектов по просрочкам (наша сторона)
+    # =====================================================================
+    if not cats_df.empty:
+        overdue = cats_df[cats_df["category_flag"].isin([
+            "new_overdue", "in_work_overdue",
+            "rejected_overdue", "discussion_overdue",
+        ])]
+
+        top_cx = (overdue.groupby("complex").size()
+                    .reset_index(name="n")
+                    .sort_values("n", ascending=False)
+                    .head(5))
+        result["top_overdue_complex"] = top_cx
+    else:
+        result["top_overdue_complex"] = pd.DataFrame()
+
+    # =====================================================================
+    #  5. Топ-5 авторов, чьи замечания ждут заказчика
+    # =====================================================================
+    if not cats_df.empty:
+        waiting_df = cats_df[cats_df["category_flag"].isin([
+            "waiting_customer", "waiting_customer_overdue",
+            "waiting_customer_ontime", "waiting_customer_chronic",
+        ])]
+
+        top_auth = (waiting_df.groupby("author").size()
+                       .reset_index(name="n")
+                       .sort_values("n", ascending=False)
+                       .head(5))
+        result["top_waiting_authors"] = top_auth
+    else:
+        result["top_waiting_authors"] = pd.DataFrame()
+
+    # =====================================================================
+    #  6. Динамика 12 месяцев (выдача / ответы / закрытие)
+    # =====================================================================
+    with get_conn() as conn:
         issue = pd.read_sql("""
             SELECT substr(created, 1, 7) AS ym, COUNT(*) AS n
             FROM comments
@@ -90,93 +210,19 @@ def _load_full_state() -> dict:
             SELECT substr(fix_date, 1, 7) AS ym, COUNT(*) AS n
             FROM comments
             WHERE fix_date IS NOT NULL AND fix_date <> ''
-              AND status IN ('Закрыто','Выполнено')
+              AND status IN ('Закрыто', 'Выполнено')
             GROUP BY ym
         """, conn)
 
-    # --- 2. Категоризация через deadlines ---
-    df = _load_all_categorized()
-
-    if not df.empty:
-        def count_by(*flags):
-            return df[df["category_flag"].isin(flags)].shape[0]
-
-        # Наша сторона
-        result["new_total"] = count_by("new_overdue", "new_in_progress")
-        result["new_overdue"] = count_by("new_overdue")
-
-        result["in_work_total"] = count_by("in_work_overdue",
-                                           "in_work_in_progress")
-        result["in_work_overdue"] = count_by("in_work_overdue")
-
-        result["rejected_total"] = count_by("rejected_overdue",
-                                            "rejected_in_progress")
-        result["rejected_overdue"] = count_by("rejected_overdue")
-
-        result["discussion_total"] = count_by("discussion_overdue",
-                                              "discussion_in_progress")
-        result["discussion_overdue"] = count_by("discussion_overdue")
-
-        # Заказчик
-        result["waiting_customer"] = count_by(
-            "waiting_customer", "waiting_customer_overdue",
-            "waiting_customer_ontime")
-        result["chronic"] = count_by("waiting_customer_chronic")
-        result["closed_by_doc"] = count_by("closed_by_doc_status")
-        result["abandoned"] = count_by("abandoned")
-
-        # Общее «наша сторона»
-        result["ours_total"] = (result["new_total"] +
-                                 result["in_work_total"] +
-                                 result["rejected_total"] +
-                                 result["discussion_total"])
-
-        # По дисциплинам
-        by_disc = {}
-        for disc in df["discipline"].dropna().unique():
-            sub = df[df["discipline"] == disc]
-            if not disc:
-                continue
-            by_disc[disc] = {
-                "ours": sub[sub["category_flag"].isin([
-                    "new_overdue", "new_in_progress",
-                    "in_work_overdue", "in_work_in_progress",
-                    "rejected_overdue", "rejected_in_progress",
-                    "discussion_overdue", "discussion_in_progress",
-                ])].shape[0],
-                "waiting": sub[sub["category_flag"].isin([
-                    "waiting_customer", "waiting_customer_overdue",
-                    "waiting_customer_ontime",
-                ])].shape[0],
-                "chronic": sub[sub["category_flag"] ==
-                                "waiting_customer_chronic"].shape[0],
-                "closed_doc": sub[sub["category_flag"] ==
-                                   "closed_by_doc_status"].shape[0],
-                "total": len(sub),
-            }
-        result["by_disc"] = by_disc
-    else:
-        # Фолбэк — нули
-        result.update({
-            "new_total": 0, "new_overdue": 0,
-            "in_work_total": 0, "in_work_overdue": 0,
-            "rejected_total": 0, "rejected_overdue": 0,
-            "discussion_total": 0, "discussion_overdue": 0,
-            "waiting_customer": 0, "chronic": 0,
-            "closed_by_doc": 0, "abandoned": 0, "ours_total": 0,
-            "by_disc": {},
-        })
-
-    # --- 3. Динамика 12 месяцев ---
     monthly = pd.merge(
         issue.rename(columns={"n": "Выдано"}),
-        fix.rename(columns={"n": "Закрыто"}),
+        fix.rename(columns={"n": "Отвечено"}),
         on="ym", how="outer",
     ).fillna(0).sort_values("ym")
 
     monthly["Выдано"] = monthly["Выдано"].astype(int)
-    monthly["Закрыто"] = monthly["Закрыто"].astype(int)
-    monthly["Сальдо"] = monthly["Выдано"] - monthly["Закрыто"]
+    monthly["Отвечено"] = monthly["Отвечено"].astype(int)
+    monthly["Отставание"] = monthly["Выдано"] - monthly["Отвечено"]
 
     result["monthly"] = monthly.tail(12)
 
@@ -187,29 +233,33 @@ def _load_full_state() -> dict:
 #  Светофор — 8 KPI в две строки
 # ---------------------------------------------------------------------------
 def _render_traffic_light(data: dict):
-    totals = data["totals"]
-    total = totals["total"] or 0
-    closed = totals["closed"] or 0
-    active = totals["active"] or 0
-    annulled = totals["annulled"] or 0
-
-    pct_closed = round((closed + annulled) / total * 100, 1) if total else 0
+    """Три ряда KPI: масштаб, наша сторона, заказчик."""
 
     # =================================================================
-    #  Ряд 1 — масштаб
+    #  Ряд 1 — Масштаб проекта
     # =================================================================
     st.markdown("##### 📦 Масштаб проекта")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Всего замечаний", f"{total:,}".replace(",", " "))
-    c2.metric("Закрыто", f"{closed:,}".replace(",", " "))
-    c3.metric("Активных", f"{active:,}".replace(",", " "))
-    c4.metric("% выполнения", f"{pct_closed}%")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Всего замечаний",
+              f"{data['total_all']:,}".replace(",", " "))
+    c2.metric("Закрыто",
+              f"{data['closed']:,}".replace(",", " "))
+    c3.metric("Активных",
+              f"{data['active_total']:,}".replace(",", " "),
+              help="Наши + ждут заказчика + хроника + учтено (A/B)")
+    c4.metric("Аннулировано",
+              f"{data['annulled']:,}".replace(",", " "))
+    pct_closed = (
+        round(data["closed"] / data["total_all"] * 100, 1)
+        if data["total_all"] else 0
+    )
+    c5.metric("% закрыто", f"{pct_closed}%")
 
     # =================================================================
-    #  Ряд 2 — наша сторона
+    #  Ряд 2 — Наша сторона
     # =================================================================
     st.markdown("##### 🔴 Наша сторона — ждут нашего ответа")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric(
         "🆕 Новое",
@@ -217,6 +267,7 @@ def _render_traffic_light(data: dict):
         delta=f"🔴 {data['new_overdue']:,} просроч.".replace(",", " ")
               if data['new_overdue'] > 0 else None,
         delta_color="inverse",
+        help="Заказчик выдал, мы не взяли в работу",
     )
     c2.metric(
         "🛠 В работе",
@@ -224,6 +275,7 @@ def _render_traffic_light(data: dict):
         delta=f"🔴 {data['in_work_overdue']:,} просроч.".replace(",", " ")
               if data['in_work_overdue'] > 0 else None,
         delta_color="inverse",
+        help="Взяли, но не ответили",
     )
     c3.metric(
         "🟪 Не принято",
@@ -231,6 +283,7 @@ def _render_traffic_light(data: dict):
         delta=f"🔴 {data['rejected_overdue']:,} просроч.".replace(",", " ")
               if data['rejected_overdue'] > 0 else None,
         delta_color="inverse",
+        help="Заказчик отклонил наш ответ",
     )
     c4.metric(
         "🟣 К обсуждению",
@@ -238,31 +291,46 @@ def _render_traffic_light(data: dict):
         delta=f"🔴 {data['discussion_overdue']:,} просроч.".replace(",", " ")
               if data['discussion_overdue'] > 0 else None,
         delta_color="inverse",
+        help="Спорное, обсуждаем",
+    )
+    c5.metric(
+        "Итого наших",
+        f"{data['ours_total']:,}".replace(",", " "),
+        help="Сумма 4 категорий",
     )
 
     # =================================================================
-    #  Ряд 3 — заказчик + архив
+    #  Ряд 3 — Заказчик + архив
     # =================================================================
     st.markdown("##### 🔵 На стороне заказчика + архив")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric(
         "🔵 Ждут заказчика",
         f"{data['waiting_customer']:,}".replace(",", " "),
+        help="Выполнено < 90 р.д., лист ещё не A/B",
     )
     c2.metric(
         "🔴 Хронические",
         f"{data['chronic']:,}".replace(",", " "),
         delta="эскалация" if data['chronic'] > 0 else None,
         delta_color="inverse",
+        help="Выполнено > 90 р.д., лист ещё не A/B",
     )
     c3.metric(
         "🟢 Учтено (A/B)",
         f"{data['closed_by_doc']:,}".replace(",", " "),
+        help="Лист A/B, но замечание не закрыто формально",
     )
     c4.metric(
         "🟡 Заброшено",
         f"{data['abandoned']:,}".replace(",", " "),
+        help="> 90 дней без движения",
+    )
+    c5.metric(
+        "Итого заказчика",
+        f"{data['waiting_total']:,}".replace(",", " "),
+        help="Ждут заказчика + хронические",
     )
 
 
@@ -295,7 +363,7 @@ def _render_top_problems(data: dict):
 
     # --- Авторы, чьи замечания ждут заказчика ---
     with col2:
-        st.markdown("##### 👤 Авторы, чьи замечания ждут заказчика")
+        st.markdown("##### 👤 Авторы, чьи замечания ждут ответа")
         top_auth = data["top_waiting_authors"]
         if top_auth.empty:
             st.info("Нет данных.")
@@ -317,6 +385,7 @@ def _render_top_problems(data: dict):
 #  Таблица «Где болит» по дисциплинам
 # ---------------------------------------------------------------------------
 def _render_discipline_table(data: dict):
+    """Таблица «Где болит» по дисциплинам."""
     st.markdown("### 🏷 Где болит — по дисциплинам")
 
     by_disc = data["by_disc"]
@@ -326,7 +395,6 @@ def _render_discipline_table(data: dict):
 
     rows = []
     for disc, s in by_disc.items():
-        total = s["total"]
         ours = s["ours"]
         waiting = s["waiting"]
         chronic = s["chronic"]
@@ -346,8 +414,8 @@ def _render_discipline_table(data: dict):
             "🔴 Наша сторона": ours,
             "🔵 Ждут заказчика": waiting,
             "🔴 Хронические": chronic,
-            "🟢 Учтено": closed_doc,
-            "Всего": total,
+            "🟢 Учтено (A/B)": closed_doc,
+            "Всего активных": s["total"],
             "Вердикт": verdict,
         })
 
@@ -360,14 +428,14 @@ def _render_discipline_table(data: dict):
             "🔴 Наша сторона": st.column_config.NumberColumn(format="%d"),
             "🔵 Ждут заказчика": st.column_config.NumberColumn(format="%d"),
             "🔴 Хронические": st.column_config.NumberColumn(format="%d"),
-            "🟢 Учтено": st.column_config.NumberColumn(format="%d"),
+            "🟢 Учтено (A/B)": st.column_config.NumberColumn(format="%d"),
         },
     )
-
 # ---------------------------------------------------------------------------
 #  Динамика 12 месяцев
 # ---------------------------------------------------------------------------
 def _render_dynamics(data: dict):
+    """Динамика за 12 месяцев: выдача, ответы, отставание."""
     st.markdown("### 📈 Потоки: выдача, ответы, отставание")
 
     monthly = data["monthly"]
@@ -381,7 +449,9 @@ def _render_dynamics(data: dict):
         "**Отставание** — насколько мы не успеваем за темпом выдачи."
     )
 
-    # --- График 1: выдача и ответы ---
+    # =================================================================
+    #  График 1: Выдача vs Ответы
+    # =================================================================
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=monthly["ym"], y=monthly["Выдано"],
@@ -390,10 +460,10 @@ def _render_dynamics(data: dict):
         text=monthly["Выдано"], textposition="outside",
     ))
     fig.add_trace(go.Bar(
-        x=monthly["ym"], y=monthly["Закрыто"],
+        x=monthly["ym"], y=monthly["Отвечено"],
         name="Наши ответы",
         marker_color="#2E7D32",
-        text=monthly["Закрыто"], textposition="outside",
+        text=monthly["Отвечено"], textposition="outside",
     ))
 
     fig.update_layout(
@@ -408,17 +478,22 @@ def _render_dynamics(data: dict):
     download_plotly(fig, "Дашборд_потоки", "dash_flows",
                     width=1400, height=600)
 
-    # --- График 2: отставание по месяцам ---
-    monthly["Отставание"] = monthly["Выдано"] - monthly["Закрыто"]
+    # =================================================================
+    #  График 2: Отставание по месяцам
+    # =================================================================
+    monthly_d = monthly.copy()
+    monthly_d["Отставание"] = monthly_d["Выдано"] - monthly_d["Отвечено"]
 
-    colors = ["#E57373" if v > 0 else "#2E7D32"
-              for v in monthly["Отставание"]]
+    colors_list = [
+        "#E57373" if v > 0 else "#2E7D32"
+        for v in monthly_d["Отставание"]
+    ]
 
     fig2 = go.Figure()
     fig2.add_trace(go.Bar(
-        x=monthly["ym"], y=monthly["Отставание"],
-        marker_color=colors,
-        text=monthly["Отставание"], textposition="outside",
+        x=monthly_d["ym"], y=monthly_d["Отставание"],
+        marker_color=colors_list,
+        text=monthly_d["Отставание"], textposition="outside",
         name="Отставание",
     ))
     fig2.add_hline(y=0, line_dash="dash", line_color="#888")
@@ -430,8 +505,10 @@ def _render_dynamics(data: dict):
     download_plotly(fig2, "Дашборд_отставание", "dash_delta",
                     width=1400, height=500)
 
-    # --- График 3: кумулятивное отставание ---
-    monthly_cum = monthly.copy()
+    # =================================================================
+    #  График 3: Накопленное отставание
+    # =================================================================
+    monthly_cum = monthly_d.copy()
     monthly_cum["Накоплено"] = monthly_cum["Отставание"].cumsum()
 
     fig3 = go.Figure()
@@ -455,13 +532,15 @@ def _render_dynamics(data: dict):
 
     st.caption(
         "**Как читать:** график 3 показывает, сколько замечаний накопилось "
-        "за период. Линия вверх = команда отстаёт от темпа выдачи. "
-        "Если тренд сохранится, к концу года задолженность вырастет ещё сильнее."
+        "за период. Линия вверх = команда отстаёт от темпа выдачи."
     )
 
-    # --- Автоматическая интерпретация ---
+    # =================================================================
+    #  Автоматическая интерпретация
+    # =================================================================
     if len(monthly) >= 3:
-        last3 = monthly.tail(3)
+        last3 = monthly.tail(3).copy()
+        last3["Отставание"] = last3["Выдано"] - last3["Отвечено"]
         total_delta = last3["Отставание"].sum()
         avg_delta = total_delta / 3
 
@@ -470,8 +549,7 @@ def _render_dynamics(data: dict):
                 f"🔴 **Команда отстаёт от темпа выдачи.** "
                 f"За последние 3 месяца в среднем **+{int(avg_delta):,}** "
                 f"незакрытых в месяц. Суммарно накопилось "
-                f"**+{int(total_delta):,}** за квартал. "
-                f"При сохранении темпа к концу года будет ещё больше."
+                f"**+{int(total_delta):,}** за квартал."
                 .replace(",", " ")
             )
         elif avg_delta < -500:
@@ -483,8 +561,7 @@ def _render_dynamics(data: dict):
         else:
             st.info(
                 f"⚖️ **Баланс.** Отставание в среднем "
-                f"{int(avg_delta):+,} в месяц — выдача и ответы "
-                f"примерно совпадают.".replace(",", " ")
+                f"{int(avg_delta):+,} в месяц.".replace(",", " ")
             )
 
 
@@ -492,7 +569,9 @@ def _render_dynamics(data: dict):
 #  Что делать сегодня — автогенерация
 # ---------------------------------------------------------------------------
 def _render_actions(data: dict):
-    st.markdown("### 🎯 Что делать сегодня")
+    """Что делать сегодня — автогенерация действий."""
+    st.divider()
+    st.markdown("#### 🎯 Что делать сегодня")
 
     new_overdue = data.get("new_overdue", 0)
     in_work_overdue = data.get("in_work_overdue", 0)
@@ -509,7 +588,7 @@ def _render_actions(data: dict):
             "priority": "🚨 СРОЧНО",
             "action": f"**{new_overdue:,} замечаний в «Новое» просрочено**"
                       .replace(",", " "),
-            "detail": "Мы их не взяли в работу. Срочно назначить исполнителей.",
+            "detail": "Мы их не взяли в работу. Назначить исполнителей.",
         })
 
     if in_work_overdue > 0:
@@ -539,7 +618,7 @@ def _render_actions(data: dict):
     if chronic > 0:
         actions.append({
             "priority": "🔴 ЭСКАЛАЦИЯ",
-            "action": f"**{chronic:,} хронических (>90 р.д.)**"
+            "action": f"**{chronic:,} хронических (> 90 р.д.)**"
                       .replace(",", " "),
             "detail": "Письмо руководству заказчика.",
         })
@@ -561,7 +640,7 @@ def _render_actions(data: dict):
         })
 
     if not actions:
-        st.success("🎉 Все показатели в норме.")
+        st.success("🎉 Все показатели в норме. Срочных действий нет.")
         return
 
     for a in actions:
