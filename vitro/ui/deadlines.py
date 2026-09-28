@@ -2,20 +2,32 @@
 """
 ⏰ Сроки — контроль соблюдения 10 рабочих дней.
 
-Три под-вкладки:
-  🔴 Ждут нашего ответа — мы просрочили ответ заказчику.
-  🔵 Ждут заказчика — мы ответили, заказчик не рассмотрел.
-  🟡 Заброшено — >90 дней без движения, архив.
+Классификация (8 категорий):
 
-KPI сверху: 4 категории + общая динамика.
+НАША СТОРОНА (надо ответить мы):
+  🆕 Новое — заказчик выдал, мы не брались
+  🛠 Принято в работу — взяли, но не ответили
+  🟪 Не принято — заказчик отклонил наш ответ, дорабатываем
+  🟣 К обсуждению — спорное, обсуждаем
+
+СТОРОНА ЗАКАЗЧИКА (мы ответили, он не рассмотрел):
+  🔵 Ждут заказчика — < 90 р.д., лист не A/B
+  🔴 Хронические — > 90 р.д., лист не A/B
+
+ЗАКРЫТЫЕ / УЧТЁННЫЕ:
+  🟢 Учтено (A/B) — лист утверждён, надо дожать на «Закрыто»
+
+АРХИВ:
+  🟡 Заброшено — > 90 календарных дней без движения
+
+SLA = 10 рабочих дней (с учётом производственного календаря РФ).
 """
 
 import io
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
@@ -30,6 +42,7 @@ from vitro.ui._utils import download_plotly
 SLA_DAYS = 10           # рабочих дней
 FRESH_DAYS = 90         # календарных дней — «свежая» просрочка
 ABANDONED_DAYS = 90     # календарных дней без движения — «заброшено»
+CHRONIC_WORKDAYS = 90   # рабочих дней — хроническое ожидание заказчика
 
 
 # ---------------------------------------------------------------------------
@@ -45,19 +58,13 @@ def _load_discipline_options() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-#  Основной расчёт — категоризация замечаний
+#  Главный расчёт — категоризация всех замечаний
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_all_categorized() -> pd.DataFrame:
     """
-    Возвращает все замечания с рассчитанными полями:
-      - created_d, fix_date_d, cat_date_d — как date
-      - due_date_d — срок (+10 р.д. от created)
-      - customer_due_d — срок рассмотрения заказчиком (+10 р.д. от fix_date)
-      - days_overdue_work — рабочих дней просрочки
-      - days_waiting_customer — рабочих дней ожидания
-      - days_since_movement — календарных дней с последнего движения
-      - category — категория проблемы
+    Возвращает все активные замечания с рассчитанными полями
+    и категорией (category_flag).
     """
     with get_conn() as conn:
         rows = conn.execute("""
@@ -66,11 +73,13 @@ def _load_all_categorized() -> pd.DataFrame:
                 c.fix_date, c.category_date, c.category,
                 d.discipline, d.section, d.complex,
                 REPLACE(REPLACE(d.leaf, '.pdf', ''), '.PDF', '') AS sheet,
-                d.name AS sheet_name
+                d.name AS sheet_name,
+                d.status AS doc_status
             FROM comments c
             JOIN documents d ON c.doc_id = d.id
             WHERE c.status IN (
-                'Новое','Принято в работу','Не принято','К обсуждению','Выполнено'
+                'Новое','Принято в работу','Не принято',
+                'К обсуждению','Выполнено'
             )
               AND c.created IS NOT NULL AND c.created <> ''
         """).fetchall()
@@ -86,45 +95,103 @@ def _load_all_categorized() -> pd.DataFrame:
         fix_d = parse_date(r["fix_date"]) if r["fix_date"] else None
         cat_d = parse_date(r["category_date"]) if r["category_date"] else None
         status = r["status"]
+        doc_status = (r["doc_status"] or "").strip().upper()
 
-        # Срок ответа с нашей стороны: created + 10 р.д.
+        # Срок ответа с нашей стороны
         due = add_workdays(created, SLA_DAYS)
 
-        # Срок рассмотрения заказчиком: fix_date + 10 р.д.
+        # Срок рассмотрения заказчиком
         cust_due = add_workdays(fix_d, SLA_DAYS) if fix_d else None
 
-        # Движение
+        # Последнее движение
         movements = [d for d in [created, fix_d, cat_d] if d]
         last_movement = max(movements) if movements else created
         days_since_movement = (today - last_movement).days
 
-        # Рабочих дней прошло
-        wd_since_created = workdays_between(created, today)
+        # Рабочих дней просрочки
         wd_overdue_work = workdays_between(due, today) if today > due else 0
+
+        # Рабочих дней ожидания заказчика
         wd_waiting_customer = 0
         if cust_due and today > cust_due:
             wd_waiting_customer = workdays_between(cust_due, today)
 
-        # Классификация
-        category = None
-        if fix_d and status == "Выполнено" and today > cust_due:
-            category = "waiting_customer"
-        elif not fix_d and status != "Выполнено" and today > due:
-            if days_since_movement > ABANDONED_DAYS:
-                category = "abandoned"
+        # ============================================================
+        #  Классификация
+        # ============================================================
+        category = "other"
+
+        # ---- 1. ЗАКАЗЧИК: статус «Выполнено» ----
+        if status == "Выполнено":
+            # 1a. Лист утверждён (A или B) — фактически принято
+            if doc_status in ("A", "B"):
+                category = "closed_by_doc_status"
+            # 1b. Хронические (>90 р.д.)
+            elif cust_due and wd_waiting_customer > CHRONIC_WORKDAYS:
+                category = "waiting_customer_chronic"
+            # 1c. Просроченные заказчиком (30-90 р.д.)
+            elif cust_due and wd_waiting_customer > 30:
+                category = "waiting_customer_overdue"
+            # 1d. Свежие (10-30 р.д.)
+            elif cust_due and today > cust_due:
+                category = "waiting_customer"
+            # 1e. Ещё в сроке
             else:
-                category = "overdue_ours"
-        elif not fix_d and status != "Выполнено":
-            category = "in_progress"
-        elif fix_d and status == "Выполнено":
-            category = "waiting_customer_ontime"  # ещё не просрочен заказчик
-        else:
-            category = "other"
+                category = "waiting_customer_ontime"
+
+        # ---- 2. МЫ: «Не принято» (заказчик отклонил) ----
+        elif status == "Не принято":
+            if fix_d:
+                reject_due = add_workdays(fix_d, SLA_DAYS)
+                if today > reject_due:
+                    if days_since_movement > ABANDONED_DAYS:
+                        category = "abandoned"
+                    else:
+                        category = "rejected_overdue"
+                else:
+                    category = "rejected_in_progress"
+            else:
+                # Аномалия: «Не принято» без fix_date
+                if today > due:
+                    category = "rejected_overdue"
+                else:
+                    category = "rejected_in_progress"
+
+        # ---- 3. МЫ: «Новое» ----
+        elif status == "Новое":
+            if today > due:
+                if days_since_movement > ABANDONED_DAYS:
+                    category = "abandoned"
+                else:
+                    category = "new_overdue"
+            else:
+                category = "new_in_progress"
+
+        # ---- 4. МЫ: «Принято в работу» ----
+        elif status == "Принято в работу":
+            if today > due:
+                if days_since_movement > ABANDONED_DAYS:
+                    category = "abandoned"
+                else:
+                    category = "in_work_overdue"
+            else:
+                category = "in_work_in_progress"
+
+        # ---- 5. МЫ: «К обсуждению» ----
+        elif status == "К обсуждению":
+            if today > due:
+                if days_since_movement > ABANDONED_DAYS:
+                    category = "abandoned"
+                else:
+                    category = "discussion_overdue"
+            else:
+                category = "discussion_in_progress"
 
         result.append({
             "id": r["id"],
             "comment": r["comment"],
             "status": status,
+            "doc_status": doc_status,
             "author": r["author"],
             "discipline": r["discipline"],
             "section": r["section"],
@@ -140,7 +207,7 @@ def _load_all_categorized() -> pd.DataFrame:
             "customer_due_d": cust_due,
             "days_overdue_work": wd_overdue_work,
             "days_waiting_customer": wd_waiting_customer,
-            "wd_since_created": wd_since_created,
+            "wd_since_created": workdays_between(created, today),
             "days_since_movement": days_since_movement,
             "category_flag": category,
         })
@@ -149,368 +216,157 @@ def _load_all_categorized() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  KPI
+#  KPI — 2 ряда
 # ---------------------------------------------------------------------------
 def _render_kpi(df: pd.DataFrame):
     if df.empty:
         st.info("Нет данных для расчёта сроков.")
         return
 
-    overdue_ours = df[df["category_flag"] == "overdue_ours"]
-    waiting = df[df["category_flag"] == "waiting_customer"]
-    abandoned = df[df["category_flag"] == "abandoned"]
-    in_progress = df[df["category_flag"] == "in_progress"]
+    def count_by(*flags):
+        return df[df["category_flag"].isin(flags)].shape[0]
 
-    st.markdown("##### 📊 Классификация по срокам")
+    # Наша сторона
+    n_new = count_by("new_overdue", "new_in_progress")
+    n_new_over = count_by("new_overdue")
+    n_work = count_by("in_work_overdue", "in_work_in_progress")
+    n_work_over = count_by("in_work_overdue")
+    n_rej = count_by("rejected_overdue", "rejected_in_progress")
+    n_rej_over = count_by("rejected_overdue")
+    n_disc = count_by("discussion_overdue", "discussion_in_progress")
+    n_disc_over = count_by("discussion_overdue")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # Заказчик + архив
+    n_wait = count_by("waiting_customer", "waiting_customer_overdue",
+                      "waiting_customer_ontime")
+    n_chronic = count_by("waiting_customer_chronic")
+    n_closed = count_by("closed_by_doc_status")
+    n_aband = count_by("abandoned")
+
+    # =================================================================
+    #  РЯД 1: НАША СТОРОНА
+    # =================================================================
+    st.markdown("##### 🔴 Наша сторона — ждут нашего ответа")
+
+    c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
-        "🔴 Ждут нашего ответа",
-        f"{len(overdue_ours):,}".replace(",", " "),
-        delta=f"свежих: {len(overdue_ours):,}".replace(",", " "),
-        delta_color="off",
-        help=f"Просрочили ответ. Из них без движения >90д: {len(abandoned)}",
+        "🆕 Новое",
+        f"{n_new:,}".replace(",", " "),
+        delta=f"🔴 {n_new_over:,} просроч.".replace(",", " ")
+              if n_new_over > 0 else None,
+        delta_color="inverse",
+        help="Заказчик выдал, мы не взяли в работу",
     )
     c2.metric(
-        "🔵 Ждут заказчика",
-        f"{len(waiting):,}".replace(",", " "),
-        help="Мы ответили, заказчик не рассмотрел >10 р.д.",
+        "🛠 Принято в работу",
+        f"{n_work:,}".replace(",", " "),
+        delta=f"🔴 {n_work_over:,} просроч.".replace(",", " ")
+              if n_work_over > 0 else None,
+        delta_color="inverse",
+        help="Взяли, но не ответили",
     )
     c3.metric(
-        "🟡 Заброшено",
-        f"{len(abandoned):,}".replace(",", " "),
-        help=">90 дней без движения",
+        "🟪 Не принято",
+        f"{n_rej:,}".replace(",", " "),
+        delta=f"🔴 {n_rej_over:,} просроч.".replace(",", " ")
+              if n_rej_over > 0 else None,
+        delta_color="inverse",
+        help="Заказчик отклонил, дорабатываем",
     )
     c4.metric(
-        "🟢 В работе, в срок",
-        f"{len(in_progress):,}".replace(",", " "),
-        help="Активные замечания в пределах 10 р.д.",
+        "🟣 К обсуждению",
+        f"{n_disc:,}".replace(",", " "),
+        delta=f"🔴 {n_disc_over:,} просроч.".replace(",", " ")
+              if n_disc_over > 0 else None,
+        delta_color="inverse",
+        help="Спорное, обсуждаем",
     )
-    total = len(df)
-    c5.metric(
-        "Всего проверено",
-        f"{total:,}".replace(",", " "),
+
+    # =================================================================
+    #  РЯД 2: ЗАКАЗЧИК + АРХИВ
+    # =================================================================
+    st.markdown("##### 🔵 На стороне заказчика + архив")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "🔵 Ждут заказчика",
+        f"{n_wait:,}".replace(",", " "),
+        help="Выполнено < 90 р.д., лист не A/B",
+    )
+    c2.metric(
+        "🔴 Хронические",
+        f"{n_chronic:,}".replace(",", " "),
+        delta="эскалация" if n_chronic > 0 else None,
+        delta_color="inverse",
+        help="> 90 р.д. ожидания, лист не A/B",
+    )
+    c3.metric(
+        "🟢 Учтено (лист A/B)",
+        f"{n_closed:,}".replace(",", " "),
+        help="Лист утверждён, надо дожать на «Закрыто»",
+    )
+    c4.metric(
+        "🟡 Заброшено",
+        f"{n_aband:,}".replace(",", " "),
+        help="> 90 дней без движения",
     )
 
 
 # ---------------------------------------------------------------------------
-#  График «Динамика по месяцам»
+#  Универсальный рендер подкатегории
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_monthly_dynamics() -> pd.DataFrame:
-    """
-    Динамика по месяцам: сколько замечаний ждут нашего ответа.
-    Разделено на свежие (<90 дней) и заброшенные (>90 дней).
-    Возвращает DataFrame с колонками: ym, Тип, Количество.
-    """
-    df = _load_all_categorized()
-    if df.empty:
-        return pd.DataFrame()
+def _render_category(df: pd.DataFrame,
+                     overdue_flag: str, in_progress_flag: str,
+                     title: str, description: str):
+    """Универсальный рендер для подкатегории."""
+    st.markdown(f"### {title}")
+    st.info(description)
 
-    # Оба типа: и свежие просрочки, и заброшенные
-    sub = df[df["category_flag"].isin(["overdue_ours", "abandoned"])].copy()
-    if sub.empty:
-        return pd.DataFrame()
-
-    sub["ym"] = sub["created_d"].apply(lambda d: d.strftime("%Y-%m"))
-    sub["Тип"] = sub["category_flag"].map({
-        "overdue_ours": "Свежие",
-        "abandoned": "Заброшенные",
-    })
-
-    monthly = sub.groupby(["ym", "Тип"]).size().reset_index(name="Количество")
-    return monthly
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_waiting_dynamics() -> pd.DataFrame:
-    """
-    Динамика по месяцам: ждут заказчика, разбито по возрасту ожидания.
-    Возвращает DataFrame с колонками: ym, Возраст, Количество.
-    """
-    df = _load_all_categorized()
-    if df.empty:
-        return pd.DataFrame()
-
-    waiting = df[df["category_flag"] == "waiting_customer"].copy()
-    if waiting.empty:
-        return pd.DataFrame()
-
-    waiting = waiting[waiting["fix_date_d"].notna()].copy()
-    if waiting.empty:
-        return pd.DataFrame()
-
-    waiting["ym"] = waiting["fix_date_d"].apply(lambda d: d.strftime("%Y-%m"))
-
-    def _bucket(days):
-        if days <= 30:
-            return "Свежие"
-        elif days <= 90:
-            return "Просроченные"
-        else:
-            return "Хронические"
-
-    waiting["Возраст"] = waiting["days_waiting_customer"].apply(_bucket)
-
-    monthly = waiting.groupby(["ym", "Возраст"]).size().reset_index(
-        name="Количество")
-    return monthly
-
-
-def _render_dynamics_chart():
-    """Два графика рядом: наша вина (стек) vs вина заказчика (стек)."""
-    monthly_ours = _load_monthly_dynamics()
-    monthly_wait = _load_waiting_dynamics()
-
-    if monthly_ours.empty and monthly_wait.empty:
-        return
-
-    st.markdown("### 📈 Динамика по месяцам")
-
-    all_months = set()
-    if not monthly_ours.empty:
-        all_months.update(monthly_ours["ym"].tolist())
-    if not monthly_wait.empty:
-        all_months.update(monthly_wait["ym"].tolist())
-
-    common_months = sorted(all_months)
-
-    col1, col2 = st.columns(2)
-
-    # --- Левый график: ждут нашего ответа ---
-    with col1:
-        if not monthly_ours.empty:
-            pivot = (monthly_ours
-                     .pivot_table(index="ym", columns="Тип",
-                                  values="Количество", fill_value=0)
-                     .reindex(common_months, fill_value=0)
-                     .reset_index())
-
-            for c in ["Свежие", "Заброшенные"]:
-                if c not in pivot.columns:
-                    pivot[c] = 0
-
-            fig = px.bar(
-                pivot, x="ym", y=["Свежие", "Заброшенные"],
-                barmode="stack",
-                labels={"ym": "Месяц выдачи", "value": "Замечаний",
-                        "variable": "Тип"},
-                color_discrete_map={
-                    "Свежие": "#E57373",
-                    "Заброшенные": "#7F0000",
-                },
-                category_orders={"variable": ["Свежие", "Заброшенные"]},
-            )
-            fig.update_layout(
-                title="🔴 Ждут нашего ответа",
-                height=420, xaxis_tickangle=-45,
-                legend=dict(orientation="h", yanchor="bottom",
-                            y=1.02, xanchor="right", x=1),
-                bargap=0.4,
-                xaxis=dict(type="category", categoryorder="array",
-                           categoryarray=common_months),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            download_plotly(fig, "Сроки_динамика_наши", "dl_dyn_ours",
-                            width=1200, height=600)
-        else:
-            st.info("Нет замечаний, ждущих нашего ответа.")
-
-    # --- Правый график: ждут заказчика (стек по возрасту) ---
-    with col2:
-        if not monthly_wait.empty:
-            pivot_w = (monthly_wait
-                       .pivot_table(index="ym", columns="Возраст",
-                                    values="Количество", fill_value=0)
-                       .reindex(common_months, fill_value=0)
-                       .reset_index())
-
-            for c in ["Свежие", "Просроченные", "Хронические"]:
-                if c not in pivot_w.columns:
-                    pivot_w[c] = 0
-
-            fig = px.bar(
-                pivot_w, x="ym",
-                y=["Свежие", "Просроченные", "Хронические"],
-                barmode="stack",
-                labels={"ym": "Месяц нашего ответа",
-                        "value": "Замечаний",
-                        "variable": "Возраст ожидания"},
-                color_discrete_map={
-                    "Свежие": "#FFD54F",
-                    "Просроченные": "#FFB74D",
-                    "Хронические": "#E57373",
-                },
-                category_orders={
-                    "variable": ["Свежие", "Просроченные", "Хронические"],
-                },
-            )
-            fig.update_layout(
-                title="🔵 Ждут заказчика (по возрасту)",
-                height=420, xaxis_tickangle=-45,
-                legend=dict(orientation="h", yanchor="bottom",
-                            y=1.02, xanchor="right", x=1),
-                bargap=0.4,
-                xaxis=dict(type="category", categoryorder="array",
-                           categoryarray=common_months),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            download_plotly(fig, "Сроки_динамика_заказчик", "dl_dyn_cust",
-                            width=1200, height=600)
-        else:
-            st.info("Нет замечаний, ждущих заказчика.")
-
-    st.caption(
-        "**Левый:** 🔴 свежие + 🟫 заброшенные. "
-        "**Правый:** 🟡 свежие (10–30 р.д.) + 🟠 просроченные (30–90 р.д.) "
-        "+ 🔴 хронические (>90 р.д.). Оба — за всё время."
-    )
-
-    # --- Интерпретация ---
-    st.markdown("#### 🧭 Что это значит")
-
-    total_ours = int(monthly_ours["Количество"].sum()) if not monthly_ours.empty else 0
-    total_wait = int(monthly_wait["Количество"].sum()) if not monthly_wait.empty else 0
-
-    if not monthly_ours.empty:
-        fresh_ours = int(monthly_ours[monthly_ours["Тип"] == "Свежие"]["Количество"].sum())
-        aband_ours = int(monthly_ours[monthly_ours["Тип"] == "Заброшенные"]["Количество"].sum())
-    else:
-        fresh_ours = aband_ours = 0
-
-    if not monthly_wait.empty:
-        fresh_w = int(monthly_wait[monthly_wait["Возраст"] == "Свежие"]["Количество"].sum())
-        mid_w = int(monthly_wait[monthly_wait["Возраст"] == "Просроченные"]["Количество"].sum())
-        old_w = int(monthly_wait[monthly_wait["Возраст"] == "Хронические"]["Количество"].sum())
-    else:
-        fresh_w = mid_w = old_w = 0
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Ждут нас — свежие", f"{fresh_ours:,}".replace(",", " "))
-    c2.metric("Ждут нас — заброшено", f"{aband_ours:,}".replace(",", " "))
-    c3.metric("Ждут заказчика — свежие",
-              f"{fresh_w:,}".replace(",", " "), help="10–30 р.д.")
-    c4.metric("Ждут заказчика — просроч.",
-              f"{mid_w:,}".replace(",", " "), help="30–90 р.д.")
-    c5.metric("Ждут заказчика — хроника",
-              f"{old_w:,}".replace(",", " "),
-              delta="эскалация" if old_w > 0 else None,
-              delta_color="inverse",
-              help=">90 р.д.")
-
-    ratio = round(total_ours / total_wait, 2) if total_wait else 0
-
-    if total_ours > total_wait * 1.2:
-        st.error(
-            f"🔴 **Узкое место — мы.** Ждущих нашего ответа в **{ratio}×** "
-            f"больше, чем ждущих заказчика. Нужно усилить отработку."
-        )
-    elif total_wait > total_ours * 1.2:
-        inv = round(total_wait / total_ours, 2) if total_ours else 0
-        st.info(
-            f"🔵 **Узкое место — заказчик.** Ждущих его рассмотрения в "
-            f"**{inv}×** больше. Готовим письмо-предъявление."
-        )
-    else:
-        st.success("⚖️ **Баланс.** Работаем в одном темпе с заказчиком.")
-
-    if old_w > 1000:
-        st.warning(
-            f"⚠️ **{old_w:,} замечаний ждут заказчика >90 р.д.** "
-            f"Зона для эскалации. Готовим официальное письмо."
-            .replace(",", " ")
-        )
-
-# ---------------------------------------------------------------------------
-#  Под-вкладка 1: Ждут нашего ответа
-# ---------------------------------------------------------------------------
-def _render_overdue_ours(df: pd.DataFrame):
-    st.markdown("### 🔴 Ждут нашего ответа")
-    st.caption(
-        "Активные замечания, где мы не ответили в течение 10 рабочих дней. "
-        "Не включая архивные (>90 дней без движения)."
-    )
-
-    sub = df[df["category_flag"] == "overdue_ours"].copy()
-    if sub.empty:
-        st.success("🎉 Нет замечаний, ждущих нашего ответа.")
-        return
-
-    # Слайдер по возрасту просрочки
-    c1, c2 = st.columns([2, 2])
-    with c1:
-        min_overdue = st.slider(
-            "Минимум рабочих дней просрочки",
-            min_value=0, max_value=90, value=0, step=5,
-            key="dl_ours_min_overdue",
-        )
-    with c2:
-        max_overdue = st.number_input(
-            "Максимум (рабочих дней просрочки)",
-            min_value=1, max_value=500, value=90, step=10,
-            key="dl_ours_max_overdue",
-        )
-
-    sub = sub[(sub["days_overdue_work"] >= min_overdue) &
-              (sub["days_overdue_work"] <= max_overdue)]
+    overdue = df[df["category_flag"] == overdue_flag].copy()
+    in_progress = df[df["category_flag"] == in_progress_flag].copy()
+    sub = pd.concat([overdue, in_progress], ignore_index=True)
 
     if sub.empty:
-        st.info("Нет замечаний в заданном диапазоне.")
+        st.success("🎉 Нет замечаний в этой категории.")
         return
 
-    # Фильтры по дисциплине/комплекту
-    disc_options = _load_discipline_options()
-    c3, c4 = st.columns(2)
-    with c3:
-        sel_disc_labels = st.multiselect(
-            "Дисциплина",
-            options=list(disc_options.values()),
-            placeholder="Все дисциплины",
-            key="dl_ours_disc",
+    # Метрики
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Всего", f"{len(sub):,}".replace(",", " "))
+    c2.metric("🔴 Просрочено", f"{len(overdue):,}".replace(",", " "))
+    c3.metric("🟢 В сроке", f"{len(in_progress):,}".replace(",", " "))
+
+    st.divider()
+
+    # Топ комплектов
+    if not sub.empty:
+        st.markdown("##### Топ-15 комплектов")
+        top = (sub.groupby("complex").size()
+                  .reset_index(name="Замечаний")
+                  .sort_values("Замечаний", ascending=True)
+                  .tail(15))
+
+        fig = px.bar(
+            top, x="Замечаний", y="complex", orientation="h",
+            text="Замечаний",
+            color_discrete_sequence=["#E57373"],
+            labels={"complex": ""},
         )
-        sel_disc = [code for code, label in disc_options.items()
-                    if label in sel_disc_labels]
-        if sel_disc:
-            sub = sub[sub["discipline"].isin(sel_disc)]
-
-    with c4:
-        complexes = sorted(sub["complex"].dropna().unique())
-        sel_kit = st.multiselect(
-            "Комплект", options=complexes,
-            placeholder="Все комплекты", key="dl_ours_kit")
-        if sel_kit:
-            sub = sub[sub["complex"].isin(sel_kit)]
-
-    if sub.empty:
-        st.info("Нет данных с заданными фильтрами.")
-        return
-
-    # Топ-15 комплектов
-    st.markdown("##### 🔥 Топ-15 комплектов по количеству просрочек")
-    top = (sub.groupby("complex").size()
-              .reset_index(name="Просрочек")
-              .sort_values("Просрочек", ascending=True)
-              .tail(15))
-
-    fig = px.bar(
-        top, x="Просрочек", y="complex", orientation="h",
-        text="Просрочек",
-        labels={"complex": ""},
-        color_discrete_sequence=["#E57373"],
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(height=max(350, 25 * len(top)))
-    st.plotly_chart(fig, use_container_width=True)
-    download_plotly(fig, "Сроки_топ_комплектов", "dl_top_cx")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=max(350, 25 * len(top)))
+        st.plotly_chart(fig, use_container_width=True)
+        download_plotly(fig, f"Сроки_{overdue_flag}_комплекты",
+                        f"dl_{overdue_flag}_cx", width=1200, height=600)
 
     # Таблица
-    st.markdown(f"##### 📋 Список ({len(sub):,} замечаний)".replace(",", " "))
+    st.markdown(f"##### 📋 Список ({len(sub):,})".replace(",", " "))
 
-    table = sub[[
-        "id", "discipline", "complex", "sheet",
-        "comment", "author", "created", "days_overdue_work",
-    ]].copy().rename(columns={
+    cols = ["id", "discipline", "complex", "sheet", "comment",
+            "author", "created", "days_overdue_work"]
+    table = sub[[c for c in cols if c in sub.columns]].copy()
+    table = table.rename(columns={
         "id": "ID",
         "discipline": "Дисциплина",
         "complex": "Комплект",
@@ -520,30 +376,28 @@ def _render_overdue_ours(df: pd.DataFrame):
         "created": "Создано",
         "days_overdue_work": "Просрочено (р.д.)",
     })
-    table = table.sort_values("Просрочено (р.д.)", ascending=False)
+    if "Просрочено (р.д.)" in table.columns:
+        table = table.sort_values("Просрочено (р.д.)", ascending=False)
 
     st.dataframe(
         table.head(500),
         use_container_width=True, hide_index=True, height=500,
         column_config={
             "Замечание": st.column_config.TextColumn(width="large"),
-            "Просрочено (р.д.)": st.column_config.NumberColumn(
-                "Просрочено (р.д.)", format="%d"),
+            "Просрочено (р.д.)": st.column_config.NumberColumn(format="%d"),
         },
     )
-    if len(table) > 500:
-        st.caption(f"Показаны первые 500 из {len(table):,}.".replace(",", " "))
 
     # Экспорт
     with st.expander("📥 Выгрузить в Excel", expanded=False):
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            table.to_excel(writer, index=False, sheet_name="Сроки")
+            table.to_excel(writer, index=False, sheet_name="Данные")
         buf.seek(0)
         st.download_button(
             "⬇️ Скачать XLSX",
             data=buf.getvalue(),
-            file_name=f"Сроки_ждут_ответа_{datetime.now():%Y%m%d}.xlsx",
+            file_name=f"{overdue_flag}_{datetime.now():%Y%m%d}.xlsx",
             mime=("application/vnd.openxmlformats-officedocument"
                   ".spreadsheetml.sheet"),
             use_container_width=True,
@@ -551,88 +405,47 @@ def _render_overdue_ours(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-#  Под-вкладка 2: Ждут заказчика
+#  Ждут заказчика (свежие + просроченные, без хронических)
 # ---------------------------------------------------------------------------
 def _render_waiting_customer(df: pd.DataFrame):
-    st.markdown("### 🔵 Ждут рассмотрения заказчиком")
-
+    st.markdown("### 🔵 Ждут заказчика")
     st.info(
-        "**Что это значит:** мы ответили на замечание (`fix_date`), статус "
-        "стал **«Выполнено»**, но заказчик не рассмотрел наш ответ в течение "
-        "**10 рабочих дней**. Это **не наша вина** — готовим письмо-предъявление.\n\n"
-        "**Формула:** `status = 'Выполнено'` И `fix_date + 10 р.д. < сегодня`"
+        "**Что это значит:** мы ответили (статус «Выполнено»), но заказчик "
+        "не рассмотрел в течение 10 рабочих дней. Лист ещё **не получил** "
+        "статус A или B. **Это его вина.**"
     )
 
-    sub = df[df["category_flag"] == "waiting_customer"].copy()
+    sub = df[df["category_flag"].isin(
+        ["waiting_customer", "waiting_customer_overdue"])].copy()
+
     if sub.empty:
         st.success("🎉 Нет замечаний, ждущих заказчика.")
         return
 
-    # =====================================================================
-    #  Разбивка по возрасту ожидания
-    # =====================================================================
     def _bucket(days):
         if days <= 30:
             return "🟡 Свежие (10–30 р.д.)"
-        elif days <= 90:
-            return "🟠 Просроченные (30–90 р.д.)"
         else:
-            return "🔴 Хронические (>90 р.д.)"
+            return "🟠 Просроченные (30–90 р.д.)"
 
     sub["Возраст"] = sub["days_waiting_customer"].apply(_bucket)
 
-    # Метрики по категориям
-    c1, c2, c3, c4 = st.columns(4)
-
-    total = len(sub)
-    fresh = (sub["Возраст"] == "🟡 Свежие (10–30 р.д.)").sum()
-    mid = (sub["Возраст"] == "🟠 Просроченные (30–90 р.д.)").sum()
-    old = (sub["Возраст"] == "🔴 Хронические (>90 р.д.)").sum()
-
-    c1.metric("Всего ждут", f"{total:,}".replace(",", " "))
-    c2.metric("🟡 Свежие (10–30 р.д.)", f"{fresh:,}".replace(",", " "),
-              help="Недавно ответили — пусть работает")
-    c3.metric("🟠 Просроченные (30–90 р.д.)", f"{mid:,}".replace(",", " "),
-              help="Пора напоминать заказчику")
-    c4.metric("🔴 Хронические (>90 р.д.)", f"{old:,}".replace(",", " "),
-              delta="эскалация" if old > 0 else None,
-              delta_color="inverse",
-              help="Эскалация к руководству заказчика")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Всего", f"{len(sub):,}".replace(",", " "))
+    c2.metric("🟡 Свежие (10–30 р.д.)",
+              f"{(sub['Возраст'] == '🟡 Свежие (10–30 р.д.)').sum():,}"
+              .replace(",", " "))
+    c3.metric("🟠 Просроченные (30–90 р.д.)",
+              f"{(sub['Возраст'] == '🟠 Просроченные (30–90 р.д.)').sum():,}"
+              .replace(",", " "))
 
     st.divider()
 
-    # =====================================================================
-    #  Слайдеры фильтра
-    # =====================================================================
-    c1, c2 = st.columns(2)
-    with c1:
-        min_wait = st.slider(
-            "Минимум рабочих дней ожидания",
-            min_value=10, max_value=180, value=10, step=5,
-            key="dl_wait_min",
-        )
-    with c2:
-        max_wait = st.number_input(
-            "Максимум (рабочих дней)",
-            min_value=11, max_value=1000, value=365, step=10,
-            key="dl_wait_max",
-        )
-
-    sub = sub[(sub["days_waiting_customer"] >= min_wait) &
-              (sub["days_waiting_customer"] <= max_wait)]
-
-    if sub.empty:
-        st.info("Нет данных в заданном диапазоне.")
-        return
-
-    # =====================================================================
-    #  График по возрастным бакетам
-    # =====================================================================
+    # График по возрастным бакетам
     bucket_counts = sub["Возраст"].value_counts().reset_index()
     bucket_counts.columns = ["Возраст", "Количество"]
 
-    order = ["🟡 Свежие (10–30 р.д.)", "🟠 Просроченные (30–90 р.д.)",
-             "🔴 Хронические (>90 р.д.)"]
+    order = ["🟡 Свежие (10–30 р.д.)", "🟠 Просроченные (30–90 р.д.)"]
     bucket_counts["Возраст"] = pd.Categorical(
         bucket_counts["Возраст"], categories=order, ordered=True)
     bucket_counts = bucket_counts.sort_values("Возраст")
@@ -640,7 +453,6 @@ def _render_waiting_customer(df: pd.DataFrame):
     color_map = {
         "🟡 Свежие (10–30 р.д.)": "#FFD54F",
         "🟠 Просроченные (30–90 р.д.)": "#FFB74D",
-        "🔴 Хронические (>90 р.д.)": "#E57373",
     }
 
     fig = px.bar(
@@ -648,7 +460,6 @@ def _render_waiting_customer(df: pd.DataFrame):
         text="Количество",
         color="Возраст",
         color_discrete_map=color_map,
-        title="Сколько ждём рассмотрения заказчиком",
     )
     fig.update_traces(textposition="outside")
     fig.update_layout(showlegend=False, height=350)
@@ -657,10 +468,8 @@ def _render_waiting_customer(df: pd.DataFrame):
 
     st.divider()
 
-    # =====================================================================
-    #  Топ авторов заказчика
-    # =====================================================================
-    st.markdown("##### 👤 Топ-10 авторов, чьи замечания ждут")
+    # Топ авторов
+    st.markdown("##### 👤 Топ-10 авторов")
     top_authors = (sub.groupby("author").size()
                       .reset_index(name="Ожидают")
                       .sort_values("Ожидают", ascending=True)
@@ -677,11 +486,8 @@ def _render_waiting_customer(df: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
     download_plotly(fig, "Сроки_ждут_авторы", "dl_wait_authors")
 
-    # =====================================================================
-    #  Таблица
-    # =====================================================================
+    # Таблица
     st.markdown(f"##### 📋 Список ({len(sub):,})".replace(",", " "))
-
     table = sub[[
         "id", "discipline", "complex", "sheet",
         "comment", "author", "fix_date", "days_waiting_customer", "Возраст",
@@ -691,7 +497,7 @@ def _render_waiting_customer(df: pd.DataFrame):
         "complex": "Комплект",
         "sheet": "Лист",
         "comment": "Замечание",
-        "author": "Автор замечания",
+        "author": "Автор",
         "fix_date": "Наш ответ",
         "days_waiting_customer": "Ждём (р.д.)",
         "Возраст": "Категория",
@@ -706,27 +512,17 @@ def _render_waiting_customer(df: pd.DataFrame):
             "Ждём (р.д.)": st.column_config.NumberColumn(format="%d"),
         },
     )
-    if len(table) > 500:
-        st.caption(f"Показаны первые 500 из {len(table):,}.".replace(",", " "))
 
-    # =====================================================================
-    #  Экспорт для письма
-    # =====================================================================
-    with st.expander("📧 Выгрузить для письма заказчику", expanded=False):
-        st.caption(
-            "**Рекомендация:** отправлять письмо с этой выгрузкой по "
-            "🔴 хроническим (>90 р.д.) и 🟠 просроченным (30–90 р.д.) "
-            "замечаниям. 🟡 свежие — пока рано, у заказчика есть время."
-        )
+    # Экспорт
+    with st.expander("📧 Выгрузить для письма", expanded=False):
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            table.to_excel(writer, index=False,
-                           sheet_name="Ждут заказчика")
+            table.to_excel(writer, index=False, sheet_name="Ждут заказчика")
         buf.seek(0)
         st.download_button(
             "⬇️ Скачать XLSX",
             data=buf.getvalue(),
-            file_name=f"Письмо_заказчику_{datetime.now():%Y%m%d}.xlsx",
+            file_name=f"Ждут_заказчика_{datetime.now():%Y%m%d}.xlsx",
             mime=("application/vnd.openxmlformats-officedocument"
                   ".spreadsheetml.sheet"),
             use_container_width=True,
@@ -734,13 +530,217 @@ def _render_waiting_customer(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-#  Под-вкладка 3: Заброшено
+#  Хронические
+# ---------------------------------------------------------------------------
+def _render_chronic(df: pd.DataFrame):
+    st.markdown("### 🔴 Хронические — ждут заказчика >90 р.д.")
+    st.warning(
+        "**Что это значит:** мы ответили > 90 рабочих дней назад, "
+        "но заказчик не рассмотрел. Лист не имеет статус A/B. "
+        "Скорее всего, статус в Витрокад **просто не обновили**. "
+        "**Рекомендуется:** массовое письмо с просьбой закрыть."
+    )
+
+    sub = df[df["category_flag"] == "waiting_customer_chronic"].copy()
+    if sub.empty:
+        st.success("🎉 Нет хронических замечаний.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Всего", f"{len(sub):,}".replace(",", " "))
+    c2.metric("Средний возраст",
+              f"{int(sub['days_waiting_customer'].mean())} р.д.")
+    c3.metric("Максимум",
+              f"{int(sub['days_waiting_customer'].max())} р.д.")
+
+    st.divider()
+
+    # Топ комплектов
+    st.markdown("##### Топ-15 комплектов")
+    top = (sub.groupby("complex").size()
+              .reset_index(name="Хронических")
+              .sort_values("Хронических", ascending=True)
+              .tail(15))
+
+    fig = px.bar(
+        top, x="Хронических", y="complex", orientation="h",
+        text="Хронических",
+        color_discrete_sequence=["#7F0000"],
+        labels={"complex": ""},
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=max(350, 25 * len(top)))
+    st.plotly_chart(fig, use_container_width=True)
+    download_plotly(fig, "Сроки_хронические_комплекты", "dl_chronic")
+
+    # Топ авторов
+    st.markdown("##### Топ-10 авторов заказчика")
+    top_auth = (sub.groupby("author").size()
+                   .reset_index(name="Хронических")
+                   .sort_values("Хронических", ascending=True)
+                   .tail(10))
+
+    fig = px.bar(
+        top_auth, x="Хронических", y="author", orientation="h",
+        text="Хронических",
+        color_discrete_sequence=["#64B5F6"],
+        labels={"author": ""},
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=max(300, 30 * len(top_auth)))
+    st.plotly_chart(fig, use_container_width=True)
+    download_plotly(fig, "Сроки_хронические_авторы", "dl_chronic_auth")
+
+    # Таблица
+    st.markdown(f"##### 📋 Список ({len(sub):,})".replace(",", " "))
+    table = sub[[
+        "id", "discipline", "complex", "sheet",
+        "comment", "author", "fix_date", "days_waiting_customer",
+    ]].copy().rename(columns={
+        "id": "ID",
+        "discipline": "Дисциплина",
+        "complex": "Комплект",
+        "sheet": "Лист",
+        "comment": "Замечание",
+        "author": "Автор",
+        "fix_date": "Наш ответ",
+        "days_waiting_customer": "Ждём (р.д.)",
+    })
+    table = table.sort_values("Ждём (р.д.)", ascending=False)
+
+    st.dataframe(
+        table.head(500),
+        use_container_width=True, hide_index=True, height=500,
+        column_config={
+            "Замечание": st.column_config.TextColumn(width="large"),
+            "Ждём (р.д.)": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    with st.expander("📧 Выгрузить для письма заказчику", expanded=False):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            table.to_excel(writer, index=False, sheet_name="Хронические")
+        buf.seek(0)
+        st.download_button(
+            "⬇️ Скачать XLSX",
+            data=buf.getvalue(),
+            file_name=f"Хронические_{datetime.now():%Y%m%d}.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            use_container_width=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+#  Учтено (лист A/B)
+# ---------------------------------------------------------------------------
+def _render_closed_by_doc(df: pd.DataFrame):
+    st.markdown("### 🟢 Учтено, но формально не закрыто")
+    st.success(
+        "**Что это значит:** мы ответили, лист получил статус **A** "
+        "(утверждён) или **B** (готов к сдаче). Значит, замечание "
+        "**фактически принято**. Осталось дожать заказчика на формальное "
+        "**«Закрыто»** в Витрокад.\n\n"
+        "**Действие:** массовое письмо с просьбой закрыть."
+    )
+
+    sub = df[df["category_flag"] == "closed_by_doc_status"].copy()
+    if sub.empty:
+        st.info("Нет таких замечаний.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Всего", f"{len(sub):,}".replace(",", " "))
+    c2.metric("Листов A/B", sub["sheet"].nunique())
+    c3.metric("Авторов", sub["author"].nunique())
+
+    st.divider()
+
+    # Топ авторов
+    st.markdown("##### Топ-10 авторов заказчика")
+    top_auth = (sub.groupby("author").size()
+                   .reset_index(name="Учтено")
+                   .sort_values("Учтено", ascending=True)
+                   .tail(10))
+
+    fig = px.bar(
+        top_auth, x="Учтено", y="author", orientation="h",
+        text="Учтено",
+        color_discrete_sequence=["#2E7D32"],
+        labels={"author": ""},
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=max(300, 30 * len(top_auth)))
+    st.plotly_chart(fig, use_container_width=True)
+    download_plotly(fig, "Сроки_учтено_авторы", "dl_closed_auth")
+
+    # Топ комплектов
+    st.markdown("##### Топ-15 комплектов")
+    top = (sub.groupby("complex").size()
+              .reset_index(name="Учтено")
+              .sort_values("Учтено", ascending=True)
+              .tail(15))
+
+    fig = px.bar(
+        top, x="Учтено", y="complex", orientation="h",
+        text="Учтено",
+        color_discrete_sequence=["#4CAF50"],
+        labels={"complex": ""},
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=max(350, 25 * len(top)))
+    st.plotly_chart(fig, use_container_width=True)
+    download_plotly(fig, "Сроки_учтено_комплекты", "dl_closed_cx")
+
+    # Таблица
+    st.markdown(f"##### 📋 Список ({len(sub):,})".replace(",", " "))
+    table = sub[[
+        "id", "discipline", "complex", "sheet",
+        "comment", "author", "doc_status", "fix_date",
+    ]].copy().rename(columns={
+        "id": "ID",
+        "discipline": "Дисциплина",
+        "complex": "Комплект",
+        "sheet": "Лист",
+        "comment": "Замечание",
+        "author": "Автор",
+        "doc_status": "Статус листа",
+        "fix_date": "Наш ответ",
+    })
+
+    st.dataframe(
+        table.head(500),
+        use_container_width=True, hide_index=True, height=500,
+        column_config={
+            "Замечание": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+    with st.expander("📧 Выгрузить для письма", expanded=False):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            table.to_excel(writer, index=False, sheet_name="Учтено")
+        buf.seek(0)
+        st.download_button(
+            "⬇️ Скачать XLSX",
+            data=buf.getvalue(),
+            file_name=f"Учтено_{datetime.now():%Y%m%d}.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            use_container_width=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+#  Заброшено
 # ---------------------------------------------------------------------------
 def _render_abandoned(df: pd.DataFrame):
     st.markdown("### 🟡 Заброшено (архив)")
-    st.caption(
-        "Замечания без движения >90 дней. Кандидаты на снятие или "
-        "пересогласование с заказчиком."
+    st.info(
+        "**Что это значит:** замечания без движения >90 календарных дней "
+        "в любом статусе. Кандидаты на снятие или пересогласование "
+        "с заказчиком."
     )
 
     sub = df[df["category_flag"] == "abandoned"].copy()
@@ -749,35 +749,15 @@ def _render_abandoned(df: pd.DataFrame):
         return
 
     c1, c2 = st.columns(2)
-    with c1:
-        min_days = st.slider(
-            "Минимум дней без движения",
-            min_value=90, max_value=730, value=90, step=10,
-            key="dl_ab_min",
-        )
-    with c2:
-        year_filter = st.multiselect(
-            "Год создания",
-            options=sorted(sub["created_d"].apply(lambda d: d.year).unique()),
-            placeholder="Все годы",
-            key="dl_ab_year",
-        )
+    c1.metric("Всего заброшено", f"{len(sub):,}".replace(",", " "))
+    c2.metric("Средний возраст",
+              f"{int(sub['days_since_movement'].mean())} дн.")
 
-    sub = sub[sub["days_since_movement"] >= min_days]
-    if year_filter:
-        sub = sub[sub["created_d"].apply(lambda d: d.year).isin(year_filter)]
-
-    if sub.empty:
-        st.info("Нет данных.")
-        return
-
-    st.metric("Всего заброшено", f"{len(sub):,}".replace(",", " "))
+    st.divider()
 
     # Разбивка по годам
-    st.markdown("##### 📅 Разбивка по годам создания")
-    sub_year = sub.copy()
-    sub_year["Год"] = sub_year["created_d"].apply(lambda d: d.year)
-    by_year = sub_year.groupby("Год").size().reset_index(name="Количество")
+    sub["Год"] = sub["created_d"].apply(lambda d: d.year)
+    by_year = sub.groupby("Год").size().reset_index(name="Количество")
 
     fig = px.bar(
         by_year, x="Год", y="Количество",
@@ -789,17 +769,34 @@ def _render_abandoned(df: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
     download_plotly(fig, "Сроки_заброшено_годы", "dl_ab_years")
 
+    # Разбивка по статусу
+    st.markdown("##### По статусам")
+    by_status = sub.groupby("status").size().reset_index(name="Количество")
+    by_status = by_status.sort_values("Количество", ascending=False)
+
+    fig = px.bar(
+        by_status, x="status", y="Количество",
+        text="Количество",
+        color_discrete_sequence=["#FFB74D"],
+        labels={"status": "Статус"},
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=300, showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+    download_plotly(fig, "Сроки_заброшено_статусы", "dl_ab_statuses")
+
     # Таблица
     st.markdown(f"##### 📋 Список ({len(sub):,})".replace(",", " "))
     table = sub[[
         "id", "discipline", "complex", "sheet",
-        "comment", "author", "created", "days_since_movement",
+        "comment", "status", "author", "created", "days_since_movement",
     ]].copy().rename(columns={
         "id": "ID",
         "discipline": "Дисциплина",
         "complex": "Комплект",
         "sheet": "Лист",
         "comment": "Замечание",
+        "status": "Статус",
         "author": "Автор",
         "created": "Создано",
         "days_since_movement": "Без движения (дн.)",
@@ -836,8 +833,9 @@ def _render_abandoned(df: pd.DataFrame):
 def render():
     st.header("⏰ Сроки")
     st.caption(
-        "Контроль соблюдения 10 рабочих дней: ответ на замечания, "
-        "рассмотрение ответов заказчиком, архивные замечания."
+        "Контроль 10 рабочих дней: ответы на замечания, рассмотрение "
+        "заказчиком, архив. Все категории разделены по вине: "
+        "**красные — наша**, **синие — заказчика**, **зелёные — учтено**."
     )
 
     col1, col2 = st.columns([4, 1])
@@ -859,21 +857,51 @@ def render():
 
     st.divider()
 
-    # Динамика
-    _render_dynamics_chart()
-
-    st.divider()
-
-    # Под-вкладки
-    tab1, tab2, tab3 = st.tabs([
-        "🔴 Ждут нашего ответа",
+    # 8 под-вкладок
+    tabs = st.tabs([
+        "🆕 Новое",
+        "🛠 Принято в работу",
+        "🟪 Не принято",
+        "🟣 К обсуждению",
         "🔵 Ждут заказчика",
+        "🔴 Хронические",
+        "🟢 Учтено (A/B)",
         "🟡 Заброшено",
     ])
 
-    with tab1:
-        _render_overdue_ours(df)
-    with tab2:
+    with tabs[0]:
+        _render_category(
+            df, "new_overdue", "new_in_progress",
+            "🆕 Новое — не взято в работу",
+            "Заказчик выдал замечание, но мы ещё не взяли его в работу. "
+            "Срок ответа — 10 рабочих дней.",
+        )
+    with tabs[1]:
+        _render_category(
+            df, "in_work_overdue", "in_work_in_progress",
+            "🛠 Принято в работу — не ответили",
+            "Мы взяли замечание, но ещё не дали ответ. "
+            "Срок ответа — 10 рабочих дней.",
+        )
+    with tabs[2]:
+        _render_category(
+            df, "rejected_overdue", "rejected_in_progress",
+            "🟪 Не принято — заказчик отклонил",
+            "Мы ответили, заказчик проверил и **не принял** — вернул на "
+            "доработку. Срок доработки — 10 рабочих дней с момента "
+            "отклонения.",
+        )
+    with tabs[3]:
+        _render_category(
+            df, "discussion_overdue", "discussion_in_progress",
+            "🟣 К обсуждению — спорное",
+            "Замечание в обсуждении, спорное. Требует совещания.",
+        )
+    with tabs[4]:
         _render_waiting_customer(df)
-    with tab3:
+    with tabs[5]:
+        _render_chronic(df)
+    with tabs[6]:
+        _render_closed_by_doc(df)
+    with tabs[7]:
         _render_abandoned(df)
