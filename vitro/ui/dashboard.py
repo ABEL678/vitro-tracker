@@ -177,7 +177,7 @@ def _load_full_state() -> dict:
         result["by_disc"] = {}
 
     # =====================================================================
-    #  4. Топ-5 комплектов по просрочкам (АТП ТЛП)
+    #  4. Топ-10 комплектов по просрочкам (АТП ТЛП)
     # =====================================================================
     if not cats_df.empty:
         overdue = cats_df[cats_df["category_flag"].isin([
@@ -186,15 +186,15 @@ def _load_full_state() -> dict:
         ])]
 
         top_cx = (overdue.groupby("complex").size()
-                    .reset_index(name="n")
-                    .sort_values("n", ascending=False)
-                    .head(5))
+                  .reset_index(name="n")
+                  .sort_values("n", ascending=False)
+                  .head(10))
         result["top_overdue_complex"] = top_cx
     else:
         result["top_overdue_complex"] = pd.DataFrame()
 
     # =====================================================================
-    #  5. Топ-5 авторов, чьи замечания ждут заказчика
+    #  5. Топ-10 авторов, чьи замечания ждут заказчика
     # =====================================================================
     if not cats_df.empty:
         waiting_df = cats_df[cats_df["category_flag"].isin([
@@ -203,9 +203,9 @@ def _load_full_state() -> dict:
         ])]
 
         top_auth = (waiting_df.groupby("author").size()
-                       .reset_index(name="n")
-                       .sort_values("n", ascending=False)
-                       .head(5))
+                    .reset_index(name="n")
+                    .sort_values("n", ascending=False)
+                    .head(10))
         result["top_waiting_authors"] = top_auth
     else:
         result["top_waiting_authors"] = pd.DataFrame()
@@ -388,7 +388,7 @@ def _render_traffic_light(data: dict):
 #  Топ-5 проблем
 # ---------------------------------------------------------------------------
 def _render_top_problems(data: dict):
-    st.markdown("### 🔥 Топ-5 проблем")
+    st.markdown("### 🔥 Топ-10 проблем")
 
     col1, col2 = st.columns(2)
 
