@@ -701,13 +701,26 @@ def _render_chronic(df: pd.DataFrame):
 #  Учтено (лист A/B)
 # ---------------------------------------------------------------------------
 def _render_closed_by_doc(df: pd.DataFrame):
-    st.markdown("### 🟢 Учтено, но формально не закрыто")
-    st.success(
-        "**Что это значит:** мы ответили, лист получил статус **A** "
-        "(утверждён) или **B** (готов к сдаче). Значит, замечание "
-        "**фактически принято**. Осталось дожать заказчика на формальное "
-        "**«Закрыто»** в Витрокад.\n\n"
-        "**Действие:** массовое письмо с просьбой закрыть."
+    """
+    Под-вкладка «Учтено (A/B)».
+
+    Это замечания в статусе «Выполнено», по которым лист получил статус:
+      🟢 A — утверждён. Замечания фактически сняты, надо дожать
+             заказчика на формальное «Закрыто» в Витрокад.
+      🟡 B — готов к сдаче. Формально замечания НЕ сняты, заказчик
+             может вернуть лист на доработку. Требует внимания.
+
+    Категория замечания при этом может быть любой (не ограничиваем).
+    """
+    st.markdown("### 🟢 Учтено — лист получил A или B, замечания не закрыты")
+    st.info(
+        "**Что это значит:** мы дали ответ (статус «Выполнено»), "
+        "и лист уже перешёл в статус **A** (утверждён) или **B** "
+        "(готов к сдаче). Фактически замечание принято, но в Витрокад "
+        "оно **ещё не закрыто**.\n\n"
+        "**Действие:** массовое письмо заказчику с просьбой закрыть "
+        "формально. Для листов **B** — дополнительно уточнить, "
+        "не вернут ли лист на доработку."
     )
 
     sub = df[df["category_flag"] == "closed_by_doc_status"].copy()
@@ -715,59 +728,171 @@ def _render_closed_by_doc(df: pd.DataFrame):
         st.info("Нет таких замечаний.")
         return
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Всего", f"{len(sub):,}".replace(",", " "))
-    c2.metric("Листов A/B", sub["sheet"].nunique())
-    c3.metric("Авторов", sub["author"].nunique())
+    # Разделяем по статусу листа
+    sub_a = sub[sub["doc_status"] == "A"].copy()
+    sub_b = sub[sub["doc_status"] == "B"].copy()
+    sub_other = sub[~sub["doc_status"].isin(["A", "B"])].copy()
+
+    # ============================================================
+    #  KPI — общие + разбивка
+    # ============================================================
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Всего учтено",
+        f"{len(sub):,}".replace(",", " "),
+        help="Лист в статусе A или B, замечание в статусе «Выполнено»",
+    )
+    c2.metric(
+        "🟢 Лист A — утверждено",
+        f"{len(sub_a):,}".replace(",", " "),
+        help="Лист утверждён заказчиком. Замечания фактически сняты, "
+             "надо только формально закрыть в Витрокад.",
+    )
+    c3.metric(
+        "🟡 Лист B — к сдаче",
+        f"{len(sub_b):,}".replace(",", " "),
+        help="Лист готов к сдаче, но замечания формально НЕ сняты. "
+             "Заказчик может вернуть лист на доработку.",
+    )
+    c4.metric(
+        "Уникальных листов",
+        sub["sheet"].nunique(),
+        help="Сколько разных листов РД затронуто",
+    )
+
+    if not sub_other.empty:
+        st.caption(
+            f"⚠️ Замечаний с нестандартным статусом листа "
+            f"(не A и не B): **{len(sub_other)}**"
+        )
 
     st.divider()
 
-    # Топ авторов
-    st.markdown("##### Топ-10 авторов заказчика")
-    top_auth = (sub.groupby("author").size()
-                   .reset_index(name="Учтено")
-                   .sort_values("Учтено", ascending=True)
-                   .tail(10))
+    # ============================================================
+    #  График 1: разбивка A vs B по дисциплинам (стек)
+    # ============================================================
+    st.markdown("##### 📊 Учтено по дисциплинам — A vs B")
 
-    fig = px.bar(
-        top_auth, x="Учтено", y="author", orientation="h",
-        text="Учтено",
-        color_discrete_sequence=["#2E7D32"],
-        labels={"author": ""},
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(height=max(300, 30 * len(top_auth)))
-    st.plotly_chart(fig, use_container_width=True)
-    download_plotly(fig, "Сроки_учтено_авторы", "dl_closed_auth")
+    by_disc = sub.groupby(["discipline", "doc_status"]).size() \
+                 .reset_index(name="Количество")
 
-    # Топ комплектов
-    st.markdown("##### Топ-15 комплектов")
-    top = (sub.groupby("complex").size()
-              .reset_index(name="Учтено")
-              .sort_values("Учтено", ascending=True)
-              .tail(15))
+    if not by_disc.empty:
+        color_map = {"A": "#2E7D32", "B": "#FFB74D"}
+        fig = px.bar(
+            by_disc, x="discipline", y="Количество",
+            color="doc_status", barmode="stack",
+            color_discrete_map=color_map,
+            labels={"discipline": "Дисциплина",
+                    "doc_status": "Статус листа"},
+            text="Количество",
+        )
+        fig.update_traces(textposition="inside")
+        fig.update_layout(
+            height=400,
+            legend_title_text="Статус листа",
+            xaxis_tickangle=-45,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        download_plotly(fig, "Сроки_учтено_дисциплины",
+                        "dl_closed_disc", width=1400, height=600)
 
-    fig = px.bar(
-        top, x="Учтено", y="complex", orientation="h",
-        text="Учтено",
-        color_discrete_sequence=["#4CAF50"],
-        labels={"complex": ""},
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(height=max(350, 25 * len(top)))
-    st.plotly_chart(fig, use_container_width=True)
-    download_plotly(fig, "Сроки_учтено_комплекты", "dl_closed_cx")
+    st.divider()
 
-    # Таблица
+    # ============================================================
+    #  График 2: топ-15 комплектов (A vs B)
+    # ============================================================
+    st.markdown("##### 🏗 Топ-15 комплектов — где больше всего учтённых")
+
+    by_cx = sub.groupby(["complex", "doc_status"]).size() \
+               .reset_index(name="Количество")
+    # Топ-15 по сумме
+    total_by_cx = by_cx.groupby("complex")["Количество"].sum() \
+                       .reset_index().sort_values("Количество",
+                                                   ascending=False).head(15)
+    by_cx = by_cx[by_cx["complex"].isin(total_by_cx["complex"])]
+
+    if not by_cx.empty:
+        fig = px.bar(
+            by_cx, x="Количество", y="complex", orientation="h",
+            color="doc_status", barmode="stack",
+            color_discrete_map={"A": "#2E7D32", "B": "#FFB74D"},
+            labels={"complex": "", "doc_status": "Статус листа"},
+            text="Количество",
+        )
+        fig.update_traces(textposition="inside")
+        fig.update_layout(
+            height=max(400, 28 * by_cx["complex"].nunique()),
+            legend_title_text="Статус листа",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        download_plotly(fig, "Сроки_учтено_комплекты",
+                        "dl_closed_cx", width=1400, height=700)
+
+    st.divider()
+
+    # ============================================================
+    #  График 3: топ-10 авторов (A vs B)
+    # ============================================================
+    st.markdown("##### 👤 Топ-10 авторов замечаний — A vs B")
+
+    by_auth = sub.groupby(["author", "doc_status"]).size() \
+                 .reset_index(name="Количество")
+    top_auth = by_auth.groupby("author")["Количество"].sum() \
+                      .reset_index().sort_values("Количество",
+                                                  ascending=False).head(10)
+    by_auth = by_auth[by_auth["author"].isin(top_auth["author"])]
+
+    if not by_auth.empty:
+        fig = px.bar(
+            by_auth, x="Количество", y="author", orientation="h",
+            color="doc_status", barmode="stack",
+            color_discrete_map={"A": "#2E7D32", "B": "#FFB74D"},
+            labels={"author": "", "doc_status": "Статус листа"},
+            text="Количество",
+        )
+        fig.update_traces(textposition="inside")
+        fig.update_layout(
+            height=max(350, 32 * by_auth["author"].nunique()),
+            legend_title_text="Статус листа",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        download_plotly(fig, "Сроки_учтено_авторы",
+                        "dl_closed_auth", width=1400, height=600)
+
+    st.divider()
+
+    # ============================================================
+    #  Таблица с фильтром A / B / всё
+    # ============================================================
     st.markdown(f"##### 📋 Список ({len(sub):,})".replace(",", " "))
-    table = sub[[
-        "id", "discipline", "complex", "sheet",
+
+    # Фильтр по статусу листа
+    flt = st.radio(
+        "Показать:",
+        options=["Все", "🟢 Только A", "🟡 Только B"],
+        horizontal=True,
+        key="dl_closed_filter",
+    )
+    if flt == "🟢 Только A":
+        table_src = sub_a
+    elif flt == "🟡 Только B":
+        table_src = sub_b
+    else:
+        table_src = sub
+
+    if table_src.empty:
+        st.info("По выбранному фильтру нет данных.")
+        return
+
+    table = table_src[[
+        "id", "discipline", "complex", "sheet", "sheet_name",
         "comment", "author", "doc_status", "fix_date",
     ]].copy().rename(columns={
         "id": "ID",
         "discipline": "Дисциплина",
         "complex": "Комплект",
         "sheet": "Лист",
+        "sheet_name": "Название листа",
         "comment": "Замечание",
         "author": "Автор",
         "doc_status": "Статус листа",
@@ -779,9 +904,16 @@ def _render_closed_by_doc(df: pd.DataFrame):
         use_container_width=True, hide_index=True, height=500,
         column_config={
             "Замечание": st.column_config.TextColumn(width="large"),
+            "Название листа": st.column_config.TextColumn(width="large"),
         },
     )
+    if len(table) > 500:
+        st.caption(f"Показаны первые 500 из {len(table):,}."
+                   .replace(",", " "))
 
+    # ============================================================
+    #  Экспорт (по текущему фильтру)
+    # ============================================================
     with st.expander("📧 Выгрузить для письма", expanded=False):
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -790,7 +922,8 @@ def _render_closed_by_doc(df: pd.DataFrame):
         st.download_button(
             "⬇️ Скачать XLSX",
             data=buf.getvalue(),
-            file_name=f"Учтено_{datetime.now():%Y%m%d}.xlsx",
+            file_name=f"Учтено_{flt.replace('🟢 ','').replace('🟡 ','')}"
+                      f"_{datetime.now():%Y%m%d}.xlsx",
             mime=("application/vnd.openxmlformats-officedocument"
                   ".spreadsheetml.sheet"),
             use_container_width=True,
