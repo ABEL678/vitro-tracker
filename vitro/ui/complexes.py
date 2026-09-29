@@ -17,6 +17,7 @@ import streamlit as st
 from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.ui._utils import download_plotly
+from vitro.ui.deadlines import _load_all_categorized
 
 
 # ---------------------------------------------------------------------------
@@ -506,12 +507,207 @@ def _render_export(df: pd.DataFrame):
 
     with st.expander("📥 Выгрузить таблицу в Excel", expanded=False):
         buf = io.BytesIO()
-        export_df = df.drop(
-            columns=["complex_name", "status_icon"],
-            errors="ignore",
+
+        # =================================================================
+        #  1. Готовим данные
+        # =================================================================
+        export_df = df.copy()
+
+       # Переименование колонок — деловые, самодостаточные названия
+        rename_map = {
+            "complex": "Шифр комплекта",
+            "complex_name": "Название комплекта",
+            "discipline": "Код дисциплины",
+            "section": "Раздел",
+            # ---- Листы ----
+            "docs_total": "Всего листов",
+            "doc_a": "Листов утверждено (A)",
+            "doc_b": "Листов к сдаче (B)",
+            "doc_c": "Листов в работе (C)",
+            "doc_info": "Листов информационных (И)",
+            "doc_pct": "% листов A+B",
+            # ---- Замечания (по всей базе) ----
+            "comments_total": "Всего замечаний",
+            "comments_active": "Активных замечаний",
+            "comments_closed": "Закрыто замечаний",
+            "comments_annulled": "Аннулировано замечаний",
+            "comment_pct": "% замечаний закрыто формально",
+            # ---- Ответственные ----
+            "ours": "Требует ответа АТП ТЛП",
+            "waiting": "Ждут рассмотрения заказчиком (10–90 р.д.)",
+            "chronic": "Заказчик не рассмотрел >90 р.д.",
+            "closed_doc": "Учтено (лист A/B, не снято)",
+            "ours_overdue": "Просрочено АТП ТЛП (>10 р.д.)",
+            # ---- Категории замечаний ----
+            "cat_1": "Принято/корректное",
+            "cat_2": "Формальное (не влияет на СМР)",
+            "cat_3": "Доп.требование (нет в ТЗ)",
+            "cat_4": "Не принято (нарушение ТНПА)",
+            "cat_none": "Без категории",
+            "cat_pct": "% замечаний с категорией",
+            # ---- Метрики ----
+            "status_icon": "Индикатор",
+        }
+        export_df = export_df.rename(columns=rename_map)
+
+        # Убираем лишние/технические колонки
+        for c in ["Статус листа"]:
+            if c in export_df.columns:
+                export_df = export_df.drop(columns=c)
+
+        # Порядок колонок
+        desired_order = [
+            "Индикатор",
+            "Шифр комплекта", "Название комплекта",
+            "Код дисциплины", "Раздел",
+            # Листы
+            "Всего листов",
+            "Листов утверждено (A)",
+            "Листов к сдаче (B)",
+            "Листов в работе (C)",
+            "Листов информационных (И)",
+            "% листов A+B",
+            # Замечания — общие
+            "Всего замечаний",
+            "Активных замечаний",
+            "Закрыто замечаний",
+            "Аннулировано замечаний",
+            "% замечаний закрыто формально",
+            # Ответственные
+            "Требует ответа АТП ТЛП",
+            "Ждут рассмотрения заказчиком (10–90 р.д.)",
+            "Заказчик не рассмотрел >90 р.д.",
+            "Учтено (лист A/B, не снято)",
+            "Просрочено АТП ТЛП (>10 р.д.)",
+            # Категории
+            "Принято/корректное",
+            "Формальное (не влияет на СМР)",
+            "Доп.требование (нет в ТЗ)",
+            "Не принято (нарушение ТНПА)",
+            "Без категории",
+            "% замечаний с категорией",
+        ]
+        export_df = export_df[
+            [c for c in desired_order if c in export_df.columns]
+        ]
+
+        # =================================================================
+        #  2. Добавляем строку ИТОГО
+        # =================================================================
+        # Колонки, по которым считаем сумму (числовые)
+        sum_cols = [
+            "Всего листов",
+            "Листов утверждено (A)",
+            "Листов к сдаче (B)",
+            "Листов в работе (C)",
+            "Листов информационных (И)",
+            "Всего замечаний",
+            "Активных замечаний",
+            "Закрыто замечаний",
+            "Аннулировано замечаний",
+            "Требует ответа АТП ТЛП",
+            "Ждут рассмотрения заказчиком (10–90 р.д.)",
+            "Заказчик не рассмотрел >90 р.д.",
+            "Учтено (лист A/B, не снято)",
+            "Просрочено АТП ТЛП (>10 р.д.)",
+            "Принято/корректное",
+            "Формальное (не влияет на СМР)",
+            "Доп.требование (нет в ТЗ)",
+            "Не принято (нарушение ТНПА)",
+            "Без категории",
+        ]
+
+        totals_row = {}
+        for col in export_df.columns:
+            if col in sum_cols:
+                try:
+                    totals_row[col] = int(export_df[col].fillna(0).sum())
+                except Exception:
+                    totals_row[col] = ""
+            elif col == "Комплект":
+                totals_row[col] = "ИТОГО"
+            elif col == "Наименование":
+                totals_row[col] = f"{len(export_df)} комплектов"
+            else:
+                totals_row[col] = ""
+
+        export_df = pd.concat(
+            [export_df, pd.DataFrame([totals_row])],
+            ignore_index=True,
         )
+
+        # =================================================================
+        #  3. Запись в Excel с форматированием
+        # =================================================================
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            export_df.to_excel(writer, index=False, sheet_name="Комплекты")
+            export_df.to_excel(
+                writer, index=False, sheet_name="Комплекты",
+            )
+
+            ws = writer.sheets["Комплекты"]
+
+            # ---- Фиксация шапки (2 строки: заголовки + первая) ----
+            ws.freeze_panes = "A2"
+
+            # ---- Автофильтр по всем колонкам ----
+            max_col_letter = chr(64 + min(len(export_df.columns), 26))
+            if len(export_df.columns) > 26:
+                # для > 26 колонок — двухбуквенные обозначения
+                max_col_letter = _excel_col_letter(len(export_df.columns))
+            ws.auto_filter.ref = f"A1:{max_col_letter}{len(export_df) + 1}"
+
+            # ---- Автоширина колонок ----
+            for col_idx, col_name in enumerate(export_df.columns, start=1):
+                col_letter = _excel_col_letter(col_idx)
+                # ширина = max из длины заголовка и содержимого, но не больше 40
+                max_len = len(str(col_name))
+                if len(export_df) > 0:
+                    try:
+                        content_max = (
+                            export_df[col_name]
+                            .astype(str)
+                            .str.len()
+                            .max()
+                        )
+                        if content_max:
+                            max_len = max(max_len, int(content_max))
+                    except Exception:
+                        pass
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
+
+            # ---- Жирный шрифт для шапки ----
+            from openpyxl.styles import Font, PatternFill, Alignment
+            bold = Font(bold=True)
+            header_fill = PatternFill(
+                start_color="D9E1F2", end_color="D9E1F2", fill_type="solid",
+            )
+
+            color_map = {
+                "Требует ответа АТП ТЛП":                        "FFC7CE",
+                "Просрочено АТП ТЛП (>10 р.д.)":                 "FFC7CE",
+                "Ждут рассмотрения заказчиком (10–90 р.д.)":     "BDD7EE",
+                "Заказчик не рассмотрел >90 р.д.":               "F8CBAD",
+                "Учтено (лист A/B, не снято)":                   "C6EFCE",
+            }
+
+            for col_idx in range(1, len(export_df.columns) + 1):
+                cell = ws.cell(row=1, column=col_idx)
+                cell.font = bold
+                cell.fill = header_fill
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center",
+                )
+
+            # ---- Жирный + подсветка для строки ИТОГО ----
+            total_row_idx = len(export_df) + 1  # +1 из-за шапки в Excel
+            for col_idx in range(1, len(export_df.columns) + 1):
+                cell = ws.cell(row=total_row_idx, column=col_idx)
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill(
+                    start_color="FFF2CC", end_color="FFF2CC",
+                    fill_type="solid",
+                )
+
         buf.seek(0)
 
         st.download_button(
@@ -523,9 +719,329 @@ def _render_export(df: pd.DataFrame):
             use_container_width=True,
             key="cx_download",
         )
-        st.caption(f"В выгрузке: **{len(export_df)}** строк"
+        st.caption(
+            f"В выгрузке: **{len(export_df) - 1}** комплектов + строка "
+            f"ИТОГО. Шапка зафиксирована, автофильтр включён."
+            .replace(",", " ")
+        )
+
+
+def _excel_col_letter(col_idx: int) -> str:
+    """Преобразует 1-based индекс колонки в букву Excel (1=A, 27=AA)."""
+    result = ""
+    while col_idx > 0:
+        col_idx, rem = divmod(col_idx - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+# ---------------------------------------------------------------------------
+#  Drill-down: детали комплекта
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_complex_details(complex_code: str) -> pd.DataFrame:
+    """Все замечания по комплекту (из _load_all_categorized)."""
+    df = _load_all_categorized()
+    if df.empty:
+        return pd.DataFrame()
+
+    sub = df[df["complex"] == complex_code].copy()
+    if sub.empty:
+        return pd.DataFrame()
+
+    # Порядок: сначала по статусу, потом по id
+    flag_order = {
+        "new_overdue": 1, "new_in_progress": 2,
+        "in_work_overdue": 3, "in_work_in_progress": 4,
+        "rejected_overdue": 5, "rejected_in_progress": 6,
+        "discussion_overdue": 7, "discussion_in_progress": 8,
+        "waiting_customer_chronic": 9,
+        "waiting_customer_overdue": 10,
+        "waiting_customer": 11,
+        "waiting_customer_ontime": 12,
+        "closed_by_doc_status": 13,
+        "abandoned": 14,
+    }
+    sub["_order"] = sub["category_flag"].map(flag_order).fillna(99)
+    sub = sub.sort_values(["_order", "id"])
+
+    return sub
+
+
+def _render_drilldown(df: pd.DataFrame):
+    """Drill-down по комплекту: KPI + 8 категорий + список замечаний."""
+    st.markdown("### 🔍 Детали комплекта")
+
+    if df.empty:
+        st.info("Нет данных по комплектам.")
+        return
+
+    # ---- Каскадные фильтры: дисциплина → раздел → комплект ----
+    c1, c2, c3 = st.columns(3)
+
+    disciplines = sorted(
+        df["discipline"].dropna().unique().tolist()
+    )
+
+    with c1:
+        sel_disc = st.multiselect(
+            "Дисциплина",
+            options=disciplines,
+            format_func=lambda c: f"{c} — {discipline_name(c)}",
+            placeholder="Все дисциплины",
+            key="cd_disc",
+        )
+
+    if sel_disc:
+        pool = df[df["discipline"].isin(sel_disc)]
+    else:
+        pool = df
+
+    sections = sorted([
+        s for s in pool["section"].dropna().unique().tolist() if s
+    ])
+
+    with c2:
+        if sections:
+            sel_section = st.multiselect(
+                "Раздел",
+                options=sections,
+                placeholder="Все разделы",
+                key="cd_section",
+            )
+        else:
+            sel_section = []
+            st.multiselect(
+                "Раздел", options=[],
+                placeholder="Не применимы",
+                disabled=True,
+                key="cd_section_empty",
+            )
+
+    if sel_section:
+        pool = pool[pool["section"].isin(sel_section)]
+
+    complexes = sorted(pool["complex"].dropna().unique().tolist())
+
+    with c3:
+        sel_complex = st.selectbox(
+            "Комплект",
+            options=[""] + complexes,
+            format_func=lambda x: x or "— выберите комплект —",
+            key="cd_complex",
+            placeholder="Начните вводить шифр...",
+        )
+
+    if not sel_complex:
+        st.info(
+            "💡 Выберите комплект — появятся KPI, разбивка по 8 "
+            "категориям и список замечаний. Можно сузить список "
+            "через дисциплину и раздел."
+        )
+        return
+
+    # ---- Загружаем детали комплекта ----
+    details = _load_complex_details(sel_complex)
+    if details.empty:
+        st.warning(f"По комплекту `{sel_complex}` замечаний не найдено.")
+        return
+
+    # ---- KPI по 8 категориям ----
+    st.markdown(f"#### 📊 Комплект `{sel_complex}`")
+
+    counts = details["category_flag"].value_counts()
+
+    n_new = int(counts.get("new_overdue", 0) + counts.get("new_in_progress", 0))
+    n_work = int(counts.get("in_work_overdue", 0) + counts.get("in_work_in_progress", 0))
+    n_rej = int(counts.get("rejected_overdue", 0) + counts.get("rejected_in_progress", 0))
+    n_disc = int(counts.get("discussion_overdue", 0) + counts.get("discussion_in_progress", 0))
+    n_wait = int(counts.get("waiting_customer", 0)
+                 + counts.get("waiting_customer_overdue", 0)
+                 + counts.get("waiting_customer_ontime", 0))
+    n_chronic = int(counts.get("waiting_customer_chronic", 0))
+    n_closed_a = int(details[
+        (details["category_flag"] == "closed_by_doc_status")
+        & (details["doc_status"] == "A")
+    ].shape[0])
+    n_closed_b = int(details[
+        (details["category_flag"] == "closed_by_doc_status")
+        & (details["doc_status"] == "B")
+    ].shape[0])
+    n_aband = int(counts.get("abandoned", 0))
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(
+        "🆕 Новое",
+        f"{n_new:,}".replace(",", " "),
+        help="Замечания, которые мы ещё не взяли в работу.",
+    )
+    c2.metric(
+        "🛠 В работе",
+        f"{n_work:,}".replace(",", " "),
+        help="Замечания, взятые в работу.",
+    )
+    c3.metric(
+        "🟪 Не принято",
+        f"{n_rej:,}".replace(",", " "),
+        help="Заказчик отклонил наш ответ.",
+    )
+    c4.metric(
+        "🔵 Ждут заказчика",
+        f"{n_wait:,}".replace(",", " "),
+        help="Мы ответили, заказчик ещё не рассмотрел.",
+    )
+    c5.metric(
+        "🔴 Хроника",
+        f"{n_chronic:,}".replace(",", " "),
+        help="Заказчик не рассматривает >90 р.д.",
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(
+        "🟢 Учтено — A",
+        f"{n_closed_a:,}".replace(",", " "),
+        help="Лист утверждён, замечание не закрыто формально.",
+    )
+    c2.metric(
+        "🟡 Учтено — B",
+        f"{n_closed_b:,}".replace(",", " "),
+        help="Лист к сдаче, замечание не закрыто.",
+    )
+    c3.metric(
+        "🟡 Заброшено",
+        f"{n_aband:,}".replace(",", " "),
+        help=">90 календарных дней без движения.",
+    )
+    c4.metric(
+        "🟣 К обсуждению",
+        f"{n_disc:,}".replace(",", " "),
+        help="Спорные замечания.",
+    )
+    c5.metric(
+        "📊 Всего замечаний",
+        f"{len(details):,}".replace(",", " "),
+        help="Все замечания по комплекту.",
+    )
+
+    # ---- Разбивка по категориям (стек-бар) ----
+    st.markdown("##### 📊 Разбивка по категориям")
+
+    cat_data = pd.DataFrame([
+        {"Категория": "Новое", "Количество": n_new},
+        {"Категория": "В работе", "Количество": n_work},
+        {"Категория": "Не принято", "Количество": n_rej},
+        {"Категория": "К обсуждению", "Количество": n_disc},
+        {"Категория": "Ждут заказчика", "Количество": n_wait},
+        {"Категория": "Хроника", "Количество": n_chronic},
+        {"Категория": "Учтено A/B",
+         "Количество": n_closed_a + n_closed_b},
+        {"Категория": "Заброшено", "Количество": n_aband},
+    ])
+    cat_data = cat_data[cat_data["Количество"] > 0]
+
+    color_map = {
+        "Новое":         "#64B5F6",
+        "В работе":      "#FFD54F",
+        "Не принято":    "#E57373",
+        "К обсуждению":  "#CE93D8",
+        "Ждут заказчика":"#81D4FA",
+        "Хроника":       "#7F0000",
+        "Учтено A/B":    "#4CAF50",
+        "Заброшено":     "#BDBDBD",
+    }
+
+    fig = px.bar(
+        cat_data, x="Количество", y="Категория", orientation="h",
+        text="Количество",
+        color="Категория",
+        color_discrete_map=color_map,
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        height=max(300, 40 * len(cat_data)),
+        showlegend=False,
+        yaxis_title="",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    download_plotly(
+        fig, f"Комплект_{sel_complex}_категории",
+        f"cd_cat_{sel_complex}",
+    )
+
+    # ---- Таблица замечаний ----
+    st.markdown(f"##### 📋 Замечания ({len(details):,})".replace(",", " "))
+
+    view = details[[
+        "id", "category_flag", "discipline", "sheet", "sheet_name",
+        "comment", "status", "author", "created",
+    ]].copy().rename(columns={
+        "id": "ID",
+        "category_flag": "Категория (флаг)",
+        "discipline": "Дисциплина",
+        "sheet": "Лист",
+        "sheet_name": "Название листа",
+        "comment": "Замечание",
+        "status": "Статус",
+        "author": "Автор",
+        "created": "Создано",
+    })
+
+    st.dataframe(
+        view.head(500), use_container_width=True, hide_index=True,
+        height=500,
+        column_config={
+            "Замечание": st.column_config.TextColumn(width="large"),
+            "Название листа": st.column_config.TextColumn(width="large"),
+        },
+    )
+    if len(view) > 500:
+        st.caption(f"Показаны первые 500 из {len(view):,}."
                    .replace(",", " "))
 
+    # ---- Экспорт ----
+    with st.expander("📥 Выгрузить замечания комплекта в Excel",
+                     expanded=False):
+        export = view.copy()
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            export.to_excel(writer, index=False,
+                            sheet_name="Замечания")
+
+            ws = writer.sheets["Замечания"]
+            ws.freeze_panes = "A2"
+
+            # Автофильтр
+            max_col_letter = _excel_col_letter(len(export.columns))
+            ws.auto_filter.ref = (
+                f"A1:{max_col_letter}{len(export) + 1}"
+            )
+
+            # Автоширина
+            for col_idx, col_name in enumerate(export.columns, start=1):
+                col_letter = _excel_col_letter(col_idx)
+                max_len = max(
+                    len(str(col_name)),
+                    export[col_name].astype(str).str.len().max()
+                    if len(export) else 0,
+                )
+                ws.column_dimensions[col_letter].width = min(
+                    max_len + 2, 60)
+
+        buf.seek(0)
+
+        safe_cx = sel_complex.replace("/", "_").replace("\\", "_")
+        st.download_button(
+            "⬇️ Скачать XLSX",
+            data=buf.getvalue(),
+            file_name=f"Комплект_{safe_cx}_{datetime.now():%Y%m%d}.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            use_container_width=True,
+            key=f"cd_dl_{safe_cx}",
+        )
+        st.caption(f"В выгрузке: **{len(export):,}** замечаний."
+                   .replace(",", " "))
 
 # ---------------------------------------------------------------------------
 #  Точка входа
@@ -636,3 +1152,8 @@ def render():
 
     # --- Экспорт ---
     _render_export(df_filtered)
+
+    st.divider()
+
+    # --- Drill-down по комплекту ---
+    _render_drilldown(df)  # передаём полный df, не отфильтрованный

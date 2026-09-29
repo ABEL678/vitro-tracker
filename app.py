@@ -4,8 +4,8 @@
 
 Фиксированный хедер с логотипом АТП ТЛП + имя пользователя справа.
 Фиксированный футер с именем пользователя и подписью.
-13 вкладок: Дашборд, Обзор, Комплекты, Категории, Сроки, Отстающие,
-Авторы, Поиск, Динамика, Ревизии, Экспорт, Логи, Управление.
+14 вкладок: Дашборд, Обзор, Комплекты, Листы, Категории, Сроки,
+Авторы, Поиск, Динамика, Ревизии, Прогноз, Экспорт, Логи, Управление.
 Запуск: streamlit run app.py
 """
 
@@ -21,7 +21,7 @@ import streamlit as st
 
 from vitro.sqlite_db import init_db
 from vitro.ui import (
-    dashboard, overview, complexes, categories, deadlines, lagging,
+    dashboard, overview, complexes, sheets, categories, deadlines,
     authors, search, dynamics, revisions, forecast, export, logs, admin,
 )
 
@@ -279,28 +279,28 @@ except AttributeError:
 #  Вкладки (14 штук)
 # ---------------------------------------------------------------------------
 tabs = st.tabs([
-    "📊 Дашборд РП",
-    "📈 Обзор",
-    "🏗 Комплекты",
-    "🏷 Категории",
-    "⏰ Сроки",
-    "⚠️ Отстающие",
-    "👤 Авторы",
-    "🔍 Поиск",
-    "📈 Динамика",
-    "🔁 Ревизии",
-    "🔮 Прогноз",
-    "📄 Экспорт",
-    "📜 Логи",
-    "⚙️ Управление",
+    "📊 Дашборд РП",     # 0
+    "📈 Обзор",          # 1
+    "🏗 Комплекты",      # 2
+    "📄 Листы",          # 3
+    "🏷 Категории",      # 4
+    "⏰ Сроки",          # 5
+    "👤 Авторы",         # 6
+    "🔍 Поиск",          # 7
+    "📈 Динамика",       # 8
+    "🔁 Ревизии",        # 9
+    "🔮 Прогноз",        # 10
+    "📄 Экспорт",        # 11
+    "📜 Логи",           # 12
+    "⚙️ Управление",     # 13
 ])
 
 with tabs[0]:  dashboard.render()
 with tabs[1]:  overview.render()
 with tabs[2]:  complexes.render()
-with tabs[3]:  categories.render()
-with tabs[4]:  deadlines.render()
-with tabs[5]:  lagging.render()
+with tabs[3]:  sheets.render()
+with tabs[4]:  categories.render()
+with tabs[5]:  deadlines.render()
 with tabs[6]:  authors.render()
 with tabs[7]:  search.render()
 with tabs[8]:  dynamics.render()
