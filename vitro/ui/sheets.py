@@ -591,7 +591,8 @@ def _render_blockers(df: pd.DataFrame):
         download_plotly(fig, "Листы_блокеры_комплекты", "sh_block_cx")
 
     # ---- Таблица ----
-    st.markdown(f"##### 📋 Список листов-блокеров ({len(blocked)})")
+    st.markdown(f"##### 📋 Список листов-блокеров ({len(blocked):,})"
+                .replace(",", " "))
 
     view = blocked[[
         "leaf", "complex", "discipline", "name",
@@ -600,25 +601,95 @@ def _render_blockers(df: pd.DataFrame):
         "leaf": "Лист",
         "complex": "Комплект",
         "discipline": "Дисциплина",
-        "name": "Название",
+        "name": "Название листа",
         "status_days": "Дней в C",
         "active_total": "Активных замечаний",
-        "ours_overdue": "🔴 Просрочек АТП ТЛП",
+        "ours_overdue": "Просрочек АТП ТЛП",
     })
 
     st.dataframe(
         view.head(500), use_container_width=True, hide_index=True,
         height=500,
         column_config={
-            "Название": st.column_config.TextColumn(width="large"),
+            "Название листа": st.column_config.TextColumn(width="large"),
             "Дней в C": st.column_config.NumberColumn(format="%d"),
             "Активных замечаний": st.column_config.NumberColumn(format="%d"),
-            "🔴 Просрочек АТП ТЛП": st.column_config.NumberColumn(format="%d"),
+            "Просрочек АТП ТЛП": st.column_config.NumberColumn(format="%d"),
         },
     )
     if len(view) > 500:
         st.caption(f"Показаны первые 500 из {len(view):,}."
                    .replace(",", " "))
+
+    # =====================================================================
+    #  Выгрузка в Excel
+    # =====================================================================
+    with st.expander("📥 Выгрузить список листов-блокеров в Excel",
+                     expanded=False):
+        export = view.copy()
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            export.to_excel(writer, index=False,
+                            sheet_name="Листы-блокеры")
+
+            ws = writer.sheets["Листы-блокеры"]
+
+            # Фиксация шапки
+            ws.freeze_panes = "A2"
+
+            # Автофильтр
+            max_col_letter = _excel_col_letter(len(export.columns))
+            ws.auto_filter.ref = (
+                f"A1:{max_col_letter}{len(export) + 1}"
+            )
+
+            # Автоширина
+            for col_idx, col_name in enumerate(export.columns, start=1):
+                col_letter = _excel_col_letter(col_idx)
+                max_len = max(
+                    len(str(col_name)),
+                    export[col_name].astype(str).str.len().max()
+                    if len(export) else 0,
+                )
+                ws.column_dimensions[col_letter].width = min(
+                    max_len + 2, 60)
+
+            # Жирная шапка с заливкой
+            from openpyxl.styles import Font, PatternFill, Alignment
+            bold = Font(bold=True)
+            header_fill = PatternFill(
+                start_color="FFE0B2", end_color="FFE0B2",
+                fill_type="solid",
+            )
+            for col_idx in range(1, len(export.columns) + 1):
+                cell = ws.cell(row=1, column=col_idx)
+                cell.font = bold
+                cell.fill = header_fill
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center",
+                    wrap_text=True,
+                )
+
+            # Высота шапки — 2 строки
+            ws.row_dimensions[1].height = 30
+
+        buf.seek(0)
+
+        st.download_button(
+            "⬇️ Скачать XLSX",
+            data=buf.getvalue(),
+            file_name=f"Листы_блокеры_{datetime.now():%Y%m%d}.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            use_container_width=True,
+            key="sh_blockers_dl",
+        )
+        st.caption(
+            f"В выгрузке: **{len(export):,}** листов-блокеров. "
+            f"Шапка зафиксирована, автофильтр включён."
+            .replace(",", " ")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -867,44 +938,135 @@ def _render_drilldown(df_sheets: pd.DataFrame):
             _render_complex_details(sel, sub)
 
     # =====================================================================
-    #  По листу (с фильтром по комплекту)
+    #  По листу (с каскадными фильтрами: дисциплина → раздел → комплект → лист)
     # =====================================================================
     with tab_leaf:
-        # Сначала фильтр по комплекту — чтобы не искать в 11 000 листов
-        complexes_leaf = sorted(
-            df_sheets["complex"].dropna().unique().tolist()
+        # ---- Уровень 1: Дисциплина ----
+        disciplines_leaf = sorted(
+            df_sheets["discipline"].dropna().unique().tolist()
         )
 
-        c1, c2 = st.columns([2, 3])
+        c1, c2, c3 = st.columns(3)
+
         with c1:
+            sel_disc_leaf = st.multiselect(
+                "Дисциплина",
+                options=disciplines_leaf,
+                format_func=lambda c: f"{c} — {discipline_name(c)}",
+                placeholder="Все дисциплины",
+                key="sh_leaf_disc",
+            )
+
+        # ---- Уровень 2: Раздел (зависит от дисциплины) ----
+        if sel_disc_leaf:
+            pool_after_disc = df_sheets[
+                df_sheets["discipline"].isin(sel_disc_leaf)
+            ]
+        else:
+            pool_after_disc = df_sheets
+
+        sections_leaf = sorted([
+            s for s in pool_after_disc["section"].dropna().unique().tolist()
+            if s
+        ])
+
+        with c2:
+            if sections_leaf:
+                sel_section_leaf = st.multiselect(
+                    "Раздел",
+                    options=sections_leaf,
+                    placeholder="Все разделы",
+                    key="sh_leaf_section",
+                )
+            else:
+                sel_section_leaf = []
+                st.multiselect(
+                    "Раздел",
+                    options=[],
+                    placeholder="Не применимы",
+                    disabled=True,
+                    key="sh_leaf_section_empty",
+                )
+
+        # ---- Уровень 3: Комплект (зависит от дисциплины/раздела) ----
+        pool_after_sect = pool_after_disc
+        if sel_section_leaf:
+            pool_after_sect = pool_after_sect[
+                pool_after_sect["section"].isin(sel_section_leaf)
+            ]
+
+        complexes_leaf = sorted(
+            pool_after_sect["complex"].dropna().unique().tolist()
+        )
+
+        with c3:
             sel_cx_for_leaf = st.selectbox(
                 "Комплект",
                 options=[""] + complexes_leaf,
                 format_func=lambda x: x or "— выберите комплект —",
-                key="sh_drill_leaf_cx",
+                key="sh_leaf_cx",
                 placeholder="Начните вводить шифр...",
             )
 
         if not sel_cx_for_leaf:
             st.info(
-                "💡 Выберите комплект — потом появится список листов."
+                "💡 Выберите комплект — потом появится список листов. "
+                "Можно сузить список через дисциплину и раздел."
             )
             return
 
-        # Листы только выбранного комплекта
+        # ---- Уровень 4: Статус листа (дополнительный фильтр) ----
         leaves_pool = df_sheets[
             df_sheets["complex"] == sel_cx_for_leaf
-        ]
-        leaves = sorted(leaves_pool["leaf"].dropna().unique().tolist())
+            ]
 
-        with c2:
+        # Список статусов, которые есть в этом комплекте
+        available_statuses = sorted(
+            leaves_pool["status_group"].dropna().unique().tolist()
+        )
+        # Сортируем по порядку: A, B, C, И, Прочие
+        status_order = {"A": 0, "B": 1, "C": 2, "И": 3, "Прочие": 4}
+        available_statuses = sorted(
+            available_statuses,
+            key=lambda x: status_order.get(x, 99),
+        )
+
+        c_status, c_search = st.columns([2, 2])
+        with c_status:
+            sel_status_leaf = st.multiselect(
+                "Статус листа",
+                options=available_statuses,
+                default=available_statuses,  # по умолчанию все
+                placeholder="Все статусы",
+                key="sh_leaf_status",
+                help="Фильтр по группе статуса: A / B / C / И / Прочие.",
+            )
+
+        # Применяем фильтр по статусу
+        if sel_status_leaf:
+            leaves_pool = leaves_pool[
+                leaves_pool["status_group"].isin(sel_status_leaf)
+            ]
+
+        leaves = sorted(
+            leaves_pool["leaf"].dropna().unique().tolist()
+        )
+
+        with c_search:
             sel_leaf = st.selectbox(
                 "Лист",
                 options=[""] + leaves,
                 format_func=lambda x: x or "— выберите лист —",
-                key="sh_drill_leaf",
+                key="sh_leaf_select",
                 placeholder="Начните вводить...",
             )
+
+        if not leaves:
+            st.warning(
+                "⚠️ По выбранным фильтрам листов нет. "
+                "Попробуйте расширить статус или выбрать другой комплект."
+            )
+            return
 
         if sel_leaf:
             _render_leaf_details(sel_leaf, df_sheets)
