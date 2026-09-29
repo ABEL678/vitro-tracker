@@ -249,7 +249,7 @@ def _render_kpi(df: pd.DataFrame):
     def count_by(*flags):
         return df[df["category_flag"].isin(flags)].shape[0]
 
-    # Наша сторона
+    # АТП ТЛП — наша сторона
     n_new = count_by("new_overdue", "new_in_progress")
     n_new_over = count_by("new_overdue")
     n_work = count_by("in_work_overdue", "in_work_in_progress")
@@ -259,51 +259,81 @@ def _render_kpi(df: pd.DataFrame):
     n_disc = count_by("discussion_overdue", "discussion_in_progress")
     n_disc_over = count_by("discussion_overdue")
 
+    # Итого АТП ТЛП
+    ours_total = n_new + n_work + n_rej + n_disc
+    ours_overdue = n_new_over + n_work_over + n_rej_over + n_disc_over
+
     # Заказчик + архив
     n_wait = count_by("waiting_customer", "waiting_customer_overdue",
                       "waiting_customer_ontime")
     n_chronic = count_by("waiting_customer_chronic")
     n_closed = count_by("closed_by_doc_status")
+    n_closed_a = df[(df["category_flag"] == "closed_by_doc_status")
+                    & (df["doc_status"] == "A")].shape[0]
+    n_closed_b = df[(df["category_flag"] == "closed_by_doc_status")
+                    & (df["doc_status"] == "B")].shape[0]
     n_aband = count_by("abandoned")
 
-    # =================================================================
-    #  РЯД 1: НАША СТОРОНА
-    # =================================================================
-    st.markdown("##### 🔴 Наша сторона — ждут нашего ответа")
+    # Итого заказчик = ждут + хронические (без учтённых A/B — они уже наши)
+    customer_total = n_wait + n_chronic
 
-    c1, c2, c3, c4 = st.columns(4)
+    # =================================================================
+    #  РЯД 1: АТП ТЛП
+    # =================================================================
+    st.markdown("##### 🔵 АТП ТЛП — ждут ответа проектировщика")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
         "🆕 Новое",
         f"{n_new:,}".replace(",", " "),
-        delta=f"🔴 {n_new_over:,} просроч.".replace(",", " ")
+        delta=f"🔴 {n_new_over:,}".replace(",", " ")
               if n_new_over > 0 else None,
         delta_color="inverse",
-        help="Заказчик выдал, мы не взяли в работу",
+        help="Замечание выдано заказчиком, но АТП ТЛП ещё не взял его "
+             "в работу. Красным — просрочено (>10 р.д.).",
     )
     c2.metric(
-        "🛠 Принято в работу",
+        "🛠 В работе",
         f"{n_work:,}".replace(",", " "),
-        delta=f"🔴 {n_work_over:,} просроч.".replace(",", " ")
+        delta=f"🔴 {n_work_over:,}".replace(",", " ")
               if n_work_over > 0 else None,
         delta_color="inverse",
-        help="Взяли, но не ответили",
+        help="Замечание взято в работу АТП ТЛП, но ответ пока не дан. "
+             "Красным — просрочено (>10 р.д.).",
     )
     c3.metric(
         "🟪 Не принято",
         f"{n_rej:,}".replace(",", " "),
-        delta=f"🔴 {n_rej_over:,} просроч.".replace(",", " ")
+        delta=f"🔴 {n_rej_over:,}".replace(",", " ")
               if n_rej_over > 0 else None,
         delta_color="inverse",
-        help="Заказчик отклонил, дорабатываем",
+        help="Заказчик отклонил ответ АТП ТЛП и вернул на доработку. "
+             "Красным — просрочено (>10 р.д.).",
     )
     c4.metric(
         "🟣 К обсуждению",
         f"{n_disc:,}".replace(",", " "),
-        delta=f"🔴 {n_disc_over:,} просроч.".replace(",", " ")
+        delta=f"🔴 {n_disc_over:,}".replace(",", " ")
               if n_disc_over > 0 else None,
         delta_color="inverse",
-        help="Спорное, обсуждаем",
+        help="Спорное замечание, требует совещания сторон. "
+             "Красным — просрочено (>10 р.д.).",
+    )
+    c5.metric(
+        "📊 Итого АТП ТЛП",
+        f"{ours_total:,}".replace(",", " "),
+        help="Все замечания, ожидающие ответа от АТП ТЛП. "
+             "Сумма 4 категорий: Новое + В работе + Не принято + "
+             "К обсуждению.",
+    )
+    c6.metric(
+        "🔴 Из них просрочено",
+        f"{ours_overdue:,}".replace(",", " "),
+        delta="требует внимания" if ours_overdue > 0 else None,
+        delta_color="inverse",
+        help="Замечания АТП ТЛП, у которых срок ответа (10 р.д.) "
+             "уже истёк.",
     )
 
     # =================================================================
@@ -311,29 +341,48 @@ def _render_kpi(df: pd.DataFrame):
     # =================================================================
     st.markdown("##### 🔵 На стороне заказчика + архив")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
         "🔵 Ждут заказчика",
         f"{n_wait:,}".replace(",", " "),
-        help="Выполнено < 90 р.д., лист не A/B",
+        help="АТП ТЛП дал ответ (статус «Выполнено»), но заказчик "
+             "ещё не рассмотрел. Срок ожидания — менее 90 р.д., "
+             "лист ещё не получил статус A или B.",
     )
     c2.metric(
         "🔴 Хронические",
         f"{n_chronic:,}".replace(",", " "),
         delta="эскалация" if n_chronic > 0 else None,
         delta_color="inverse",
-        help="> 90 р.д. ожидания, лист не A/B",
+        help="Заказчик не рассматривает ответ более 90 р.д. "
+             "Требуется эскалация — письмо руководству заказчика.",
     )
     c3.metric(
-        "🟢 Учтено (лист A/B)",
-        f"{n_closed:,}".replace(",", " "),
-        help="Лист утверждён, надо дожать на «Закрыто»",
+        "🟢 Учтено — A",
+        f"{n_closed_a:,}".replace(",", " "),
+        help="Лист утверждён заказчиком (статус A). Замечания "
+             "фактически сняты, осталось формально закрыть в Витрокад.",
     )
     c4.metric(
+        "🟡 Учтено — B",
+        f"{n_closed_b:,}".replace(",", " "),
+        help="Лист готов к сдаче (статус B). Формально замечания "
+             "НЕ сняты, заказчик может вернуть лист на доработку. "
+             "Требует внимания.",
+    )
+    c5.metric(
         "🟡 Заброшено",
         f"{n_aband:,}".replace(",", " "),
-        help="> 90 дней без движения",
+        help="Замечания без движения более 90 календарных дней. "
+             "Кандидаты на снятие или пересогласование.",
+    )
+    c6.metric(
+        "📊 Итого заказчик",
+        f"{customer_total:,}".replace(",", " "),
+        help="Замечания, ожидающие действия от заказчика: "
+             "Ждут заказчика + Хронические. Учтённые (A/B) сюда "
+             "не входят — они уже отработаны АТП ТЛП.",
     )
 
 
