@@ -4,10 +4,10 @@
 
 Стиль: топ проблем + автокомментарии. Одна страница — вся картина.
 Что внутри:
-  - Светофор: 8 KPI в две строки.
+  - Светофор: масштаб + АТП ТЛП + заказчик/архив (3 ряда KPI).
   - Топ-5 проблем по каждой категории.
   - Таблица «Где болит» по дисциплинам с вердиктом.
-  - Динамика 12 месяцев (выдача/закрытие/сальдо).
+  - Динамика 12 месяцев (выдача/ответы/сальдо).
   - Блок «Что делать сегодня» — автогенерируемые действия.
   - Экспорт в PDF с графиками.
 """
@@ -51,7 +51,7 @@ def _load_full_state() -> dict:
         def count_by(*flags):
             return cats_df[cats_df["category_flag"].isin(flags)].shape[0]
 
-        # Наша сторона (4 категории)
+        # АТП ТЛП (4 категории)
         result["new_total"] = count_by("new_overdue", "new_in_progress")
         result["new_overdue"] = count_by("new_overdue")
 
@@ -67,12 +67,17 @@ def _load_full_state() -> dict:
                                                 "discussion_in_progress")
         result["discussion_overdue"] = count_by("discussion_overdue")
 
-        # Наша сторона — всего
+        # АТП ТЛП — всего и просрочено
         ours_total = (result["new_total"] +
                       result["in_work_total"] +
                       result["rejected_total"] +
                       result["discussion_total"])
+        ours_overdue = (result["new_overdue"] +
+                        result["in_work_overdue"] +
+                        result["rejected_overdue"] +
+                        result["discussion_overdue"])
         result["ours_total"] = ours_total
+        result["ours_overdue"] = ours_overdue
 
         # Заказчик
         result["waiting_customer"] = count_by(
@@ -81,8 +86,18 @@ def _load_full_state() -> dict:
         result["chronic"] = count_by("waiting_customer_chronic")
         result["waiting_total"] = result["waiting_customer"] + result["chronic"]
 
-        # Учтённые и архив
+        # Учтённые (A/B) — раздельно
         result["closed_by_doc"] = count_by("closed_by_doc_status")
+        result["closed_by_doc_a"] = cats_df[
+            (cats_df["category_flag"] == "closed_by_doc_status")
+            & (cats_df["doc_status"] == "A")
+        ].shape[0]
+        result["closed_by_doc_b"] = cats_df[
+            (cats_df["category_flag"] == "closed_by_doc_status")
+            & (cats_df["doc_status"] == "B")
+        ].shape[0]
+
+        # Архив
         result["abandoned"] = count_by("abandoned")
 
         # Активные (5 статусов = наши + ждут заказчика + хроника + A/B)
@@ -94,9 +109,10 @@ def _load_full_state() -> dict:
         for k in ["new_total", "new_overdue", "in_work_total",
                    "in_work_overdue", "rejected_total", "rejected_overdue",
                    "discussion_total", "discussion_overdue",
-                   "ours_total", "waiting_customer", "chronic",
-                   "waiting_total", "closed_by_doc", "abandoned",
-                   "active_total"]:
+                   "ours_total", "ours_overdue",
+                   "waiting_customer", "chronic", "waiting_total",
+                   "closed_by_doc", "closed_by_doc_a", "closed_by_doc_b",
+                   "abandoned", "active_total"]:
             result[k] = 0
 
     # =====================================================================
@@ -118,7 +134,6 @@ def _load_full_state() -> dict:
     result["total_all"] = base["total"] or 0
     result["closed"] = base["closed"] or 0
     result["annulled"] = base["annulled"] or 0
-    # Закрыто для справки = Закрыто + Аннулировано
     result["closed_for_ref"] = result["closed"] + result["annulled"]
 
     # =====================================================================
@@ -162,7 +177,7 @@ def _load_full_state() -> dict:
         result["by_disc"] = {}
 
     # =====================================================================
-    #  4. Топ-5 комплектов по просрочкам (наша сторона)
+    #  4. Топ-5 комплектов по просрочкам (АТП ТЛП)
     # =====================================================================
     if not cats_df.empty:
         overdue = cats_df[cats_df["category_flag"].isin([
@@ -230,10 +245,10 @@ def _load_full_state() -> dict:
 
 
 # ---------------------------------------------------------------------------
-#  Светофор — 8 KPI в две строки
+#  Светофор — 3 ряда KPI
 # ---------------------------------------------------------------------------
 def _render_traffic_light(data: dict):
-    """Три ряда KPI: масштаб, наша сторона, заказчик."""
+    """Три ряда KPI: масштаб, АТП ТЛП, заказчик."""
 
     # =================================================================
     #  Ряд 1 — Масштаб проекта
@@ -241,96 +256,131 @@ def _render_traffic_light(data: dict):
     st.markdown("##### 📦 Масштаб проекта")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Всего замечаний",
-              f"{data['total_all']:,}".replace(",", " "))
+              f"{data['total_all']:,}".replace(",", " "),
+              help="Все замечания в базе, включая закрытые и "
+                   "аннулированные.")
     c2.metric("Закрыто",
-              f"{data['closed']:,}".replace(",", " "))
+              f"{data['closed']:,}".replace(",", " "),
+              help="Замечания со статусом «Закрыто» — работа "
+                   "полностью завершена.")
     c3.metric("Активных",
               f"{data['active_total']:,}".replace(",", " "),
-              help="Наши + ждут заказчика + хроника + учтено (A/B)")
+              help="АТП ТЛП + ждут заказчика + хронические + "
+                   "учтено (A/B). Без закрытых и аннулированных.")
     c4.metric("Аннулировано",
-              f"{data['annulled']:,}".replace(",", " "))
+              f"{data['annulled']:,}".replace(",", " "),
+              help="Замечания, снятые заказчиком или отменённые.")
     pct_closed = (
         round(data["closed"] / data["total_all"] * 100, 1)
         if data["total_all"] else 0
     )
-    c5.metric("% закрыто", f"{pct_closed}%")
+    c5.metric("% закрыто", f"{pct_closed}%",
+              help="Доля закрытых от всех замечаний в базе.")
 
     # =================================================================
-    #  Ряд 2 — Наша сторона
+    #  Ряд 2 — АТП ТЛП
     # =================================================================
-    st.markdown("##### 🔴 Наша сторона — ждут нашего ответа")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    st.markdown("##### 🔵 АТП ТЛП — ждут ответа проектировщика")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
         "🆕 Новое",
         f"{data['new_total']:,}".replace(",", " "),
-        delta=f"🔴 {data['new_overdue']:,} просроч.".replace(",", " ")
+        delta=f"🔴 {data['new_overdue']:,}".replace(",", " ")
               if data['new_overdue'] > 0 else None,
         delta_color="inverse",
-        help="Заказчик выдал, мы не взяли в работу",
+        help="Замечание выдано заказчиком, но АТП ТЛП ещё не взял "
+             "его в работу. Красным — просрочено (>10 р.д.).",
     )
     c2.metric(
         "🛠 В работе",
         f"{data['in_work_total']:,}".replace(",", " "),
-        delta=f"🔴 {data['in_work_overdue']:,} просроч.".replace(",", " ")
+        delta=f"🔴 {data['in_work_overdue']:,}".replace(",", " ")
               if data['in_work_overdue'] > 0 else None,
         delta_color="inverse",
-        help="Взяли, но не ответили",
+        help="Замечание взято в работу АТП ТЛП, но ответ пока не дан. "
+             "Красным — просрочено (>10 р.д.).",
     )
     c3.metric(
         "🟪 Не принято",
         f"{data['rejected_total']:,}".replace(",", " "),
-        delta=f"🔴 {data['rejected_overdue']:,} просроч.".replace(",", " ")
+        delta=f"🔴 {data['rejected_overdue']:,}".replace(",", " ")
               if data['rejected_overdue'] > 0 else None,
         delta_color="inverse",
-        help="Заказчик отклонил наш ответ",
+        help="Заказчик отклонил ответ АТП ТЛП и вернул на доработку. "
+             "Красным — просрочено (>10 р.д.).",
     )
     c4.metric(
         "🟣 К обсуждению",
         f"{data['discussion_total']:,}".replace(",", " "),
-        delta=f"🔴 {data['discussion_overdue']:,} просроч.".replace(",", " ")
+        delta=f"🔴 {data['discussion_overdue']:,}".replace(",", " ")
               if data['discussion_overdue'] > 0 else None,
         delta_color="inverse",
-        help="Спорное, обсуждаем",
+        help="Спорное замечание, требует совещания сторон. "
+             "Красным — просрочено (>10 р.д.).",
     )
     c5.metric(
-        "Итого наших",
+        "📊 Итого АТП ТЛП",
         f"{data['ours_total']:,}".replace(",", " "),
-        help="Сумма 4 категорий",
+        help="Все замечания, ожидающие ответа от АТП ТЛП. "
+             "Сумма 4 категорий: Новое + В работе + Не принято + "
+             "К обсуждению.",
+    )
+    c6.metric(
+        "🔴 Из них просрочено",
+        f"{data['ours_overdue']:,}".replace(",", " "),
+        delta="требует внимания" if data['ours_overdue'] > 0 else None,
+        delta_color="inverse",
+        help="Замечания АТП ТЛП, у которых срок ответа (10 р.д.) "
+             "уже истёк.",
     )
 
     # =================================================================
     #  Ряд 3 — Заказчик + архив
     # =================================================================
     st.markdown("##### 🔵 На стороне заказчика + архив")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     c1.metric(
         "🔵 Ждут заказчика",
         f"{data['waiting_customer']:,}".replace(",", " "),
-        help="Выполнено < 90 р.д., лист ещё не A/B",
+        help="АТП ТЛП дал ответ (статус «Выполнено»), но заказчик "
+             "ещё не рассмотрел. Срок ожидания — менее 90 р.д., "
+             "лист ещё не получил статус A или B.",
     )
     c2.metric(
         "🔴 Хронические",
         f"{data['chronic']:,}".replace(",", " "),
         delta="эскалация" if data['chronic'] > 0 else None,
         delta_color="inverse",
-        help="Выполнено > 90 р.д., лист ещё не A/B",
+        help="Заказчик не рассматривает ответ более 90 р.д. "
+             "Требуется эскалация — письмо руководству заказчика.",
     )
     c3.metric(
-        "🟢 Учтено (A/B)",
-        f"{data['closed_by_doc']:,}".replace(",", " "),
-        help="Лист A/B, но замечание не закрыто формально",
+        "🟢 Учтено — A",
+        f"{data['closed_by_doc_a']:,}".replace(",", " "),
+        help="Лист утверждён заказчиком (статус A). Замечания "
+             "фактически сняты, осталось формально закрыть в Витрокад.",
     )
     c4.metric(
-        "🟡 Заброшено",
-        f"{data['abandoned']:,}".replace(",", " "),
-        help="> 90 дней без движения",
+        "🟡 Учтено — B",
+        f"{data['closed_by_doc_b']:,}".replace(",", " "),
+        help="Лист готов к сдаче (статус B). Формально замечания "
+             "НЕ сняты, заказчик может вернуть лист на доработку. "
+             "Требует внимания.",
     )
     c5.metric(
-        "Итого заказчика",
+        "🟡 Заброшено",
+        f"{data['abandoned']:,}".replace(",", " "),
+        help="Замечания без движения более 90 календарных дней. "
+             "Кандидаты на снятие или пересогласование.",
+    )
+    c6.metric(
+        "📊 Итого заказчик",
         f"{data['waiting_total']:,}".replace(",", " "),
-        help="Ждут заказчика + хронические",
+        help="Замечания, ожидающие действия от заказчика: "
+             "Ждут заказчика + Хронические. Учтённые (A/B) сюда "
+             "не входят — они уже отработаны АТП ТЛП.",
     )
 
 
@@ -411,7 +461,7 @@ def _render_discipline_table(data: dict):
         rows.append({
             "Дисциплина": disc,
             "Наименование": discipline_name(disc),
-            "🔴 Наша сторона": ours,
+            "🔴 АТП ТЛП": ours,
             "🔵 Ждут заказчика": waiting,
             "🔴 Хронические": chronic,
             "🟢 Учтено (A/B)": closed_doc,
@@ -420,17 +470,19 @@ def _render_discipline_table(data: dict):
         })
 
     df = pd.DataFrame(rows).sort_values(
-        ["🔴 Наша сторона", "🔴 Хронические"], ascending=False)
+        ["🔴 АТП ТЛП", "🔴 Хронические"], ascending=False)
 
     st.dataframe(
         df, use_container_width=True, hide_index=True, height=420,
         column_config={
-            "🔴 Наша сторона": st.column_config.NumberColumn(format="%d"),
+            "🔴 АТП ТЛП": st.column_config.NumberColumn(format="%d"),
             "🔵 Ждут заказчика": st.column_config.NumberColumn(format="%d"),
             "🔴 Хронические": st.column_config.NumberColumn(format="%d"),
             "🟢 Учтено (A/B)": st.column_config.NumberColumn(format="%d"),
         },
     )
+
+
 # ---------------------------------------------------------------------------
 #  Динамика 12 месяцев
 # ---------------------------------------------------------------------------
@@ -445,8 +497,8 @@ def _render_dynamics(data: dict):
 
     st.caption(
         "**Выдача** — новые замечания от заказчика (вход). "
-        "**Ответы** — наши ответы на ранее выданные (выход). "
-        "**Отставание** — насколько мы не успеваем за темпом выдачи."
+        "**Ответы** — ответы АТП ТЛП на ранее выданные (выход). "
+        "**Отставание** — насколько АТП ТЛП не успевает за темпом выдачи."
     )
 
     # =================================================================
@@ -461,14 +513,14 @@ def _render_dynamics(data: dict):
     ))
     fig.add_trace(go.Bar(
         x=monthly["ym"], y=monthly["Отвечено"],
-        name="Наши ответы",
+        name="Ответы АТП ТЛП",
         marker_color="#2E7D32",
         text=monthly["Отвечено"], textposition="outside",
     ))
 
     fig.update_layout(
         barmode="group",
-        title="Выдача vs Наши ответы (за месяц)",
+        title="Выдача vs Ответы АТП ТЛП (за месяц)",
         height=420, xaxis_tickangle=-45,
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom",
@@ -498,7 +550,8 @@ def _render_dynamics(data: dict):
     ))
     fig2.add_hline(y=0, line_dash="dash", line_color="#888")
     fig2.update_layout(
-        title="Отставание (Выдано − Отвечено). Красное — задолженность растёт",
+        title="Отставание (Выдано − Отвечено). "
+              "Красное — задолженность растёт",
         height=350, xaxis_tickangle=-45, showlegend=False,
     )
     st.plotly_chart(fig2, use_container_width=True)
@@ -532,7 +585,7 @@ def _render_dynamics(data: dict):
 
     st.caption(
         "**Как читать:** график 3 показывает, сколько замечаний накопилось "
-        "за период. Линия вверх = команда отстаёт от темпа выдачи."
+        "за период. Линия вверх = АТП ТЛП отстаёт от темпа выдачи."
     )
 
     # =================================================================
@@ -546,7 +599,7 @@ def _render_dynamics(data: dict):
 
         if avg_delta > 500:
             st.error(
-                f"🔴 **Команда отстаёт от темпа выдачи.** "
+                f"🔴 **АТП ТЛП отстаёт от темпа выдачи.** "
                 f"За последние 3 месяца в среднем **+{int(avg_delta):,}** "
                 f"незакрытых в месяц. Суммарно накопилось "
                 f"**+{int(total_delta):,}** за квартал."
@@ -554,7 +607,7 @@ def _render_dynamics(data: dict):
             )
         elif avg_delta < -500:
             st.success(
-                f"✅ **Команда разгребает задолженность.** "
+                f"✅ **АТП ТЛП разгребает задолженность.** "
                 f"В среднем **{int(avg_delta):,}** в месяц — закрываем "
                 f"больше, чем выдаём.".replace(",", " ")
             )
@@ -578,7 +631,8 @@ def _render_actions(data: dict):
     rejected_overdue = data.get("rejected_overdue", 0)
     waiting = data.get("waiting_customer", 0)
     chronic = data.get("chronic", 0)
-    closed_doc = data.get("closed_by_doc", 0)
+    closed_a = data.get("closed_by_doc_a", 0)
+    closed_b = data.get("closed_by_doc_b", 0)
     abandoned = data.get("abandoned", 0)
 
     actions = []
@@ -588,15 +642,16 @@ def _render_actions(data: dict):
             "priority": "🚨 СРОЧНО",
             "action": f"**{new_overdue:,} замечаний в «Новое» просрочено**"
                       .replace(",", " "),
-            "detail": "Мы их не взяли в работу. Назначить исполнителей.",
+            "detail": "АТП ТЛП не взял их в работу. Назначить "
+                      "исполнителей.",
         })
 
     if in_work_overdue > 0:
         actions.append({
             "priority": "🛠 УСКОРИТЬ",
-            "action": f"**{in_work_overdue:,} замечаний в «Принято в работу» "
-                      f"просрочено**".replace(",", " "),
-            "detail": "Мы работаем, но медленно. Ускорить ответы.",
+            "action": f"**{in_work_overdue:,} замечаний в «Принято "
+                      f"в работу» просрочено**".replace(",", " "),
+            "detail": "АТП ТЛП работает, но медленно. Ускорить ответы.",
         })
 
     if rejected_overdue > 0:
@@ -604,7 +659,7 @@ def _render_actions(data: dict):
             "priority": "🟪 РАЗОБРАТЬ",
             "action": f"**{rejected_overdue:,} отклонённых замечаний "
                       f"просрочено**".replace(",", " "),
-            "detail": "Заказчик не принял наши ответы. Доработать.",
+            "detail": "Заказчик не принял ответы АТП ТЛП. Доработать.",
         })
 
     if waiting > 0:
@@ -623,12 +678,23 @@ def _render_actions(data: dict):
             "detail": "Письмо руководству заказчика.",
         })
 
-    if closed_doc > 0:
+    if closed_a > 0:
         actions.append({
             "priority": "🟢 ЗАКРЫТЬ",
-            "action": f"**{closed_doc:,} фактически принято (лист A/B)**"
+            "action": f"**{closed_a:,} учтено по листу A**"
                       .replace(",", " "),
-            "detail": "Дожать заказчика на «Закрыто» в Витрокад.",
+            "detail": "Лист утверждён. Дожать заказчика на «Закрыто» "
+                      "в Витрокад.",
+        })
+
+    if closed_b > 0:
+        actions.append({
+            "priority": "🟡 ПРОВЕРИТЬ",
+            "action": f"**{closed_b:,} учтено по листу B**"
+                      .replace(",", " "),
+            "detail": "Лист готов к сдаче, но замечания формально "
+                      "не сняты. Уточнить у заказчика — не вернут ли "
+                      "на доработку.",
         })
 
     if abandoned > 100:
@@ -651,6 +717,7 @@ def _render_actions(data: dict):
             with col2:
                 st.markdown(a["action"])
                 st.caption(a["detail"])
+
 
 # ---------------------------------------------------------------------------
 #  Экспорт в PDF
@@ -687,7 +754,7 @@ def _build_dashboard_pdf(data: dict) -> bytes:
     Графики генерируются через kaleido и вставляются как PNG.
 
     Особенности вёрстки:
-      - Каждый график начинается с новой страницы (PageBreak) для читаемости.
+      - Каждый график начинается с новой страницы (PageBreak).
       - Увеличенный margin слева (220) — чтобы длинные шифры комплектов
         не обрезались на горизонтальных барах.
       - Без эмодзи в тексте — DejaVu Sans их не поддерживает.
@@ -706,21 +773,48 @@ def _build_dashboard_pdf(data: dict) -> bytes:
     # =================================================================
     #  1. Подготовка данных
     # =================================================================
-    totals = data["totals"]
-    total = totals["total"] or 0
-    closed = totals["closed"] or 0
-    annulled = totals["annulled"] or 0
-    pct = round((closed + annulled) / total * 100, 1) if total else 0
+    total_all = data["total_all"] or 0
+    closed = data["closed"] or 0
+    annulled = data["annulled"] or 0
+    active = data["active_total"] or 0
+    pct = round(closed / total_all * 100, 1) if total_all else 0
 
+    # KPI-строки для PDF (без эмодзи)
     kpi_rows = [
-        ("Всего замечаний", f"{total:,}".replace(",", " ")),
+        ("Масштаб проекта", ""),
+        ("Всего замечаний", f"{total_all:,}".replace(",", " ")),
         ("Закрыто", f"{closed:,}".replace(",", " ")),
-        ("% выполнения", f"{pct}%"),
+        ("Активных", f"{active:,}".replace(",", " ")),
+        ("Аннулировано", f"{annulled:,}".replace(",", " ")),
+        ("% закрыто", f"{pct}%"),
         ("", ""),
-        ("Ждут нашего ответа", f"{data['overdue_ours']:,}".replace(",", " ")),
-        ("Ждут заказчика", f"{data['waiting_customer']:,}".replace(",", " ")),
+        ("АТП ТЛП — ждут ответа", ""),
+        ("Новое", f"{data['new_total']:,}".replace(",", " ")),
+        ("  в т.ч. просрочено", f"{data['new_overdue']:,}".replace(",", " ")),
+        ("В работе", f"{data['in_work_total']:,}".replace(",", " ")),
+        ("  в т.ч. просрочено",
+         f"{data['in_work_overdue']:,}".replace(",", " ")),
+        ("Не принято", f"{data['rejected_total']:,}".replace(",", " ")),
+        ("  в т.ч. просрочено",
+         f"{data['rejected_overdue']:,}".replace(",", " ")),
+        ("К обсуждению", f"{data['discussion_total']:,}".replace(",", " ")),
+        ("  в т.ч. просрочено",
+         f"{data['discussion_overdue']:,}".replace(",", " ")),
+        ("Итого АТП ТЛП", f"{data['ours_total']:,}".replace(",", " ")),
+        ("  из них просрочено",
+         f"{data['ours_overdue']:,}".replace(",", " ")),
+        ("", ""),
+        ("На стороне заказчика + архив", ""),
+        ("Ждут заказчика",
+         f"{data['waiting_customer']:,}".replace(",", " ")),
+        ("Хронические", f"{data['chronic']:,}".replace(",", " ")),
+        ("Учтено - A (лист утверждён)",
+         f"{data['closed_by_doc_a']:,}".replace(",", " ")),
+        ("Учтено - B (лист к сдаче)",
+         f"{data['closed_by_doc_b']:,}".replace(",", " ")),
         ("Заброшено", f"{data['abandoned']:,}".replace(",", " ")),
-        ("В работе, в срок", f"{data['in_progress']:,}".replace(",", " ")),
+        ("Итого заказчик",
+         f"{data['waiting_total']:,}".replace(",", " ")),
     ]
 
     by_disc = data["by_disc"]
@@ -729,21 +823,23 @@ def _build_dashboard_pdf(data: dict) -> bytes:
         disc_rows.append({
             "Дисциплина": disc,
             "Наименование": discipline_name(disc),
-            "Ждут нас": s["overdue"],
+            "АТП ТЛП": s["ours"],
             "Ждут заказчика": s["waiting"],
+            "Хронические": s["chronic"],
+            "Учтено A/B": s["closed_doc"],
             "Всего": s["total"],
         })
     disc_df = pd.DataFrame(disc_rows).sort_values(
-        "Ждут нас", ascending=False) if disc_rows else pd.DataFrame()
+        "АТП ТЛП", ascending=False) if disc_rows else pd.DataFrame()
 
     # =================================================================
-    #  2. Генерация графиков как PNG (единый стиль)
+    #  2. Генерация графиков как PNG
     # =================================================================
     def _fig_to_png(fig, width: int = 1400, height: int = 600):
         """
         Конвертирует Plotly-фигуру в PNG с едиными настройками:
           - margin 220 слева — для длинных подписей;
-          - margin 100 справа/снизу — чтобы метки и пики не обрезались;
+          - margin 100 справа/снизу — чтобы метки не обрезались;
           - font 16 — для читаемости в PDF.
         """
         try:
@@ -773,10 +869,10 @@ def _build_dashboard_pdf(data: dict) -> bytes:
             text=monthly["Выдано"], textposition="outside",
         ))
         fig1.add_trace(go.Bar(
-            x=monthly["ym"], y=monthly["Закрыто"],
-            name="Наши ответы",
+            x=monthly["ym"], y=monthly["Отвечено"],
+            name="Ответы АТП ТЛП",
             marker_color="#2E7D32",
-            text=monthly["Закрыто"], textposition="outside",
+            text=monthly["Отвечено"], textposition="outside",
         ))
         fig1.update_layout(
             barmode="group",
@@ -794,7 +890,7 @@ def _build_dashboard_pdf(data: dict) -> bytes:
         #  График 2: отставание по месяцам
         # -------------------------------------------------------------
         monthly_d = monthly.copy()
-        monthly_d["Отставание"] = monthly_d["Выдано"] - monthly_d["Закрыто"]
+        monthly_d["Отставание"] = monthly_d["Выдано"] - monthly_d["Отвечено"]
         colors_list = ["#E57373" if v > 0 else "#2E7D32"
                        for v in monthly_d["Отставание"]]
 
@@ -868,8 +964,8 @@ def _build_dashboard_pdf(data: dict) -> bytes:
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(A4),
         leftMargin=12 * mm, rightMargin=12 * mm,
-        topMargin=22 * mm,  # ← было 10
-        bottomMargin=15 * mm,  # ← было 10
+        topMargin=22 * mm,
+        bottomMargin=15 * mm,
     )
 
     styles = getSampleStyleSheet()
@@ -956,7 +1052,7 @@ def _build_dashboard_pdf(data: dict) -> bytes:
             story.append(Paragraph("3. Динамика и графики", h2))
             story.append(Spacer(1, 4*mm))
             story.append(Paragraph(
-                "3.1. Выдача замечаний vs Наши ответы", h3))
+                "3.1. Выдача замечаний vs Ответы АТП ТЛП", h3))
             story.append(Spacer(1, 4*mm))
             img = Image(_io.BytesIO(images["flows"]),
                         width=page_width, height=page_width * 0.42)
@@ -995,7 +1091,7 @@ def _build_dashboard_pdf(data: dict) -> bytes:
             story.append(img)
 
     # =================================================================
-    #  5. Вывод — без эмодзи
+    #  5. Вывод
     # =================================================================
     story.append(PageBreak())
     story.append(Paragraph("4. Вывод", h2))
@@ -1003,18 +1099,19 @@ def _build_dashboard_pdf(data: dict) -> bytes:
 
     conclusions = []
     conclusions.append(
-        f"Всего замечаний: <b>{total:,}</b>. "
+        f"Всего замечаний: <b>{total_all:,}</b>. "
         f"Закрыто: <b>{closed:,}</b> ({pct}%).".replace(",", " ")
     )
 
-    if data["overdue_ours"] > 5000:
+    if data["ours_overdue"] > 5000:
         conclusions.append(
-            f"<b>КРИТИЧНО:</b> {data['overdue_ours']:,} замечаний "
-            f"ждут нашего ответа более 10 рабочих дней.".replace(",", " ")
+            f"<b>КРИТИЧНО:</b> {data['ours_overdue']:,} замечаний "
+            f"ждут ответа АТП ТЛП более 10 рабочих дней."
+            .replace(",", " ")
         )
-    elif data["overdue_ours"] > 1000:
+    elif data["ours_overdue"] > 1000:
         conclusions.append(
-            f"{data['overdue_ours']:,} замечаний ждут нашего ответа."
+            f"{data['ours_overdue']:,} замечаний ждут ответа АТП ТЛП."
             .replace(",", " ")
         )
 
@@ -1022,6 +1119,13 @@ def _build_dashboard_pdf(data: dict) -> bytes:
         conclusions.append(
             f"{data['waiting_customer']:,} замечаний ждут рассмотрения "
             f"заказчиком — готовим письмо-предъявление.".replace(",", " ")
+        )
+
+    if data["closed_by_doc_b"] > 0:
+        conclusions.append(
+            f"{data['closed_by_doc_b']:,} замечаний учтено по листам B — "
+            f"формально не сняты, заказчик может вернуть на доработку."
+            .replace(",", " ")
         )
 
     if data["abandoned"] > 1000:
@@ -1033,20 +1137,20 @@ def _build_dashboard_pdf(data: dict) -> bytes:
 
     if not monthly.empty and len(monthly) >= 3:
         last3 = monthly.tail(3).copy()
-        last3["Отставание"] = last3["Выдано"] - last3["Закрыто"]
+        last3["Отставание"] = last3["Выдано"] - last3["Отвечено"]
         total_delta = last3["Отставание"].sum()
         avg_delta = total_delta / 3
 
         if avg_delta > 500:
             conclusions.append(
-                f"<b>Команда отстаёт от темпа выдачи.</b> "
-                f"В среднем <b>+{int(avg_delta):,}</b> незакрытых в месяц. "
-                f"При сохранении темпа к концу года задолженность вырастет."
-                .replace(",", " ")
+                f"<b>АТП ТЛП отстаёт от темпа выдачи.</b> "
+                f"В среднем <b>+{int(avg_delta):,}</b> незакрытых в "
+                f"месяц. При сохранении темпа к концу года "
+                f"задолженность вырастет.".replace(",", " ")
             )
         elif avg_delta < -500:
             conclusions.append(
-                f"Команда разгребает задолженность: "
+                f"АТП ТЛП разгребает задолженность: "
                 f"{int(avg_delta):,} в месяц в среднем.".replace(",", " ")
             )
 
