@@ -1016,7 +1016,7 @@ def _render_drilldown(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_waiting_review(disciplines=None, kits=None,
-                          sections=None) -> pd.DataFrame:
+                          sections=None, authors=None) -> pd.DataFrame:
     """Замечания «Выполнено» из единого источника."""
     from vitro.ui.deadlines import _load_all_categorized
 
@@ -1041,6 +1041,8 @@ def _load_waiting_review(disciplines=None, kits=None,
         df = df[df["section"].isin(sections)]
     if kits:
         df = df[df["complex"].isin(kits)]
+    if authors:
+        df = df[df["author"].isin(authors)]     # ← НОВОЕ
 
     def _bucket(row):
         flag = row["category_flag"]
@@ -1073,10 +1075,31 @@ def _render_waiting_review():
         "решения заказчика. Категорию можно поставить или изменить."
     )
 
+    # ---------------------------------------------------------------------
+    #  Загружаем список авторов (для фильтра)
+    # ---------------------------------------------------------------------
+    # Загружаем базовый набор (без фильтров) — чтобы получить всех авторов
+    from vitro.ui.deadlines import _load_all_categorized
+    _all = _load_all_categorized()
+    if not _all.empty:
+        # Только «Выполнено» — чтобы предлагать авторов, у которых
+        # есть замечания в этом статусе
+        _waiting_flags_for_authors = [
+            "waiting_customer", "waiting_customer_overdue",
+            "waiting_customer_ontime", "waiting_customer_chronic",
+            "closed_by_doc_status",
+        ]
+        _authors = sorted(
+            _all[_all["category_flag"].isin(_waiting_flags_for_authors)]
+            ["author"].dropna().unique().tolist()
+        )
+    else:
+        _authors = []
+
     # Фильтры
     disc_options = _load_discipline_options()
     with st.expander("🎛 Фильтры", expanded=False):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)        # ← было 3, стало 4
         with c1:
             sel_disc_labels = st.multiselect(
                 "Дисциплина", options=list(disc_options.values()),
@@ -1106,11 +1129,20 @@ def _render_waiting_review():
                 placeholder="Все комплекты", key="wait_kit")
             sel_kit = [c for c, l in kit_options.items()
                         if l in sel_kit_labels]
+        with c4:
+            sel_author_labels = st.multiselect(
+                "Автор (заказчик)",
+                options=_authors,
+                placeholder="Все авторы",
+                key="wait_author",
+            )
+            sel_author = sel_author_labels
 
     df = _load_waiting_review(
         disciplines=tuple(sel_disc) if sel_disc else None,
         kits=tuple(sel_kit) if sel_kit else None,
         sections=tuple(sel_section) if sel_section else None,
+        authors=tuple(sel_author) if sel_author else None,   # ← НОВОЕ
     )
 
     if df.empty:
