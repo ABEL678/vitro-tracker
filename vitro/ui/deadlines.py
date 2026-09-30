@@ -33,6 +33,7 @@ import streamlit as st
 from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.workdays import add_workdays, parse_date, workdays_between
+from vitro.text_utils import clean_leaf_key      # ← НОВОЕ
 from vitro.ui._utils import download_plotly
 
 
@@ -91,7 +92,7 @@ def _load_all_categorized() -> pd.DataFrame:
                 c.fix_date, c.category, c.category_date,
                 c.category_user, c.category_version,
                 d.discipline, d.section, d.complex,
-                REPLACE(REPLACE(d.leaf, '.pdf', ''), '.PDF', '') AS sheet,
+                d.leaf AS sheet_raw,
                 d.name AS sheet_name,
                 d.status AS doc_status
             FROM comments c
@@ -215,7 +216,8 @@ def _load_all_categorized() -> pd.DataFrame:
             "discipline": r["discipline"],
             "section": r["section"],
             "complex": r["complex"],
-            "sheet": r["sheet"],
+            "sheet": clean_leaf_key(r["sheet_raw"]),
+            "sheet_raw": r["sheet_raw"],   # оригинал (для отладки)
             "sheet_name": r["sheet_name"],
             "created": r["created"],
             "created_d": created,
@@ -239,7 +241,7 @@ def _load_all_categorized() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  KPI — 2 ряда
+#  KPI — 3 ряда
 # ---------------------------------------------------------------------------
 def _render_kpi(df: pd.DataFrame):
     if df.empty:
@@ -259,11 +261,11 @@ def _render_kpi(df: pd.DataFrame):
     n_disc = count_by("discussion_overdue", "discussion_in_progress")
     n_disc_over = count_by("discussion_overdue")
 
-    # Итого АТП ТЛП
+    # Итого АТП ТЛП — сумма 4 категорий (включая «К обсуждению»)
     ours_total = n_new + n_work + n_rej + n_disc
     ours_overdue = n_new_over + n_work_over + n_rej_over + n_disc_over
 
-    # Заказчик + архив
+    # Заказчик
     n_wait = count_by("waiting_customer", "waiting_customer_overdue",
                       "waiting_customer_ontime")
     n_chronic = count_by("waiting_customer_chronic")
@@ -272,9 +274,11 @@ def _render_kpi(df: pd.DataFrame):
                     & (df["doc_status"] == "A")].shape[0]
     n_closed_b = df[(df["category_flag"] == "closed_by_doc_status")
                     & (df["doc_status"] == "B")].shape[0]
+
+    # Архив
     n_aband = count_by("abandoned")
 
-    # Итого заказчик = ждут + хронические (без учтённых A/B — они уже наши)
+    # Итого заказчик = ждут + хронические
     customer_total = n_wait + n_chronic
 
     # =================================================================
@@ -282,7 +286,7 @@ def _render_kpi(df: pd.DataFrame):
     # =================================================================
     st.markdown("##### 🔵 АТП ТЛП — ждут ответа проектировщика")
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric(
         "🆕 Новое",
@@ -290,8 +294,8 @@ def _render_kpi(df: pd.DataFrame):
         delta=f"🔴 {n_new_over:,}".replace(",", " ")
               if n_new_over > 0 else None,
         delta_color="inverse",
-        help="Замечание выдано заказчиком, но АТП ТЛП ещё не взял его "
-             "в работу. Красным — просрочено (>10 р.д.).",
+        help="Замечание выдано заказчиком, но АТП ТЛП ещё не взял "
+             "его в работу. Красным — просрочено (>10 р.д.).",
     )
     c2.metric(
         "🛠 В работе",
@@ -312,22 +316,14 @@ def _render_kpi(df: pd.DataFrame):
              "Красным — просрочено (>10 р.д.).",
     )
     c4.metric(
-        "🟣 К обсуждению",
-        f"{n_disc:,}".replace(",", " "),
-        delta=f"🔴 {n_disc_over:,}".replace(",", " ")
-              if n_disc_over > 0 else None,
-        delta_color="inverse",
-        help="Спорное замечание, требует совещания сторон. "
-             "Красным — просрочено (>10 р.д.).",
-    )
-    c5.metric(
         "📊 Итого АТП ТЛП",
         f"{ours_total:,}".replace(",", " "),
         help="Все замечания, ожидающие ответа от АТП ТЛП. "
              "Сумма 4 категорий: Новое + В работе + Не принято + "
-             "К обсуждению.",
+             "К обсуждению. **К обсуждению** вынесено в «Особые случаи» "
+             "ниже.",
     )
-    c6.metric(
+    c5.metric(
         "🔴 Из них просрочено",
         f"{ours_overdue:,}".replace(",", " "),
         delta="требует внимания" if ours_overdue > 0 else None,
@@ -337,11 +333,11 @@ def _render_kpi(df: pd.DataFrame):
     )
 
     # =================================================================
-    #  РЯД 2: ЗАКАЗЧИК + АРХИВ
+    #  РЯД 2: ЗАКАЗЧИК
     # =================================================================
-    st.markdown("##### 🔵 На стороне заказчика + архив")
+    st.markdown("##### 🔵 На стороне заказчика")
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
         "🔵 Ждут заказчика",
@@ -371,18 +367,34 @@ def _render_kpi(df: pd.DataFrame):
              "НЕ сняты, заказчик может вернуть лист на доработку. "
              "Требует внимания.",
     )
-    c5.metric(
-        "🟡 Заброшено",
+
+    # =================================================================
+    #  РЯД 3: ОСОБЫЕ СЛУЧАИ
+    # =================================================================
+    st.markdown("##### ⚪ Особые случаи — требуют отдельного решения")
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "🟣 К обсуждению",
+        f"{n_disc:,}".replace(",", " "),
+        delta=f"🔴 {n_disc_over:,} просроч.".replace(",", " ")
+              if n_disc_over > 0 else None,
+        delta_color="inverse",
+        help="Спорные замечания — обе стороны не могут решить. "
+             "Требуется совещание.",
+    )
+    c2.metric(
+        "🟡 Заброшено (>90 кал. дн.)",
         f"{n_aband:,}".replace(",", " "),
         help="Замечания без движения более 90 календарных дней. "
-             "Кандидаты на снятие или пересогласование.",
+             "Кандидаты на снятие, аннулирование или пересогласование. "
+             "Могут быть и на нашей стороне, и на стороне заказчика.",
     )
-    c6.metric(
-        "📊 Итого заказчик",
-        f"{customer_total:,}".replace(",", " "),
-        help="Замечания, ожидающие действия от заказчика: "
-             "Ждут заказчика + Хронические. Учтённые (A/B) сюда "
-             "не входят — они уже отработаны АТП ТЛП.",
+    c3.metric(
+        "📊 Итого особых",
+        f"{n_disc + n_aband:,}".replace(",", " "),
+        help="К обсуждению + Заброшено.",
     )
 
 
@@ -933,17 +945,40 @@ def _render_closed_by_doc(df: pd.DataFrame):
         st.info("По выбранному фильтру нет данных.")
         return
 
+    # Готовим таблицу с человеческими колонками
     table = table_src[[
         "id", "discipline", "complex", "sheet", "sheet_name",
-        "comment", "author", "doc_status", "fix_date",
-    ]].copy().rename(columns={
+        "comment", "status", "author", "doc_status", "fix_date",
+    ]].copy()
+
+    # Форматируем дату «Наш ответ» → «30.05.2025 06:08»
+    def _fmt_date(s):
+        if not s:
+            return ""
+        try:
+            # fix_date приходит как ISO: "2025-05-30T06:08:27Z"
+            s_str = str(s).replace("Z", "").replace("T", " ")
+            # обрезаем до минут
+            if len(s_str) >= 16:
+                s_str = s_str[:16]
+            # переводим в формат DD.MM.YYYY HH:MM
+            from datetime import datetime as _dt
+            d = _dt.strptime(s_str, "%Y-%m-%d %H:%M")
+            return d.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return str(s)
+
+    table["fix_date"] = table["fix_date"].apply(_fmt_date)
+
+    table = table.rename(columns={
         "id": "ID",
         "discipline": "Дисциплина",
         "complex": "Комплект",
         "sheet": "Лист",
         "sheet_name": "Название листа",
         "comment": "Замечание",
-        "author": "Автор",
+        "status": "Статус замечания",  # ← НОВОЕ
+        "author": "Автор замечания",
         "doc_status": "Статус листа",
         "fix_date": "Наш ответ",
     })
@@ -954,6 +989,9 @@ def _render_closed_by_doc(df: pd.DataFrame):
         column_config={
             "Замечание": st.column_config.TextColumn(width="large"),
             "Название листа": st.column_config.TextColumn(width="large"),
+            "Наш ответ": st.column_config.TextColumn(width="small"),
+            "Статус замечания": st.column_config.TextColumn(width="small"),
+            "Статус листа": st.column_config.TextColumn(width="small"),
         },
     )
     if len(table) > 500:

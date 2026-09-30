@@ -621,12 +621,13 @@ def _render_analysis():
                 cross.to_excel(writer, index=False, sheet_name="Категории_статусы")
             buf.seek(0)
             st.download_button(
-                "⬇️ Скачать XLSX",
+                label="⬇️ Скачать XLSX",
                 data=buf.getvalue(),
                 file_name=f"Категории_статусы_{datetime.now():%Y%m%d}.xlsx",
                 mime=("application/vnd.openxmlformats-officedocument"
                       ".spreadsheetml.sheet"),
                 use_container_width=True,
+                key="analysis_download_cross",  # ← НОВАЯ СТРОКА
             )
     else:
         st.info("Нет активных замечаний.")
@@ -826,7 +827,7 @@ def _collapse_repeats(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  Редактор (без изменений)
+#  Редактор
 # ---------------------------------------------------------------------------
 def _render_editor():
     """Редактор категорий — только активные замечания."""
@@ -860,7 +861,7 @@ def _render_editor():
         show_waiting = st.checkbox(
             "🔵 Показать «Выполнено» (ждут заказчика)",
             value=False,
-            key="cat_show_waiting",
+            key="editor_show_waiting",
             help="Если выключено — в редакторе только 4 активных статуса. "
                  "Если включено — добавляются замечания со статусом "
                  "«Выполнено» (АТП ТЛП ответил, ждём рассмотрения).",
@@ -870,7 +871,7 @@ def _render_editor():
         only_uncategorized = st.checkbox(
             "Только без категории",
             value=False,
-            key="cat_only_uncat",
+            key="editor_only_uncat",
         )
 
     # =================================================================
@@ -886,7 +887,7 @@ def _render_editor():
                 "Дисциплина",
                 options=list(disc_options.values()),
                 placeholder="Все дисциплины",
-                key="cat_disc",
+                key="editor_disc",
             )
             sel_disc = [code for code, label in disc_options.items()
                         if label in sel_disc_labels]
@@ -900,7 +901,7 @@ def _render_editor():
                     "Раздел",
                     options=list(section_options.values()),
                     placeholder="Все разделы",
-                    key="cat_section",
+                    key="editor_section",
                 )
                 sel_section = [code for code, label in section_options.items()
                                if label in sel_section_labels]
@@ -910,50 +911,53 @@ def _render_editor():
                     "Раздел", options=[],
                     placeholder="Разделы не применимы",
                     disabled=True,
-                    key="cat_section_empty",
+                    key="editor_section_empty",
                 )
 
         kit_options = _load_kit_options(
             tuple(sel_disc) if sel_disc else (),
-            tuple(sel_section) if sel_section else ())
+            tuple(sel_section) if sel_section else (),
+        )
 
         with c3:
             sel_kit_labels = st.multiselect(
                 "Комплект",
                 options=list(kit_options.values()),
                 placeholder="Все комплекты",
-                key="cat_kit",
+                key="editor_kit",
             )
             sel_kit = [code for code, label in kit_options.items()
                        if label in sel_kit_labels]
 
+        # Определяем список доступных статусов
+        if show_waiting:
+            status_options = [
+                "Новое", "Принято в работу", "Не принято",
+                "К обсуждению", "Выполнено",
+            ]
+        else:
+            status_options = [
+                "Новое", "Принято в работу",
+                "Не принято", "К обсуждению",
+            ]
+
         c4, c5 = st.columns(2)
         with c4:
-            if show_waiting:
-                status_options = [
-                    "Новое", "Принято в работу", "Не принято",
-                    "К обсуждению", "Выполнено",
-                ]
-            else:
-                status_options = [
-                    "Новое", "Принято в работу",
-                    "Не принято", "К обсуждению",
-                ]
-
             sel_status = st.multiselect(
                 "Статус замечания",
                 options=status_options,
                 default=status_options,
                 placeholder="Все доступные статусы",
-                key="cat_status",
+                key="editor_status",
             )
 
         with c5:
             limit = st.number_input(
                 "Лимит строк",
                 min_value=50, max_value=2000,
-                value=300, step=50, key="cat_limit",
+                value=300, step=50, key="editor_limit",
             )
+
 
     # =================================================================
     #  ЗАГРУЗКА СРЕЗА

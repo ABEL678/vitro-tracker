@@ -971,12 +971,37 @@ def _render_drilldown(df: pd.DataFrame):
     # ---- Таблица замечаний ----
     st.markdown(f"##### 📋 Замечания ({len(details):,})".replace(",", " "))
 
+    # Человеческие названия флагов
+    FLAG_LABELS = {
+        "new_overdue": "🆕 Новое (просрочено)",
+        "new_in_progress": "🆕 Новое (в сроке)",
+        "in_work_overdue": "🛠 В работе (просрочено)",
+        "in_work_in_progress": "🛠 В работе (в сроке)",
+        "rejected_overdue": "🟪 Не принято (просрочено)",
+        "rejected_in_progress": "🟪 Не принято (в сроке)",
+        "discussion_overdue": "🟣 К обсуждению (просрочено)",
+        "discussion_in_progress": "🟣 К обсуждению (в сроке)",
+        "waiting_customer": "🔵 Ждут заказчика (10–30)",
+        "waiting_customer_overdue": "🔵 Ждут заказчика (30–90)",
+        "waiting_customer_ontime": "🔵 Ждут заказчика (в сроке)",
+        "waiting_customer_chronic": "🔴 Хроника (>90 р.д.)",
+        "closed_by_doc_status": "🟢 Учтено (A/B)",
+        "abandoned": "🟡 Заброшено",
+    }
+
     view = details[[
         "id", "category_flag", "discipline", "sheet", "sheet_name",
         "comment", "status", "author", "created",
-    ]].copy().rename(columns={
+    ]].copy()
+
+    # Заменяем технические флаги на человеческие
+    view["category_flag"] = view["category_flag"].map(
+        FLAG_LABELS
+    ).fillna(view["category_flag"])
+
+    view = view.rename(columns={
         "id": "ID",
-        "category_flag": "Категория (флаг)",
+        "category_flag": "Категория",
         "discipline": "Дисциплина",
         "sheet": "Лист",
         "sheet_name": "Название листа",

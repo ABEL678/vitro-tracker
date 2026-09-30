@@ -1289,7 +1289,8 @@ def _render_waiting_review():
                          ascending=[True, False]).drop(columns=["_sort"])
 
     display_cols = [
-        "id", "bucket", "discipline", "complex", "sheet",
+        "id", "bucket", "doc_status",  # ← НОВОЕ: статус листа
+        "discipline", "complex", "sheet",
         "comment", "author", "fix_date", "days_waiting",
         "category", "category_user", "category_date",
         "category_version",
@@ -1310,6 +1311,10 @@ def _render_waiting_review():
                 "Комплект", disabled=True, width="medium"),
             "sheet": st.column_config.TextColumn(
                 "Лист", disabled=True, width="medium"),
+            "doc_status": st.column_config.TextColumn(
+                "Статус листа", disabled=True, width="small",
+                help="A — лист утверждён; B — готов к сдаче",
+            ),
             "comment": st.column_config.TextColumn(
                 "Замечание", disabled=True, width="large"),
             "author": st.column_config.TextColumn(
@@ -1388,7 +1393,9 @@ def _render_waiting_review():
                 "Всё «Выполнено»",
                 "🔵 Ждут заказчика",
                 "🔴 Только хроника",
-                "🟢 Учтено (A/B)",
+                "🟢 Учтено — только A (лист утверждён)",
+                "🟡 Учтено — только B (к сдаче)",
+                "🟢🟡 Учтено — A и B вместе",
             ],
             horizontal=False,
             key="wait_export_choice",
@@ -1404,7 +1411,17 @@ def _render_waiting_review():
             ])]
         elif export_choice == "🔴 Только хроника":
             export_df = df[df["bucket"] == "🔴 Хронические (>90 р.д.)"]
-        else:
+        elif export_choice == "🟢 Учтено — только A (лист утверждён)":
+            export_df = df[
+                (df["bucket"] == "🟢 Учтено (A/B)")
+                & (df["doc_status"].astype(str).str.upper() == "A")
+                ]
+        elif export_choice == "🟡 Учтено — только B (к сдаче)":
+            export_df = df[
+                (df["bucket"] == "🟢 Учтено (A/B)")
+                & (df["doc_status"].astype(str).str.upper() == "B")
+                ]
+        else:  # A и B вместе
             export_df = df[df["bucket"] == "🟢 Учтено (A/B)"]
 
         buf = io.BytesIO()

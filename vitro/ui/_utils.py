@@ -1,81 +1,106 @@
-# vitro/ui/_utils.py
+# vitro/text_utils.py
 """
-Утилиты для UI: скачивание графиков Plotly в PNG, безопасные имена файлов.
+Утилиты для работы с текстом.
 
-PNG генерируется ТОЛЬКО по кнопке — чтобы не тормозить рендер страницы.
+Основное назначение — нормализация имён листов РД, которые могут
+храниться в SharePoint как в латинице, так и в кириллице.
+Визуально одинаковые символы (C/С, P/Р, A/А и т. д.) — разные байты,
+поэтому наивная группировка «разваливает» один лист на два.
 """
 
-import hashlib
-import re
 import streamlit as st
 
+# ---------------------------------------------------------------------------
+#  Таблица гомоглифов: кириллица → латиница
+# ---------------------------------------------------------------------------
+_HOMOGLYPHS = {
+    # Заглавные
+    "А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H",
+    "К": "K", "М": "M", "О": "O", "Р": "P", "Т": "T",
+    "Х": "X", "У": "Y",
+    # Строчные
+    "а": "a", "в": "b", "с": "c", "е": "e", "н": "h",
+    "к": "k", "м": "m", "о": "o", "р": "p", "т": "t",
+    "х": "x", "у": "y",
+}
 
-def safe_filename(name: str) -> str:
+
+def normalize_homoglyphs(s: str) -> str:
     """
-    Убирает из имени файла символы, недопустимые в Windows/Linux.
-    Пробелы → подчёркивания.
+    Заменяет визуально похожие кириллические символы на латинские.
+
+    ВАЖНО: используется ТОЛЬКО для ключа группировки.
+    Оригинальные имена листов можно показывать как есть.
     """
-    if not name:
-        return "file"
-    name = re.sub(r'[\\/:*?"<>|]', "_", str(name))
-    name = re.sub(r"\s+", "_", name.strip())
-    return name[:120] or "file"
+    if not s:
+        return s
+    return "".join(_HOMOGLYPHS.get(ch, ch) for ch in str(s))
 
 
-def _fig_id(fig) -> str:
-    """Уникальный хэш фигуры — чтобы не путать кэш между графиками."""
+def clean_leaf_key(leaf) -> str:
+    """
+    Возвращает нормализованный ключ листа:
+      1. Убирает расширение .pdf / .PDF.
+      2. Заменяет кириллические гомоглифы на латинские.
+
+    Используется для сопоставления листов между `documents` и `comments`.
+    """
+    if not leaf:
+        return ""
+    s = str(leaf)
+    # Убираем .pdf (в обоих регистрах)
+    if s.lower().endswith(".pdf"):
+        s = s[:-4]
+    return normalize_homoglyphs(s)
+
+
+def download_plotly(fig, filename_base: str, key_suffix: str,
+                    width: int = 1200, height: int = 700,
+                    scale: float = 1.5):
+    """
+    Универсальная кнопка скачивания Plotly-графика в PNG.
+
+    fig           — plotly-фигура
+    filename_base — имя файла без расширения (например, «Отстающие_по_разбору»)
+    key_suffix    — уникальный ключ для Streamlit (чтобы не было DuplicateElementId)
+    width/height  — размер PNG в пикселях
+    scale         — масштаб (1.5 = retina-качество)
+
+    Требует установленный `kaleido`. Если его нет — покажет подсказку.
+    """
     try:
-        s = fig.to_json()
+        png_bytes = fig.to_image(
+            format="png",
+            width=width,
+            height=height,
+            scale=scale,
+        )
     except Exception:
-        s = str(id(fig))
-    return hashlib.md5(s.encode()).hexdigest()[:12]
+        st.caption(
+            "📷 Для экспорта графиков в PNG установите `kaleido`: "
+            "`pip install kaleido`"
+        )
+        return
+
+    st.download_button(
+        "📷 PNG",
+        data=png_bytes,
+        file_name=f"{filename_base}.png",
+        mime="image/png",
+        key=key_suffix,
+        use_container_width=True,
+    )
 
 
-def download_plotly(fig, filename: str, key: str,
-                    width: int = 1400, height: int = 700, scale: int = 2):
+def safe_filename(s: str) -> str:
     """
-    Кнопки скачивания графика в PNG (компактные).
+    Превращает строку в безопасное имя файла:
+    убирает запрещённые символы, оставляет буквы/цифры/дефис/подчёркивание.
     """
-    fig_hash = _fig_id(fig)
-    state_key = f"png_ready_{key}_{fig_hash}"
-
-    col1, col2, _ = st.columns([2, 2, 6])
-
-    with col1:
-        if state_key not in st.session_state:
-            if st.button(
-                "📷 PNG",
-                key=f"prep_{key}",
-                use_container_width=True,
-                help="Сгенерировать PNG (2–3 секунды)",
-            ):
-                with st.spinner("Готовим PNG..."):
-                    try:
-                        png_bytes = fig.to_image(
-                            format="png", width=width,
-                            height=height, scale=scale,
-                        )
-                        st.session_state[state_key] = png_bytes
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Ошибка PNG: {e}")
-        else:
-            st.download_button(
-                "⬇️ PNG",
-                data=st.session_state[state_key],
-                file_name=f"{filename}.png",
-                mime="image/png",
-                key=f"png_{key}",
-                use_container_width=True,
-            )
-
-    with col2:
-        if state_key in st.session_state:
-            if st.button(
-                "✖",
-                key=f"clear_{key}",
-                use_container_width=True,
-                help="Убрать PNG из памяти",
-            ):
-                del st.session_state[state_key]
-                st.rerun()
+    if not s:
+        return "file"
+    # Запрещённые в Windows: \ / : * ? " < > |
+    bad = '\\/:*?"<>|'
+    out = "".join(ch if ch not in bad else "_" for ch in str(s))
+    out = out.strip().rstrip(".")
+    return out or "file"

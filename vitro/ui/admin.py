@@ -156,27 +156,29 @@ def _render_danger_zone():
         "Эти операции необратимы. Используйте только при необходимости."
     )
 
-    with st.expander("🧹 Очистить журнал логов", expanded=False):
-        st.warning("Удалит все записи из таблицы `log`.")
-        if st.button("Очистить лог", key="btn_clear_log"):
+    with st.expander("🧹 Очистить журнал операций", expanded=False):
+        st.warning("Удалит все записи журнала (синхронизации, ошибки).")
+        if st.button("Очистить журнал", key="btn_clear_log"):
             with get_conn() as conn:
                 conn.execute("DELETE FROM log")
-            st.success("Лог очищен")
+            st.success("Журнал очищен")
             st.cache_data.clear()
 
-    with st.expander("🧹 Очистить историю категорий", expanded=False):
-        st.warning("Удалит все записи из `users_activity`.")
+    with st.expander("🧹 Очистить историю изменений категорий",
+                     expanded=False):
+        st.warning("Удалит все записи об изменениях категорий "
+                   "(кто, когда, что менял).")
         if st.button("Очистить историю", key="btn_clear_activity"):
             with get_conn() as conn:
                 conn.execute("DELETE FROM users_activity")
             st.success("История очищена")
             st.cache_data.clear()
 
-    with st.expander("🗑 Полная очистка БД (кроме категорий)", expanded=False):
+    with st.expander("🗑 Полная очистка базы данных", expanded=False):
         st.error(
-            "Удалит documents, complexes, history_*, log. "
-            "**Категории замечаний в comments тоже удалятся.** "
-            "Понадобится полная синхронизация."
+            "Удалит **ВСЕ** данные: листы, комплекты, замечания, "
+            "историю, журнал. **Категории замечаний тоже удалятся.** "
+            "Понадобится полная синхронизация с SharePoint."
         )
         confirm = st.text_input("Введите DELETE для подтверждения",
                                 key="confirm_delete")
