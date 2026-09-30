@@ -54,7 +54,7 @@ def _load_discipline_options() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 #  Главные метрики по проекту
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_project_metrics() -> dict:
     """
     Глобальные метрики по ревизиям (по всему проекту).
@@ -96,7 +96,7 @@ def _load_project_metrics() -> dict:
 # ---------------------------------------------------------------------------
 #  Гистограмма распределения
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_histogram() -> pd.DataFrame:
     """Сколько листов на каждой ревизии 0, 1, 2, ..., 30+."""
     with get_conn() as conn:
@@ -124,7 +124,7 @@ def _load_histogram() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  По комплектам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_by_complex() -> pd.DataFrame:
     """Сводка по каждому комплекту: средняя/макс ревизия, кол-во листов."""
     with get_conn() as conn:
@@ -158,7 +158,7 @@ def _load_by_complex() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  По дисциплинам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_by_discipline() -> pd.DataFrame:
     """Сводка по каждой дисциплине."""
     with get_conn() as conn:
@@ -191,7 +191,7 @@ def _load_by_discipline() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Связь ревизий с замечаниями
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_revisions_per_issue() -> pd.DataFrame:
     """
     Метрика: сколько ревизий приходится на одно замечание по комплекту.
@@ -247,7 +247,7 @@ def _load_revisions_per_issue() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Листы для drill-down
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_sheets_for_complex(complex_code: str) -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""
@@ -549,12 +549,7 @@ def render():
         "согласования затянут и требует вмешательства."
     )
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="rev_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     with st.spinner("Загрузка данных по ревизиям..."):
         metrics = _load_project_metrics()

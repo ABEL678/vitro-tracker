@@ -24,6 +24,7 @@ SLA = 10 рабочих дней (с учётом производственно
 """
 
 import io
+import time
 from datetime import date, datetime
 
 import pandas as pd
@@ -61,7 +62,7 @@ def _load_discipline_options() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 #  Главный расчёт — категоризация всех замечаний
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_all_categorized() -> pd.DataFrame:
     """
     Возвращает все активные замечания с рассчитанными полями
@@ -85,6 +86,8 @@ def _load_all_categorized() -> pd.DataFrame:
       АРХИВ:
         abandoned (> 90 календарных дней без движения)
     """
+    t0 = time.time()
+
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT
@@ -103,6 +106,9 @@ def _load_all_categorized() -> pd.DataFrame:
             )
               AND c.created IS NOT NULL AND c.created <> ''
         """).fetchall()
+
+        t1 = time.time()
+        print(f"[TIMING] _load_all_categorized: SQL {t1 - t0:.1f} сек ({len(rows)} строк)")
 
     today = date.today()
     result = []
@@ -237,6 +243,9 @@ def _load_all_categorized() -> pd.DataFrame:
             "category_flag": category,
         })
 
+    t2 = time.time()
+    print(f"[TIMING] _load_all_categorized: обработка {t2 - t1:.1f} сек")
+    print(f"[TIMING] _load_all_categorized: ИТОГО {t2 - t0:.1f} сек")
     return pd.DataFrame(result)
 
 
@@ -1123,12 +1132,7 @@ def render():
         "**красные — наша**, **синие — заказчика**, **зелёные — учтено**."
     )
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="dl_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     with st.spinner("Загрузка и категоризация..."):
         df = _load_all_categorized()

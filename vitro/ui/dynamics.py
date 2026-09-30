@@ -24,7 +24,7 @@ from vitro.ui._utils import download_plotly
 # ---------------------------------------------------------------------------
 #  Снимки (без изменений)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_snapshots() -> pd.DataFrame:
     with get_conn() as conn:
         df = pd.read_sql("""
@@ -214,7 +214,7 @@ def _render_by_discipline(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Загрузчики для выдачи и рассмотрения
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_issue_stats() -> pd.DataFrame:
     """Выдача замечаний по месяцам (created)."""
     with get_conn() as conn:
@@ -226,7 +226,7 @@ def _load_issue_stats() -> pd.DataFrame:
         """, conn)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_issue_by_discipline() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""
@@ -239,7 +239,7 @@ def _load_issue_by_discipline() -> pd.DataFrame:
         """, conn)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_our_answers_stats() -> pd.DataFrame:
     """
     НАШИ ОТВЕТЫ по месяцам.
@@ -255,7 +255,7 @@ def _load_our_answers_stats() -> pd.DataFrame:
         """, conn)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_our_answers_by_discipline() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""
@@ -269,7 +269,7 @@ def _load_our_answers_by_discipline() -> pd.DataFrame:
         """, conn)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_customer_closed_stats() -> pd.DataFrame:
     """
     ЗАКРЫТО ЗАКАЗЧИКОМ по месяцам.
@@ -285,7 +285,7 @@ def _load_customer_closed_stats() -> pd.DataFrame:
         """, conn)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_customer_closed_by_discipline() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""
@@ -541,12 +541,7 @@ def _render_issue_and_fix_section():
 def render():
     st.header("📈 Динамика")
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="dyn_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     st.caption(
         "История по снимкам + выдача и рассмотрение замечаний по месяцам. "

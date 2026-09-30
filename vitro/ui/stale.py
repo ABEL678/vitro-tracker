@@ -81,7 +81,7 @@ def _load_author_options() -> list[str]:
 # ---------------------------------------------------------------------------
 #  Точные счётчики (без лимита)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _count_active(disciplines: tuple = (), kits: tuple = (),
                   authors: tuple = ()) -> int:
     """Точное число всех активных замечаний (без лимита)."""
@@ -106,7 +106,7 @@ def _count_active(disciplines: tuple = (), kits: tuple = (),
         return conn.execute(q, params).fetchone()[0]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _count_active_stale(min_days: int, disciplines: tuple = (),
                         kits: tuple = (), authors: tuple = ()) -> int:
     """Точное число активных замечаний старше min_days (без лимита)."""
@@ -135,7 +135,7 @@ def _count_active_stale(min_days: int, disciplines: tuple = (),
 # ---------------------------------------------------------------------------
 #  Распределение по возрасту — точное, через SQL (без лимита)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_age_distribution(disciplines: tuple = (), kits: tuple = (),
                            authors: tuple = ()) -> pd.DataFrame:
     """
@@ -194,7 +194,7 @@ def _load_age_distribution(disciplines: tuple = (), kits: tuple = (),
 # ---------------------------------------------------------------------------
 #  DataFrame для топов и таблицы (с лимитом)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_all_active(disciplines: tuple = (), kits: tuple = (),
                      authors: tuple = ()) -> pd.DataFrame:
     """

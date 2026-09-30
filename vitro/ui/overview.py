@@ -71,7 +71,7 @@ SHEET_STATUS_COLORS = {
 # ---------------------------------------------------------------------------
 #  Масштаб проекта — общие цифры
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_scale() -> dict:
     with get_conn() as conn:
         docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
@@ -97,7 +97,7 @@ def _load_scale() -> dict:
 # ---------------------------------------------------------------------------
 #  Единый срез активных (из deadlines._load_all_categorized)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
     """
     Активные замечания = `_load_all_categorized` без 'abandoned'.
@@ -193,7 +193,7 @@ def _active_count() -> int:
 # ---------------------------------------------------------------------------
 #  Сводка по дисциплинам (расширенная)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_discipline_summary() -> pd.DataFrame:
     """
     Сводка по дисциплинам.
@@ -430,7 +430,7 @@ def _render_discipline_table(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Загрузчики для графиков
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_status_distribution() -> pd.DataFrame:
     """Пирог: все статусы по всей базе."""
     with get_conn() as conn:
@@ -443,7 +443,7 @@ def _load_status_distribution() -> pd.DataFrame:
         """, conn)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_sheet_status_distribution() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""
@@ -466,7 +466,7 @@ def _load_sheet_status_distribution() -> pd.DataFrame:
         """, conn)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_top_complexes(limit: int = 15) -> pd.DataFrame:
     """
     Топ комплектов по ПРОСРОЧКАМ АТП ТЛП.
@@ -626,15 +626,10 @@ def render():
     st.caption(
         "Главная витрина проекта. Оперативные цифры синхронизированы "
         "с дашбордом через единый источник — активные замечания "
-        "из `_load_all_categorized`."
+        "из всех выданных."
     )
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="ov_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     _render_kpi()
     st.divider()

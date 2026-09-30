@@ -90,12 +90,7 @@ def render():
     st.header("📜 Логи и история")
     st.caption("Журнал операций синхронизации и история изменений категорий.")
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="logs_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     limit = st.slider("Сколько последних записей показать",
                       min_value=50, max_value=5000,

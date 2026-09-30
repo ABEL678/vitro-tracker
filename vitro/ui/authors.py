@@ -79,7 +79,7 @@ def _add_prefix(raw_value):
 # ---------------------------------------------------------------------------
 #  Единый источник активных
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
     """Активные замечания из _load_all_categorized (без abandoned)."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -224,7 +224,7 @@ def _render_kpi(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Агрегация по авторам (активные, из единого источника)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_authors(disciplines: tuple = (), sections: tuple = (),
                    kits: tuple = ()) -> pd.DataFrame:
     """Сводка по авторам — только активные замечания."""
@@ -297,7 +297,7 @@ def _load_authors(disciplines: tuple = (), sections: tuple = (),
 # ---------------------------------------------------------------------------
 #  Метрики сроков по авторам (только активные)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_author_timing() -> pd.DataFrame:
     """
     Сроки по авторам — только активные замечания.
@@ -381,7 +381,7 @@ def _load_author_timing() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Разбивка автора по дисциплинам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_author_by_discipline(author: str) -> pd.DataFrame:
     """Разбивка замечаний автора по дисциплинам (активные)."""
     active = _load_active_df()
@@ -416,7 +416,7 @@ def _load_author_by_discipline(author: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Замечания автора (полный список с 8 категориями)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_author_comments(author: str) -> pd.DataFrame:
     """Все замечания автора (включая архив, закрытые — для полноты)."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -448,7 +448,7 @@ def _load_author_comments(author: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Просрочки заказчика по автору (его замечания, мы ответили, он тянет)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_author_overdue(author: str) -> pd.DataFrame:
     """
     Просрочки РАССМОТРЕНИЯ заказчиком по замечаниям автора.
@@ -1014,7 +1014,7 @@ def _render_drilldown(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Загрузка ожидающих заказчика
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_waiting_review(disciplines=None, kits=None,
                           sections=None, authors=None) -> pd.DataFrame:
     """Замечания «Выполнено» из единого источника."""
@@ -1103,7 +1103,8 @@ def _render_waiting_review():
         with c1:
             sel_disc_labels = st.multiselect(
                 "Дисциплина", options=list(disc_options.values()),
-                placeholder="Все дисциплины", key="wait_disc")
+                placeholder="Все дисциплины", key="wait_disc",
+                on_change=lambda: st.rerun(scope="fragment"))
             sel_disc = [c for c, l in disc_options.items()
                          if l in sel_disc_labels]
         section_options = _load_section_options(
@@ -1112,7 +1113,8 @@ def _render_waiting_review():
             if section_options:
                 sel_section_labels = st.multiselect(
                     "Раздел", options=list(section_options.values()),
-                    placeholder="Все разделы", key="wait_section")
+                    placeholder="Все разделы", key="wait_section",
+                on_change=lambda: st.rerun(scope="fragment"))
                 sel_section = [c for c, l in section_options.items()
                                 if l in sel_section_labels]
             else:
@@ -1126,7 +1128,8 @@ def _render_waiting_review():
         with c3:
             sel_kit_labels = st.multiselect(
                 "Комплект", options=list(kit_options.values()),
-                placeholder="Все комплекты", key="wait_kit")
+                placeholder="Все комплекты", key="wait_kit",
+                on_change=lambda: st.rerun(scope="fragment"))
             sel_kit = [c for c, l in kit_options.items()
                         if l in sel_kit_labels]
         with c4:
@@ -1458,9 +1461,10 @@ def _render_analytics_tab():
     with c1:
         sel_disc_labels = st.multiselect(
             "Дисциплина", options=list(disc_options.values()),
-            placeholder="Все дисциплины", key="authors_disc")
+            placeholder="Все дисциплины", key="authors_disc",
+            on_change=lambda: st.rerun(scope="fragment"))
         sel_disc = [c for c, l in disc_options.items()
-                     if l in sel_disc_labels]
+                    if l in sel_disc_labels]
 
     section_options = _load_section_options(
         tuple(sel_disc) if sel_disc else ())
@@ -1469,7 +1473,8 @@ def _render_analytics_tab():
         if section_options:
             sel_section_labels = st.multiselect(
                 "Раздел", options=list(section_options.values()),
-                placeholder="Все разделы", key="authors_section")
+                placeholder="Все разделы", key="authors_section",
+                on_change=lambda: st.rerun(scope="fragment"))
             sel_section = [c for c, l in section_options.items()
                             if l in sel_section_labels]
         else:
@@ -1485,7 +1490,8 @@ def _render_analytics_tab():
     with c3:
         sel_kit_labels = st.multiselect(
             "Комплект", options=list(kit_options.values()),
-            placeholder="Все комплекты", key="authors_kit")
+            placeholder="Все комплекты", key="authors_kit",
+            on_change=lambda: st.rerun(scope="fragment"))
         sel_kit = [c for c, l in kit_options.items()
                     if l in sel_kit_labels]
 

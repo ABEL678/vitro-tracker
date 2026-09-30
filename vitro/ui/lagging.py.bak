@@ -39,7 +39,7 @@ def _load_discipline_options() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 #  Единый источник активных
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
     """Активные замечания из _load_all_categorized (без abandoned)."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -52,7 +52,7 @@ def _load_active_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Сводка по комплектам (из единого источника + листы)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_complex_stats(disciplines: tuple = ()) -> pd.DataFrame:
     """
     Возвращает по каждому комплекту:
@@ -331,7 +331,7 @@ def _render_low_pct(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Таб 2: По просрочкам АТП ТЛП
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_overdue_by_complex(disciplines: tuple = ()) -> pd.DataFrame:
     """Топ комплектов по количеству просрочек АТП ТЛП."""
     active = _load_active_df()
@@ -477,7 +477,7 @@ def _render_overdue(df_stats: pd.DataFrame,
 # ---------------------------------------------------------------------------
 #  Таб 3: По ожиданию заказчика
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_waiting_by_complex(disciplines: tuple = ()) -> pd.DataFrame:
     """Топ комплектов по количеству замечаний, ждущих заказчика."""
     active = _load_active_df()
@@ -617,7 +617,7 @@ def _render_waiting(df_stats: pd.DataFrame,
 # ---------------------------------------------------------------------------
 #  Таб 4: Детали комплекта
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_complex_details(complex_code: str) -> pd.DataFrame:
     """Замечания комплекта с привязкой к категориям из _load_all_categorized."""
     from vitro.ui.deadlines import _load_all_categorized

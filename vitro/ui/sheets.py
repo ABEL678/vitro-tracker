@@ -14,6 +14,7 @@
 """
 
 import io
+import time
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -88,7 +89,7 @@ def _parse_date_safe(value) -> date | None:
 # ---------------------------------------------------------------------------
 #  Единый источник активных замечаний
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
     """Активные замечания из deadlines._load_all_categorized."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -151,7 +152,7 @@ def _normalize_status(raw) -> str:
 # ---------------------------------------------------------------------------
 #  Загрузка всех листов
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_all_sheets() -> pd.DataFrame:
     """
     Возвращает все листы, агрегированные по нормализованному leaf.
@@ -159,6 +160,9 @@ def _load_all_sheets() -> pd.DataFrame:
     Использует `clean_leaf_key` из vitro.text_utils, потому что
     этот запрос идёт НАПРЯМУЮ к таблице documents (не через deadlines).
     """
+
+    t0 = time.time()
+
     from vitro.text_utils import clean_leaf_key
 
     with get_conn() as conn:
@@ -219,6 +223,8 @@ def _load_all_sheets() -> pd.DataFrame:
             "sheet_number": data["sheet_number"],
         })
 
+    t1 = time.time()
+    print(f"[TIMING] _load_all_sheets: {t1 - t0:.1f} сек")
     return pd.DataFrame(result)
 
 
@@ -241,7 +247,7 @@ def _row_to_dict(r) -> dict:
 # ---------------------------------------------------------------------------
 #  Активные замечания по листам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_by_sheet() -> pd.DataFrame:
     """Активные замечания, сгруппированные по листу."""
     active = _load_active_df()
@@ -695,7 +701,7 @@ def _render_blockers(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Комплекты в зоне риска (2 топа)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_complex_stats(df_sheets: pd.DataFrame) -> pd.DataFrame:
     """
     Сводка по комплектам: листы по группам + активные замечания + просрочки.
@@ -1300,12 +1306,7 @@ def render():
         "синхронизировано с дашбордом."
     )
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="sheets_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     # ---- Фильтр по дисциплине ----
     disc_options = _load_discipline_options()

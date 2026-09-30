@@ -183,7 +183,7 @@ def _load_kit_options(disciplines: tuple[str, ...] = (),
 # ---------------------------------------------------------------------------
 #  Единый срез активных замечаний (с категориями)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
     """
     Возвращает активные замечания из `_load_all_categorized`.
@@ -211,7 +211,7 @@ def _load_active_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Прогресс категоризации (по активным)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_categorization_progress() -> dict:
     """
     Прогресс категоризации — ТОЛЬКО по активным.
@@ -254,7 +254,7 @@ def _load_categorization_progress() -> dict:
 # ---------------------------------------------------------------------------
 #  Распределение по 4 категориям (среди активных)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_overall_distribution() -> pd.DataFrame:
     """Распределение по 4 категориям + Без категории (только активные)."""
     active = _load_active_df()
@@ -282,7 +282,7 @@ def _load_overall_distribution() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Кросс-таблица «4 категории × 5 статусов»
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_category_by_status() -> pd.DataFrame:
     """
     Кросс-таблица: строки — 4 категории (+ Без категории + Итого),
@@ -329,7 +329,7 @@ def _load_category_by_status() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Распределение по дисциплинам (активные)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_by_discipline() -> pd.DataFrame:
     """Стек-бар: 4 категории по дисциплинам (только активные)."""
     active = _load_active_df()
@@ -349,7 +349,7 @@ def _load_by_discipline() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  По авторам (активные)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_by_author(limit: int = 30) -> pd.DataFrame:
     """Сводная по авторам: всего + по 4 категориям + без категории."""
     active = _load_active_df()
@@ -395,7 +395,7 @@ def _load_by_author(limit: int = 30) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Где нужна работа — топ комплектов по некатегоризированным (активные)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_top_uncategorized(limit: int = 20) -> pd.DataFrame:
     """
     Топ комплектов, где больше всего НЕкатегоризированных замечаний
@@ -431,7 +431,7 @@ def _load_top_uncategorized(limit: int = 20) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Блок «Учтено (A/B)» — разбивка по 4 категориям
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_closed_by_doc() -> dict:
     """
     Учтённые замечания (лист A/B). Возвращает:
@@ -485,7 +485,7 @@ def _load_closed_by_doc() -> dict:
 # ---------------------------------------------------------------------------
 #  Активность специалистов (без изменений)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_user_activity() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""

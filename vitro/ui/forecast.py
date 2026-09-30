@@ -26,7 +26,7 @@ from vitro.ui._utils import download_plotly
 # ---------------------------------------------------------------------------
 #  Единый источник активных
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
     """Активные замечания из _load_all_categorized (без abandoned)."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -39,7 +39,7 @@ def _load_active_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Загрузка данных + темпы
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_data() -> dict:
     """
     Собирает данные для прогноза:
@@ -879,7 +879,7 @@ def _render_by_discipline(data: dict):
 # ---------------------------------------------------------------------------
 #  Комплекты в зоне риска
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_risk_complexes() -> pd.DataFrame:
     """Комплекты с наибольшим объёмом просрочек АТП ТЛП."""
     active = _load_active_df()
@@ -1020,12 +1020,7 @@ def render():
         "Данные синхронизированы с дашбордом."
     )
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="fc_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     with st.spinner("Загрузка данных..."):
         data = _load_data()

@@ -64,7 +64,7 @@ def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 #  Единый источник активных замечаний
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
     """Активные замечания из deadlines._load_all_categorized."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -77,7 +77,7 @@ def _load_active_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Таблица комплектов
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_complex_table(disciplines: tuple = (),
                          sections: tuple = ()) -> pd.DataFrame:
     """
@@ -738,7 +738,7 @@ def _excel_col_letter(col_idx: int) -> str:
 # ---------------------------------------------------------------------------
 #  Drill-down: детали комплекта
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_complex_details(complex_code: str) -> pd.DataFrame:
     """Все замечания по комплекту (из _load_all_categorized)."""
     df = _load_all_categorized()

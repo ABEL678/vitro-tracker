@@ -25,6 +25,9 @@ from vitro.ui import (
     authors, search, dynamics, revisions, forecast, export, logs, admin,
 )
 
+import time
+_t_start = time.time()
+
 # ---------------------------------------------------------------------------
 #  Настройки страницы
 # ---------------------------------------------------------------------------
@@ -36,6 +39,10 @@ st.set_page_config(
 )
 
 init_db()
+t1 = time.time()
+print(f"[TIMING] app.py: imports + set_page_config: {t1 - _t_start:.2f} сек")
+t2 = time.time()
+print(f"[TIMING] app.py: init_db: {t2 - t1:.2f} сек")
 
 # ---------------------------------------------------------------------------
 #  Логотип в base64
@@ -278,6 +285,9 @@ except AttributeError:
 # ---------------------------------------------------------------------------
 #  Вкладки (14 штук)
 # ---------------------------------------------------------------------------
+t3 = time.time()
+print(f"[TIMING] app.py: header/footer: {t3 - t2:.2f} сек")
+
 tabs = st.tabs([
     "📊 Дашборд РП",     # 0
     "📈 Обзор",          # 1
@@ -295,17 +305,79 @@ tabs = st.tabs([
     "⚙️ Управление",     # 13
 ])
 
-with tabs[0]:  dashboard.render()
-with tabs[1]:  overview.render()
-with tabs[2]:  complexes.render()
-with tabs[3]:  sheets.render()
-with tabs[4]:  categories.render()
-with tabs[5]:  deadlines.render()
-with tabs[6]:  authors.render()
-with tabs[7]:  search.render()
-with tabs[8]:  dynamics.render()
-with tabs[9]:  revisions.render()
-with tabs[10]: forecast.render()
-with tabs[11]: export.render()
-with tabs[12]: logs.render()
-with tabs[13]: admin.render()
+# ---------------------------------------------------------------------------
+#  Вкладки обёрнуты в @st.fragment там, где нет каскадных фильтров
+#  (там, где каскады — оставлены без @st.fragment, чтобы не ломать логику)
+# ---------------------------------------------------------------------------
+
+@st.fragment
+def _tab_dashboard():
+    dashboard.render()
+
+@st.fragment
+def _tab_overview():
+    overview.render()
+
+@st.fragment
+def _tab_complexes():
+    complexes.render()
+
+@st.fragment
+def _tab_sheets():
+    sheets.render()
+
+@st.fragment
+def _tab_categories():
+    categories.render()
+
+@st.fragment
+def _tab_deadlines():
+    deadlines.render()
+
+@st.fragment
+def _tab_authors():
+    authors.render()
+
+@st.fragment
+def _tab_search():
+    search.render()
+
+@st.fragment
+def _tab_dynamics():
+    dynamics.render()
+
+@st.fragment
+def _tab_revisions():
+    revisions.render()
+
+@st.fragment
+def _tab_forecast():
+    forecast.render()
+
+@st.fragment
+def _tab_export():
+    export.render()
+
+@st.fragment
+def _tab_logs():
+    logs.render()
+
+@st.fragment
+def _tab_admin():
+    admin.render()
+
+
+with tabs[0]:  _tab_dashboard()
+with tabs[1]:  _tab_overview()
+with tabs[2]:  _tab_complexes()
+with tabs[3]:  _tab_sheets()
+with tabs[4]:  _tab_categories()
+with tabs[5]:  _tab_deadlines()
+with tabs[6]:  _tab_authors()
+with tabs[7]:  _tab_search()
+with tabs[8]:  _tab_dynamics()
+with tabs[9]:  _tab_revisions()
+with tabs[10]: _tab_forecast()
+with tabs[11]: _tab_export()
+with tabs[12]: _tab_logs()
+with tabs[13]: _tab_admin()

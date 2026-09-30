@@ -30,7 +30,7 @@ from vitro.pdf_builder import draw_header_footer
 # ---------------------------------------------------------------------------
 #  Загрузка всех данных одним запросом
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_full_state() -> dict:
     """
     Возвращает все данные для дашборда.
@@ -428,7 +428,8 @@ def _render_top_problems(data: dict):
             )
             fig.update_traces(textposition="outside")
             fig.update_layout(height=max(300, 30 * len(top)))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True,
+                            key="dash_top_complexes")
             download_plotly(fig, "Дашборд_топ_комплектов", "dash_top_cx")
 
     # --- Авторы, чьи замечания ждут заказчика ---
@@ -447,7 +448,8 @@ def _render_top_problems(data: dict):
             )
             fig.update_traces(textposition="outside")
             fig.update_layout(height=max(300, 30 * len(top_auth)))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True,
+                            key="dash_top_authors")
             download_plotly(fig, "Дашборд_топ_авторов", "dash_top_auth")
 
 
@@ -546,7 +548,8 @@ def _render_dynamics(data: dict):
         legend=dict(orientation="h", yanchor="bottom",
                     y=1.02, xanchor="right", x=1),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True,
+                    key="dash_dynamics_flows")
     download_plotly(fig, "Дашборд_потоки", "dash_flows",
                     width=1400, height=600)
 
@@ -574,7 +577,8 @@ def _render_dynamics(data: dict):
               "Красное — задолженность растёт",
         height=350, xaxis_tickangle=-45, showlegend=False,
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, use_container_width=True,
+                    key="dash_dynamics_delta")
     download_plotly(fig2, "Дашборд_отставание", "dash_delta",
                     width=1400, height=500)
 
@@ -599,7 +603,8 @@ def _render_dynamics(data: dict):
         yaxis_title="Незакрытых замечаний",
         height=350, xaxis_tickangle=-45,
     )
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, use_container_width=True,
+                    key="dash_dynamics_cumulative")
     download_plotly(fig3, "Дашборд_накопление", "dash_cum",
                     width=1400, height=500)
 
@@ -1202,12 +1207,7 @@ def render():
         "действия. Обновляется каждые 5 минут."
     )
 
-    col1, col2 = st.columns([4, 1])
-    with col2:
-        if st.button("🔄 Обновить", key="dash_refresh",
-                     use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
+    # Кнопка «Обновить» убрана — данные из кэша (TTL 1 час).
 
     with st.spinner("Загрузка данных..."):
         data = _load_full_state()
