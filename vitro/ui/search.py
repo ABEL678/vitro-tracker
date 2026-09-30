@@ -113,6 +113,7 @@ def _load_author_options() -> list[str]:
 def _search_comments(query: str,
                      disciplines=(), sections=(), kits=(),
                      statuses=(), authors=(), categories=(),
+                     complex_mask: str = "",
                      limit: int = 2000) -> pd.DataFrame:
     """
     Поиск замечаний по подстроке с фильтрами.
@@ -150,6 +151,11 @@ def _search_comments(query: str,
     if kits:
         q += f" AND d.complex IN ({','.join('?' * len(kits))})"
         params += list(kits)
+
+    # Фильтр по маске комплекта (LIKE)
+    if complex_mask and complex_mask.strip():
+        q += " AND LOWER(d.complex) LIKE LOWER(?)"
+        params.append(f"%{complex_mask.strip()}%")
     if statuses:
         q += f" AND c.status IN ({','.join('?' * len(statuses))})"
         params += list(statuses)
@@ -287,6 +293,15 @@ def render():
             sel_kit = [code for code, label in kit_options.items()
                        if label in sel_kit_labels]
 
+        # ---- Строка маски комплекта ----
+        complex_mask = st.text_input(
+            "Маска комплекта (поиск по подстроке)",
+            placeholder="например: -С- для стилобата, КЖ для конструкций",
+            key="search_complex_mask",
+            help="Показывает только комплекты, в шифре которых есть эта "
+                 "подстрока. Регистронезависимо.",
+        )
+
         c4, c5, c6 = st.columns(3)
         with c4:
             sel_status = st.multiselect(
@@ -331,6 +346,7 @@ def render():
             statuses=tuple(sel_status) if sel_status else (),
             authors=tuple(sel_author) if sel_author else (),
             categories=tuple(sel_category) if sel_category else (),
+            complex_mask=complex_mask,  # ← НОВОЕ
             limit=int(limit),
         )
 
@@ -366,7 +382,8 @@ def render():
     st.divider()
     c1, c2 = st.columns([1, 3])
     with c1:
-        if st.button("📥 Подготовить выгрузку", use_container_width=True):
+        if st.button("📥 Подготовить выгрузку", use_container_width=True,
+                     key="search_prepare_export"):
             xlsx_bytes = _export_to_excel(df, query)
             st.session_state["search_export_bytes"] = xlsx_bytes
             st.session_state["search_export_filename"] = (
@@ -381,8 +398,10 @@ def render():
                 data=st.session_state["search_export_bytes"],
                 file_name=st.session_state.get(
                     "search_export_filename", "search.xlsx"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                mime=("application/vnd.openxmlformats-officedocument"
+                      ".spreadsheetml.sheet"),
                 use_container_width=True,
+                key="search_download_export",
             )
 
     # --- Подсказка ---
