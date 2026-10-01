@@ -12,8 +12,8 @@
   + Разрез по дисциплинам / разделам / комплектам.
 
 Источник: `_load_all_categorized` из deadlines.py (единый).
-Фильтры общие, каскадные: дисциплина → раздел → комплект.
-Опционально: только стилобат (`-С-` в шифре комплекта).
+Фильтры общие, каскадные: дисциплина → раздел → комплект
++ расположение (4-й блок шифра).
 """
 
 import pandas as pd
@@ -57,6 +57,17 @@ STATUS_IN_WORK = "Принято в работу"
 STATUS_REJECTED = "Не принято"
 STATUS_DISCUSSION = "К обсуждению"
 STATUS_DONE = "Выполнено"
+
+# 4-й блок шифра комплекта
+BLOCK_OPTIONS = {
+    "Корпус 1":                    "1",
+    "Корпус 2":                    "2",
+    "Общие":                       "0",
+    "Стилобат":                    "С",
+    "Газовая котельная":           "ГК",
+    "Генплан":                     "ГП",
+    "Автомобильные дороги (УДС)":  "А",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -132,13 +143,39 @@ def _load_kit_options(disciplines: tuple = (),
 
 
 # ---------------------------------------------------------------------------
+#  4-й блок шифра — утилиты
+# ---------------------------------------------------------------------------
+def _extract_4th_block(complex_code) -> str:
+    """
+    Извлекает 4-й блок шифра комплекта.
+    'АТ-РД-АПТ-1-00'     → '1'
+    'АТ-РД-КЖ.ГИ1-С-00'  → 'С'
+    """
+    if not complex_code:
+        return ""
+    parts = str(complex_code).split("-")
+    if len(parts) >= 4:
+        return parts[3].strip().upper()
+    return ""
+
+
+def _filter_by_blocks(df: pd.DataFrame,
+                       block_codes: tuple = ()) -> pd.DataFrame:
+    """Фильтрует DataFrame по 4-му блоку шифра комплекта."""
+    if df.empty or not block_codes:
+        return df
+    blocks = df["complex"].apply(_extract_4th_block)
+    return df[blocks.isin(block_codes)]
+
+
+# ---------------------------------------------------------------------------
 #  Фильтрация
 # ---------------------------------------------------------------------------
 def _filter_active(df: pd.DataFrame,
                     disciplines: tuple = (),
                     sections: tuple = (),
                     kits: tuple = (),
-                    stilobat_only: bool = False) -> pd.DataFrame:
+                    block_codes: tuple = ()) -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -148,11 +185,8 @@ def _filter_active(df: pd.DataFrame,
         out = out[out["section"].isin(sections)]
     if kits:
         out = out[out["complex"].isin(kits)]
-    if stilobat_only:
-        out = out[
-            out["complex"].astype(str)
-            .str.contains("-С-", case=False, na=False, regex=False)
-        ]
+    if block_codes:
+        out = _filter_by_blocks(out, block_codes)
     return out
 
 
@@ -160,7 +194,7 @@ def _filter_documents(df: pd.DataFrame,
                        disciplines: tuple = (),
                        sections: tuple = (),
                        kits: tuple = (),
-                       stilobat_only: bool = False) -> pd.DataFrame:
+                       block_codes: tuple = ()) -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -170,11 +204,8 @@ def _filter_documents(df: pd.DataFrame,
         out = out[out["section"].isin(sections)]
     if kits:
         out = out[out["complex"].isin(kits)]
-    if stilobat_only:
-        out = out[
-            out["complex"].astype(str)
-            .str.contains("-С-", case=False, na=False, regex=False)
-        ]
+    if block_codes:
+        out = _filter_by_blocks(out, block_codes)
     return out
 
 
@@ -198,7 +229,7 @@ def _load_documents() -> pd.DataFrame:
 def _load_scale(disciplines: tuple = (),
                  sections: tuple = (),
                  kits: tuple = (),
-                 stilobat_only: bool = False) -> dict:
+                 block_codes: tuple = ()) -> dict:
     q = """
         SELECT
             COUNT(*) AS total_all,
@@ -222,8 +253,17 @@ def _load_scale(disciplines: tuple = (),
     if kits:
         q += f" AND d.complex IN ({','.join('?' * len(kits))})"
         params += list(kits)
-    if stilobat_only:
-        q += " AND (d.complex LIKE '%-С-%' OR d.complex LIKE '%-с-%')"
+    if block_codes:
+        # 4-й блок — считаем в Python, но здесь SQL.
+        # Используем SUBSTR + INSTR: 4-й блок = часть между 3-м и 4-м дефисом.
+        # Проще: фильтруем по LIKE на позиции блока.
+        # Так как block_codes — маленькие строки, собираем OR LIKE.
+        # Пример: 'АТ-РД-АПТ-1-00' — блок '1' находится как '-1-' в строке.
+        # Используем паттерн '%-{code}-%'.
+        ors = []
+        for bc in block_codes:
+            ors.append(f"d.complex LIKE '%-{bc}-%'")
+        q += " AND (" + " OR ".join(ors) + ")"
 
     with get_conn() as conn:
         row = conn.execute(q, tuple(params)).fetchone()
@@ -331,7 +371,6 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     n_loading = int(statuses.isin(
         ["НА КОРРЕКТИРОВКЕ", "РАЗМЕЩЕНО"]).sum())
 
-    # % готовых = (A + B) / (Всего − И − Аннулировано)
     denominator = total - n_i - n_annulled
     pct_ab = (round((n_a + n_b) / denominator * 100, 1)
               if denominator > 0 else 0.0)
@@ -404,7 +443,6 @@ def _render_ours_section(active_df: pd.DataFrame) -> None:
 
     n_ours_total = n_new + n_in_work + n_rejected + n_disc
 
-    # Просрочено = overdue + abandoned (по флагам)
     flags = clean["category_flag"]
     mask_overdue = flags.isin(OURS_OVERDUE_FLAGS)
     mask_abandoned = flags == ABANDONED_FLAG
@@ -477,7 +515,6 @@ def _render_customer_section(active_df: pd.DataFrame) -> None:
     n_a_total = int(mask_a.sum())
     n_annul_total = int(mask_annul.sum())
 
-    # «Выполнено» без A и аннул.
     mask_done = active_df["status"] == STATUS_DONE
     mask_done_clean = mask_done & ~mask_special
     n_done_clean = int(mask_done_clean.sum())
@@ -724,42 +761,42 @@ def _build_summary_rows(group_col: str,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_summary_by_discipline(
     disciplines: tuple = (), sections: tuple = (),
-    kits: tuple = (), stilobat_only: bool = False,
+    kits: tuple = (), block_codes: tuple = (),
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             stilobat_only)
+                             block_codes)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              stilobat_only)
+                              block_codes)
     return _build_summary_rows("discipline", active, docs)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_summary_by_section(
     disciplines: tuple = (), sections: tuple = (),
-    kits: tuple = (), stilobat_only: bool = False,
+    kits: tuple = (), block_codes: tuple = (),
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             stilobat_only)
+                             block_codes)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              stilobat_only)
+                              block_codes)
     return _build_summary_rows("section", active, docs)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_summary_by_complex(
     disciplines: tuple = (), sections: tuple = (),
-    kits: tuple = (), stilobat_only: bool = False,
+    kits: tuple = (), block_codes: tuple = (),
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             stilobat_only)
+                             block_codes)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              stilobat_only)
+                              block_codes)
     return _build_summary_rows("complex", active, docs)
 
 
@@ -938,12 +975,17 @@ def render():
                 if label in sel_kit_labels
             ]
 
-        stilobat_only = st.checkbox(
-            "Только стилобат (признак «-С-» в шифре)",
-            value=False,
-            key="sum_stilobat",
-            help="Показать только комплекты, в шифре которых есть "
-                 "сегмент «-С-».",
+        sel_blocks = st.multiselect(
+            "Расположение (4-й блок шифра)",
+            options=list(BLOCK_OPTIONS.keys()),
+            placeholder="Все комплекты",
+            key="sum_blocks",
+            help="Фильтр по 4-му блоку шифра комплекта. "
+                 "Можно выбрать несколько. "
+                 "Например: «Корпус 1» + «Стилобат» — показать оба.",
+        )
+        block_codes = tuple(
+            BLOCK_OPTIONS[b] for b in sel_blocks
         )
 
     disc_t = tuple(sel_disc)
@@ -953,13 +995,12 @@ def render():
     with st.spinner("Загрузка данных..."):
         active_all = _load_all_categorized()
         active_filtered = _filter_active(
-            active_all, disc_t, sect_t, kit_t, stilobat_only)
+            active_all, disc_t, sect_t, kit_t, block_codes)
         docs_all = _load_documents()
         docs_filtered = _filter_documents(
-            docs_all, disc_t, sect_t, kit_t, stilobat_only)
-        scale = _load_scale(disc_t, sect_t, kit_t, stilobat_only)
+            docs_all, disc_t, sect_t, kit_t, block_codes)
+        scale = _load_scale(disc_t, sect_t, kit_t, block_codes)
 
-    # «Активных» = выгрузка из Витро (5 статусов)
     active_count = len(active_filtered)
 
     _render_scale_section(scale, active_count)
@@ -987,15 +1028,15 @@ def render():
 
     with tab_disc:
         df = _load_summary_by_discipline(
-            disc_t, sect_t, kit_t, stilobat_only)
+            disc_t, sect_t, kit_t, block_codes)
         _render_summary_table(df, "Код", "discipline")
 
     with tab_sect:
         df = _load_summary_by_section(
-            disc_t, sect_t, kit_t, stilobat_only)
+            disc_t, sect_t, kit_t, block_codes)
         _render_summary_table(df, "Раздел", "section")
 
     with tab_cx:
         df = _load_summary_by_complex(
-            disc_t, sect_t, kit_t, stilobat_only)
+            disc_t, sect_t, kit_t, block_codes)
         _render_summary_table(df, "Комплект", "complex")
