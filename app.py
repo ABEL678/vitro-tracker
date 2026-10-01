@@ -64,8 +64,7 @@ def ask_user_name():
     """Модальное окно для ввода имени."""
     st.write(
         "Имя сохраняется вместе с категориями замечаний. "
-        "Оно будет отображаться в хедере и футере."
-    )
+            )
     name = st.text_input(
         "Фамилия и имя",
         value=st.session_state.get("user", "")
@@ -78,7 +77,8 @@ def ask_user_name():
 
     with col1:
         if st.button("💾 Сохранить", type="primary",
-                     use_container_width=True):
+                     use_container_width=True,
+                     key="dialog_save_btn"):
             if name.strip():
                 st.session_state["user"] = name.strip()
                 st.session_state["user_confirmed"] = True
@@ -87,22 +87,28 @@ def ask_user_name():
                 st.error("Введите имя")
 
     with col2:
-        if st.button("Отмена", use_container_width=True):
+        if st.button("Отмена", use_container_width=True,
+                     key="dialog_cancel_btn"):
             if not st.session_state.get("user"):
                 st.session_state["user"] = "инженер"
             st.session_state["user_confirmed"] = True
             st.rerun()
 
-    # Инициализация session_state
 
-
+# ---------------------------------------------------------------------------
+#  Инициализация session_state
+# ---------------------------------------------------------------------------
 if "user" not in st.session_state:
     st.session_state["user"] = ""
 if "user_confirmed" not in st.session_state:
     st.session_state["user_confirmed"] = False
 
-    # Показываем диалог, если имя ещё не подтверждено
-if not st.session_state.get("user_confirmed"):
+# ---------------------------------------------------------------------------
+#  Показываем диалог ОДИН РАЗ, только если имя ещё не подтверждено
+# ---------------------------------------------------------------------------
+# Флаг user_confirmed НЕ сбрасывается при обычных rerun.
+# Модалка вылезает только если user_confirmed явно False.
+if st.session_state.get("user_confirmed") is not True:
     ask_user_name()
 
 user_label = st.session_state.get("user", "инженер")
@@ -283,101 +289,112 @@ except AttributeError:
     st.markdown(FOOTER_HTML, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-#  Вкладки (14 штук)
+#  Ленивая загрузка вкладок — рендерится только активная
 # ---------------------------------------------------------------------------
 t3 = time.time()
 print(f"[TIMING] app.py: header/footer: {t3 - t2:.2f} сек")
 
-tabs = st.tabs([
-    "📊 Дашборд РП",     # 0
-    "📈 Обзор",          # 1
-    "🏗 Комплекты",      # 2
-    "📄 Листы",          # 3
-    "🏷 Категории",      # 4
-    "⏰ Сроки",          # 5
-    "👤 Авторы",         # 6
-    "🔍 Поиск",          # 7
-    "📈 Динамика",       # 8
-    "🔁 Ревизии",        # 9
-    "🔮 Прогноз",        # 10
-    "📄 Экспорт",        # 11
-    "📜 Логи",           # 12
-    "⚙️ Управление",     # 13
-])
+# ---- Список вкладок ----
+_TABS = [
+    "📊 Дашборд РП",
+    "📈 Обзор",
+    "🏗 Комплекты",
+    "📄 Листы",
+    "🏷 Категории",
+    "⏰ Сроки",
+    "👤 Авторы",
+    "🔍 Поиск",
+    "📈 Динамика",
+    "🔁 Ревизии",
+    "🔮 Прогноз",
+    "📄 Экспорт",
+    "📜 Логи",
+    "⚙️ Управление",
+]
 
-# ---------------------------------------------------------------------------
-#  Вкладки обёрнуты в @st.fragment там, где нет каскадных фильтров
-#  (там, где каскады — оставлены без @st.fragment, чтобы не ломать логику)
-# ---------------------------------------------------------------------------
+# ---- Активная вкладка через session_state ----
+if "active_tab" not in st.session_state:
+    st.session_state["active_tab"] = _TABS[0]
 
-@st.fragment
-def _tab_dashboard():
+# ---- CSS для стилизации radio как вкладок ----
+st.markdown("""
+<style>
+    /* Стилизация radio-кнопок под вкладки */
+    div[data-testid="stRadio"] > div[role="radiogroup"] {
+        flex-direction: row !important;
+        flex-wrap: wrap !important;
+        gap: 0 !important;
+        border-bottom: 1px solid #d0d0d0 !important;
+        padding: 0 !important;
+        margin-bottom: 12px !important;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] > label {
+        padding: 8px 14px !important;
+        margin: 0 !important;
+        border-bottom: 3px solid transparent !important;
+        cursor: pointer !important;
+        transition: all 0.15s !important;
+        font-size: 0.92rem !important;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] > label:hover {
+        background: #f5f5f5 !important;
+    }
+    div[data-testid="stRadio"] > div[role="radiogroup"] > label[data-checked="true"] {
+        border-bottom-color: #ff4b4b !important;
+        color: #ff4b4b !important;
+        font-weight: 600 !important;
+    }
+    /* Скрываем сами кружки радио */
+    div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child {
+        display: none !important;
+    }
+    /* Делаем весь лейбл кликабельным */
+    div[data-testid="stRadio"] > div[role="radiogroup"] > label > div {
+        cursor: pointer !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ---- Radio как «вкладки» ----
+_active = st.radio(
+    "Вкладка",
+    options=_TABS,
+    index=_TABS.index(st.session_state["active_tab"]),
+    horizontal=True,
+    label_visibility="collapsed",
+    key="tab_selector",
+)
+
+# ---- Обновляем session_state при переключении ----
+if _active != st.session_state["active_tab"]:
+    st.session_state["active_tab"] = _active
+
+# ---- Рендер только активной вкладки ----
+if _active == "📊 Дашборд РП":
     dashboard.render()
-
-@st.fragment
-def _tab_overview():
+elif _active == "📈 Обзор":
     overview.render()
-
-@st.fragment
-def _tab_complexes():
+elif _active == "🏗 Комплекты":
     complexes.render()
-
-@st.fragment
-def _tab_sheets():
+elif _active == "📄 Листы":
     sheets.render()
-
-@st.fragment
-def _tab_categories():
+elif _active == "🏷 Категории":
     categories.render()
-
-@st.fragment
-def _tab_deadlines():
+elif _active == "⏰ Сроки":
     deadlines.render()
-
-@st.fragment
-def _tab_authors():
+elif _active == "👤 Авторы":
     authors.render()
-
-@st.fragment
-def _tab_search():
+elif _active == "🔍 Поиск":
     search.render()
-
-@st.fragment
-def _tab_dynamics():
+elif _active == "📈 Динамика":
     dynamics.render()
-
-@st.fragment
-def _tab_revisions():
+elif _active == "🔁 Ревизии":
     revisions.render()
-
-@st.fragment
-def _tab_forecast():
+elif _active == "🔮 Прогноз":
     forecast.render()
-
-@st.fragment
-def _tab_export():
+elif _active == "📄 Экспорт":
     export.render()
-
-@st.fragment
-def _tab_logs():
+elif _active == "📜 Логи":
     logs.render()
-
-@st.fragment
-def _tab_admin():
+elif _active == "⚙️ Управление":
     admin.render()
-
-
-with tabs[0]:  _tab_dashboard()
-with tabs[1]:  _tab_overview()
-with tabs[2]:  _tab_complexes()
-with tabs[3]:  _tab_sheets()
-with tabs[4]:  _tab_categories()
-with tabs[5]:  _tab_deadlines()
-with tabs[6]:  _tab_authors()
-with tabs[7]:  _tab_search()
-with tabs[8]:  _tab_dynamics()
-with tabs[9]:  _tab_revisions()
-with tabs[10]: _tab_forecast()
-with tabs[11]: _tab_export()
-with tabs[12]: _tab_logs()
-with tabs[13]: _tab_admin()
