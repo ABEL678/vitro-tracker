@@ -90,13 +90,13 @@ STATUS_COLORS = {
 }
 
 SHEET_COLORS = {
-    "A — утверждён":              "#2ca02c",   # зелёный
-    "B — к сдаче":                "#ffdd57",   # жёлтый
-    "C — в работе":               "#ff7f0e",   # оранжевый
-    "И — информационный":         "#e8e8e8",   # почти белый
-    "На согласовании Заказчика":  "#17becf",   # голубой
-    "Готовится к загрузке":       "#9467bd",   # фиолетовый
-    "Аннулировано":               "#7f7f7f",   # серый
+    "A — утверждён":              "#2ca02c",
+    "B — к сдаче":                "#ffdd57",
+    "C — в работе":               "#ff7f0e",
+    "И — информационный":         "#e8e8e8",
+    "На согласовании Заказчика":  "#17becf",
+    "Готовится к загрузке":       "#9467bd",
+    "Аннулировано":               "#7f7f7f",
 }
 
 EMOJI = {
@@ -824,89 +824,55 @@ def _sheet_distribution_from_df(docs_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
-#  Разрез
+#  Разрез: сводная таблица
 # ===========================================================================
 def _build_summary_rows(group_col: str,
-                         active_df: pd.DataFrame,
-                         docs_df: pd.DataFrame) -> pd.DataFrame:
-    if docs_df.empty and active_df.empty:
+                         active_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Сводная таблица для разреза:
+      [группа] | Открытых | Новое | Не принято
+      | К обсуждению | Принято в работу | Выполнено
+
+    Замечания к листам A и к аннулированным — исключены
+    (как в верхних секциях).
+    """
+    if active_df.empty:
         return pd.DataFrame()
 
-    if not docs_df.empty:
-        doc_rows = []
-        for grp, sub in docs_df.groupby(group_col, dropna=True):
-            if not grp:
-                continue
-            total = len(sub)
-            statuses = sub["status"].astype(str).str.strip().str.upper()
-            a = int((statuses == "A").sum())
-            b = int((statuses == "B").sum())
-            c = int((statuses == "C").sum())
-            i = int((statuses == "И").sum())
-            annulled = int((statuses == "АННУЛИРОВАНО").sum())
-            denom = total - i - annulled
-            pct_ab = (round((a + b) / denom * 100, 1)
-                      if denom > 0 else 0.0)
-            doc_rows.append({
-                group_col: grp,
-                "docs_total": total,
-                "doc_a": a, "doc_b": b, "doc_c": c, "doc_i": i,
-                "doc_annulled": annulled,
-                "doc_other": total - a - b - c - i - annulled,
-                "pct_ab": pct_ab,
-            })
-        docs_grp = pd.DataFrame(doc_rows)
-    else:
-        docs_grp = pd.DataFrame()
+    ds = active_df["doc_status"].astype(str).str.strip().str.upper()
+    mask_special = ds.isin([DS_A, DS_ANNULLED])
+    clean = active_df[~mask_special]
 
-    if not active_df.empty:
-        df = active_df.copy()
-        df["Категория"] = (
-            df["category"].fillna("Без категории")
-            .replace("", "Без категории")
-        )
-        rows = []
-        for grp, sub in df.groupby(group_col, dropna=True):
-            if not grp:
-                continue
-            sdss = sub["doc_status"].astype(str).str.strip().str.upper()
-            smask_special = sdss.isin([DS_A, DS_ANNULLED])
-            sflags = sub["category_flag"]
-            sstatus = sub["status"]
-            cat_counts = sub["Категория"].value_counts()
-            rows.append({
-                group_col: grp,
-                "n_new": int(((sstatus == STATUS_NEW)
-                              & ~smask_special).sum()),
-                "n_in_work": int(((sstatus == STATUS_IN_WORK)
-                                  & ~smask_special).sum()),
-                "n_rejected": int(((sstatus == STATUS_REJECTED)
-                                   & ~smask_special).sum()),
-                "n_discussion": int(((sstatus == STATUS_DISCUSSION)
-                                     & ~smask_special).sum()),
-                "ours_overdue": int((
-                    (sflags.isin(OURS_OVERDUE_FLAGS)
-                     | (sflags == ABANDONED_FLAG))
-                    & ~smask_special
-                ).sum()),
-                "cat_1": int(cat_counts.get(CAT_1, 0)),
-                "cat_2": int(cat_counts.get(CAT_2, 0)),
-                "cat_3": int(cat_counts.get(CAT_3, 0)),
-                "cat_4": int(cat_counts.get(CAT_4, 0)),
-                "cat_none": int(cat_counts.get("Без категории", 0)),
-            })
-        active_grp = pd.DataFrame(rows)
-    else:
-        active_grp = pd.DataFrame()
-
-    if docs_grp.empty and active_grp.empty:
+    if clean.empty:
         return pd.DataFrame()
-    if docs_grp.empty:
-        result = active_grp
-    elif active_grp.empty:
-        result = docs_grp
-    else:
-        result = docs_grp.merge(active_grp, on=group_col, how="outer")
+
+    statuses_order = [
+        STATUS_NEW, STATUS_REJECTED, STATUS_DISCUSSION,
+        STATUS_IN_WORK, STATUS_DONE,
+    ]
+
+    rows = []
+    for grp, sub in clean.groupby(group_col, dropna=True):
+        if not grp:
+            continue
+
+        row = {group_col: grp}
+        sstatus = sub["status"]
+
+        counts = {}
+        for st in statuses_order:
+            counts[st] = int((sstatus == st).sum())
+
+        row["open_total"] = sum(counts.values())
+        for st in statuses_order:
+            row[st] = counts[st]
+
+        rows.append(row)
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
     result = result.fillna(0)
 
     group_col_names = {
@@ -926,10 +892,7 @@ def _load_summary_by_discipline(disciplines: tuple = (),
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
                              block_codes)
-    docs = _load_documents()
-    docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes)
-    return _build_summary_rows("discipline", active, docs)
+    return _build_summary_rows("discipline", active)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -940,10 +903,7 @@ def _load_summary_by_section(disciplines: tuple = (),
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
                              block_codes)
-    docs = _load_documents()
-    docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes)
-    return _build_summary_rows("section", active, docs)
+    return _build_summary_rows("section", active)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -954,97 +914,96 @@ def _load_summary_by_complex(disciplines: tuple = (),
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
                              block_codes)
-    docs = _load_documents()
-    docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes)
-    return _build_summary_rows("complex", active, docs)
+    return _build_summary_rows("complex", active)
 
 
 def _render_summary_table(df: pd.DataFrame,
                             group_label: str,
                             level: str) -> None:
+    """
+    Сводная таблица разреза:
+      Код/Раздел/Комплект | [Наименование] | Открытых | 5 статусов
+      + строка ИТОГО в конце.
+    """
     if df.empty:
         st.info("Нет данных по заданным фильтрам.")
         return
 
     view = df.copy()
+
+    # Наименование (для дисциплин)
     if level == "discipline" and "Код" in view.columns:
         view.insert(
             1, "Наименование",
             view["Код"].map(lambda c: discipline_name(c) if c else ""),
         )
 
+    # Красивые названия колонок с эмодзи
     rename_map = {
-        "n_new":          "Новое",
-        "n_in_work":      "В работе",
-        "n_rejected":     "Не принято",
-        "n_discussion":   "К обсуждению",
-        "ours_overdue":   "Просрочено (>10 р.д.)",
-        "cat_1":          "Принято",
-        "cat_2":          "Формальное",
-        "cat_3":          "Доп.требование",
-        "cat_4":          "Не принято (кат.)",
-        "cat_none":       "Без категории",
-        "docs_total":     "Листов",
-        "doc_a":          "A", "doc_b": "B", "doc_c": "C",
-        "doc_i":          "И",
-        "doc_annulled":   "Аннул.",
-        "doc_other":      "Прочие",
-        "pct_ab":         "% A+B",
+        "open_total":       "Открытых",
+        STATUS_NEW:         f"{EMOJI['blue']} Новое",
+        STATUS_REJECTED:    f"{EMOJI['red']} Не принято",
+        STATUS_DISCUSSION:  f"{EMOJI['yellow']} К обсуждению",
+        STATUS_IN_WORK:     f"{EMOJI['globe']} Принято в работу",
+        STATUS_DONE:        f"{EMOJI['green']} Выполнено",
     }
     view = view.rename(columns=rename_map)
 
-    base_order = [group_label]
+    # Порядок колонок
+    cols_order = [group_label]
     if level == "discipline":
-        base_order.append("Наименование")
-    cols_order = base_order + [
-        "Новое", "В работе", "Не принято", "К обсуждению",
-        "Просрочено (>10 р.д.)",
-        "Принято", "Формальное", "Доп.требование",
-        "Не принято (кат.)", "Без категории",
-        "Листов", "A", "B", "C", "И", "Аннул.", "Прочие",
-        "% A+B",
+        cols_order.append("Наименование")
+    cols_order += [
+        "Открытых",
+        f"{EMOJI['blue']} Новое",
+        f"{EMOJI['red']} Не принято",
+        f"{EMOJI['yellow']} К обсуждению",
+        f"{EMOJI['globe']} Принято в работу",
+        f"{EMOJI['green']} Выполнено",
     ]
     cols_order = [c for c in cols_order if c in view.columns]
     view = view[cols_order]
 
-    if "Новое" in view.columns:
-        view = view.sort_values("Новое", ascending=False)
+    # Сортировка по «Открытых» (убывание)
+    if "Открытых" in view.columns:
+        view = view.sort_values("Открытых", ascending=False)
 
-    st.dataframe(
-        view, use_container_width=True, hide_index=True, height=520,
-        column_config={
-            "% A+B": st.column_config.ProgressColumn(
-                "% A+B", min_value=0, max_value=100, format="%.1f%%"),
-        },
+    # Строка ИТОГО — в конец
+    totals_row = {group_label: "ИТОГО"}
+    if level == "discipline":
+        totals_row["Наименование"] = ""
+    for c in view.columns:
+        if c in (group_label, "Наименование"):
+            continue
+        totals_row[c] = int(view[c].sum())
+
+    view_with_total = pd.concat(
+        [view, pd.DataFrame([totals_row])],
+        ignore_index=True,
     )
 
-    totals = {group_label: "ИТОГО"}
-    if level == "discipline":
-        totals["Наименование"] = ""
-    numeric_cols = [
-        c for c in view.columns
-        if c not in (group_label, "Наименование", "% A+B")
-    ]
-    for c in numeric_cols:
-        totals[c] = int(view[c].sum())
-    if "Листов" in totals and totals["Листов"] > 0:
-        a = totals.get("A", 0)
-        b = totals.get("B", 0)
-        i = totals.get("И", 0)
-        annulled = totals.get("Аннул.", 0)
-        denom = totals["Листов"] - i - annulled
-        totals["% A+B"] = (round((a + b) / denom * 100, 1)
-                            if denom > 0 else 0.0)
-    ordered_keys = [group_label]
-    if level == "discipline":
-        ordered_keys.append("Наименование")
-    ordered_keys += [c for c in view.columns if c not in ordered_keys]
-    totals = {k: totals.get(k, 0) for k in ordered_keys}
+    # Стилизация: жирный + серый фон для строки ИТОГО
+    def _style_row(row):
+        if row.name == len(view_with_total) - 1:
+            return ["font-weight: bold; "
+                    "background-color: #f0f0f0"] * len(row)
+        return [""] * len(row)
 
-    st.markdown("**Итоги:**")
-    st.dataframe(pd.DataFrame([totals]),
-                  use_container_width=True, hide_index=True)
+    styled = view_with_total.style.apply(_style_row, axis=1)
+
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+    )
+
+    st.caption(
+        f"Показано **{len(view)}** групп. "
+        f"Строка **ИТОГО** — внизу таблицы. "
+        f"Замечания к листам A и к аннулированным в разрез "
+        f"не входят."
+    )
 
 
 # ===========================================================================

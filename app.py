@@ -4,7 +4,7 @@
 
 Фиксированный хедер с логотипом АТП ТЛП + имя пользователя справа.
 Фиксированный футер с именем пользователя и подписью.
-14 вкладок: Дашборд, Обзор, Комплекты, Листы, Категории, Сроки,
+13 вкладок: Сводка, Комплекты, Листы, Категории, Сроки,
 Авторы, Поиск, Динамика, Ревизии, Прогноз, Экспорт, Логи, Управление.
 Запуск: streamlit run app.py
 """
@@ -21,7 +21,7 @@ import streamlit as st
 
 from vitro.sqlite_db import init_db
 from vitro.ui import (
-    dashboard, overview, complexes, sheets, categories, deadlines,
+    summary, complexes, sheets, categories, deadlines,
     authors, search, dynamics, revisions, forecast, export, logs, admin,
 )
 
@@ -296,8 +296,7 @@ print(f"[TIMING] app.py: header/footer: {t3 - t2:.2f} сек")
 
 # ---- Список вкладок ----
 _TABS = [
-    "📊 Дашборд РП",
-    "📈 Обзор",
+    "📊 Сводка по проекту",
     "🏗 Комплекты",
     "📄 Листы",
     "🏷 Категории",
@@ -370,10 +369,8 @@ if _active != st.session_state["active_tab"]:
     st.session_state["active_tab"] = _active
 
 # ---- Рендер только активной вкладки ----
-if _active == "📊 Дашборд РП":
-    dashboard.render()
-elif _active == "📈 Обзор":
-    overview.render()
+if _active == "📊 Сводка по проекту":
+    summary.render()
 elif _active == "🏗 Комплекты":
     complexes.render()
 elif _active == "📄 Листы":
