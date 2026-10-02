@@ -5,13 +5,13 @@
 Структура (5 секций, каждая — 3 блока [2, 3, 2]):
   1. Объём замечаний — Всего + бублик / Активных + % / Закрыто и др.
   2. Листы РД       — Всего + бублик / A+B+C+% / И и др.
-  3. Замечания на стороне АТП ТЛП — Всего + бублик / состав / просрочка.
-  4. Замечания на стороне Заказчика — Всего + бублик / крупные / детали.
-  5. Категории замечаний, оценка АТП ТЛП — Всего + бублик / плохие / хорошие.
+  3. Замечания на стороне АТП ТЛП — Всего + бублик / состав / сроки.
+  4. Замечания на стороне Заказчика — Всего + бублик / состав / сроки.
+  5. Категории замечаний, оценка АТП ТЛП — Всего + бублик / 5 категорий.
   + Разрез по дисциплинам / разделам / комплектам.
 
-Источник: `_load_all_categorized` из deadlines.py (единый).
-Фильтры: дисциплина → раздел → комплект + расположение (4-й блок).
+Источник: `_load_all_categorized` из deadlines.py.
+Логика: новая (holder / our_status / our_bucket / customer_bucket).
 """
 
 import pandas as pd
@@ -30,24 +30,6 @@ CAT_2 = "Формальное/нет влияния на СМР"
 CAT_3 = "Доп.требование/отсутствует в ТЗ"
 CAT_4 = "Не принято/нарушение ТНПА"
 
-OURS_ACTIVE_FLAGS = [
-    "new_overdue", "new_in_progress",
-    "in_work_overdue", "in_work_in_progress",
-    "rejected_overdue", "rejected_in_progress",
-    "discussion_overdue", "discussion_in_progress",
-]
-OURS_OVERDUE_FLAGS = [
-    "new_overdue", "in_work_overdue",
-    "rejected_overdue", "discussion_overdue",
-]
-WAITING_FLAGS = [
-    "waiting_customer_ontime",
-    "waiting_customer",
-    "waiting_customer_overdue",
-]
-CHRONIC_FLAG = "waiting_customer_chronic"
-ABANDONED_FLAG = "abandoned"
-
 DS_A = "A"
 DS_ANNULLED = "АННУЛИРОВАНО"
 
@@ -55,7 +37,6 @@ STATUS_NEW = "Новое"
 STATUS_IN_WORK = "Принято в работу"
 STATUS_REJECTED = "Не принято"
 STATUS_DISCUSSION = "К обсуждению"
-STATUS_DONE = "Выполнено"
 
 BLOCK_OPTIONS = {
     "Корпус 1":                    "1",
@@ -97,6 +78,13 @@ SHEET_COLORS = {
     "На согласовании Заказчика":  "#17becf",
     "Готовится к загрузке":       "#9467bd",
     "Аннулировано":               "#7f7f7f",
+}
+
+BUCKET_COLORS = {
+    "≤10":   "#a5d6a7",   # зелёный — в сроке
+    "10–30": "#ffdd57",   # жёлтый
+    "30–90": "#ff7f0e",   # оранжевый
+    ">90":   "#d62728",   # красный
 }
 
 EMOJI = {
@@ -508,67 +496,90 @@ def _render_ours_section(active_df: pd.DataFrame) -> None:
         st.info("Нет данных.")
         return
 
-    ds = active_df["doc_status"].astype(str).str.strip().str.upper()
-    mask_special = ds.isin([DS_A, DS_ANNULLED])
-    clean = active_df[~mask_special]
-    statuses = clean["status"]
+    ours = active_df[active_df["holder"] == "ours"]
 
-    n_new = int((statuses == STATUS_NEW).sum())
-    n_in_work = int((statuses == STATUS_IN_WORK).sum())
-    n_rejected = int((statuses == STATUS_REJECTED).sum())
-    n_disc = int((statuses == STATUS_DISCUSSION).sum())
+    if ours.empty:
+        st.info("Нет замечаний на нашей стороне.")
+        return
 
-    n_ours_total = n_new + n_in_work + n_rejected + n_disc
+    n_total = len(ours)
+    n_new = int((ours["our_status"] == "new").sum())
+    n_in_work = int((ours["our_status"] == "in_work").sum())
+    n_rejected = int((ours["our_status"] == "rejected").sum())
+    n_disc = int((ours["our_status"] == "discussion").sum())
 
-    flags = clean["category_flag"]
-    mask_overdue = flags.isin(OURS_OVERDUE_FLAGS)
-    mask_abandoned = flags == ABANDONED_FLAG
-    n_overdue = int((mask_overdue | mask_abandoned).sum())
+    n_in_time = int((ours["our_bucket"] == "≤10").sum())
+    n_overdue = int(ours["our_bucket"].isin(
+        ["10–30", "30–90", ">90"]).sum())
 
     col_left, col_mid, col_right = st.columns([2, 3, 2])
 
+    # ----- Левый -----
     with col_left:
         _metric(
-            st, "Всего у АТП ТЛП", n_ours_total,
+            st, "Всего у АТП ТЛП", n_total,
             "Расчёт: Новое + Принято в работу + Не принято + "
-            "К обсуждению.",
+            "К обсуждению.\n\n"
+            f"Арифметика: {_fmt_num(n_new)} + {_fmt_num(n_in_work)} + "
+            f"{_fmt_num(n_rejected)} + {_fmt_num(n_disc)} = "
+            f"{_fmt_num(n_total)}.\n\n"
+            "Не включает замечания к листам A и к аннулированным — "
+            "они в блоке «Замечания на стороне Заказчика».",
         )
+
         pie_data = pd.DataFrame([
-            {"Статус": STATUS_NEW,        "Количество": n_new},
-            {"Статус": STATUS_IN_WORK,    "Количество": n_in_work},
-            {"Статус": STATUS_REJECTED,   "Количество": n_rejected},
-            {"Статус": STATUS_DISCUSSION, "Количество": n_disc},
+            {"Статус": "Новое",           "Количество": n_new},
+            {"Статус": "Принято в работу", "Количество": n_in_work},
+            {"Статус": "Не принято",      "Количество": n_rejected},
+            {"Статус": "К обсуждению",    "Количество": n_disc},
         ])
         pie_data = pie_data[pie_data["Количество"] > 0]
         _pie(pie_data, "Статус", "Количество", STATUS_COLORS,
              "sum_pie_ours")
 
+    # ----- Средний -----
     with col_mid:
         _metric(
             st, f"{EMOJI['blue']} Новое", n_new,
-            "Выгрузка из Витро: COUNT(comments WHERE status='Новое').",
+            "Выгрузка из Витро: COUNT(comments WHERE status='Новое').\n\n"
+            "Из них исключены замечания к листам A и к аннулированным.\n\n"
+            "Входит в «Всего у АТП ТЛП».",
         )
         _metric(
             st, f"{EMOJI['globe']} Принято в работу", n_in_work,
             "Выгрузка из Витро: "
-            "COUNT(comments WHERE status='Принято в работу').",
+            "COUNT(comments WHERE status='Принято в работу').\n\n"
+            "Входит в «Всего у АТП ТЛП».",
         )
         _metric(
             st, f"{EMOJI['red']} Не принято", n_rejected,
             "Выгрузка из Витро: "
-            "COUNT(comments WHERE status='Не принято').",
+            "COUNT(comments WHERE status='Не принято').\n\n"
+            "Входит в «Всего у АТП ТЛП».",
         )
         _metric(
             st, f"{EMOJI['yellow']} К обсуждению", n_disc,
             "Выгрузка из Витро: "
-            "COUNT(comments WHERE status='К обсуждению').",
+            "COUNT(comments WHERE status='К обсуждению').\n\n"
+            "Входит в «Всего у АТП ТЛП».",
         )
 
+    # ----- Правый -----
     with col_right:
+        _metric(
+            st, " из них срок ответа не превышен", n_in_time,
+            "Расчёт: замечания из состава «Всего у АТП ТЛП», "
+            "у которых срок ответа (10 рабочих дней) не истёк.\n\n"
+            "Арифметика: количество замечаний с бакетом «≤10».\n\n"
+            "Входит в «Всего у АТП ТЛП».",
+        )
         _metric(
             st, " из них Просрочено (>10 р.д.)", n_overdue,
             "Расчёт: замечания из состава «Всего у АТП ТЛП», "
-            "у которых срок ответа (10 рабочих дней) истёк.",
+            "у которых срок ответа (10 рабочих дней) истёк.\n\n"
+            "Арифметика: количество замечаний с бакетами "
+            "«10–30» + «30–90» + «>90».\n\n"
+            "Входит в «Всего у АТП ТЛП».",
         )
 
 
@@ -582,89 +593,90 @@ def _render_customer_section(active_df: pd.DataFrame) -> None:
         st.info("Нет данных.")
         return
 
-    ds = active_df["doc_status"].astype(str).str.strip().str.upper()
+    customer = active_df[active_df["holder"] == "customer"]
+    customer_a = active_df[active_df["holder"] == "customer_a"]
+    annulled = active_df[active_df["holder"] == "annulled"]
 
-    mask_a = ds == DS_A
-    mask_annul = ds == DS_ANNULLED
-    mask_special = mask_a | mask_annul
+    n_done = len(customer)
+    n_a_total = len(customer_a)
+    n_annul_total = len(annulled)
+    n_total = n_done + n_a_total + n_annul_total
 
-    n_a_total = int(mask_a.sum())
-    n_annul_total = int(mask_annul.sum())
+    if customer.empty and customer_a.empty and annulled.empty:
+        st.info("Нет замечаний на стороне заказчика.")
+        return
 
-    mask_done = active_df["status"] == STATUS_DONE
-    mask_done_clean = mask_done & ~mask_special
-    n_done_clean = int(mask_done_clean.sum())
-
-    done = active_df[mask_done_clean]
-    done_flags = done["category_flag"]
-
-    n_ontime = int((done_flags == "waiting_customer_ontime").sum())
-    n_waiting = int((done_flags == "waiting_customer").sum())
-    n_overdue = int((done_flags == "waiting_customer_overdue").sum())
-    n_chronic = int((done_flags == CHRONIC_FLAG).sum())
-
-    n_overdue_review = n_waiting + n_overdue + n_chronic
-
-    n_total = n_done_clean + n_a_total + n_annul_total
+    n_in_time = int((customer["customer_bucket"] == "≤10").sum())
+    n_overdue = int(customer["customer_bucket"].isin(
+        ["10–30", "30–90", ">90"]).sum())
 
     col_left, col_mid, col_right = st.columns([2, 3, 2])
 
+    # ----- Левый -----
     with col_left:
         _metric(
             st, "Всего у заказчика", n_total,
-            "Расчёт: со статусом Выполнено (без особых) "
-            "+ К листам A + К аннулированным листам.",
+            "Расчёт: со статусом Выполнено + К листам A "
+            "+ К аннулированным листам.\n\n"
+            f"Арифметика: {_fmt_num(n_done)} + "
+            f"{_fmt_num(n_a_total)} + {_fmt_num(n_annul_total)} = "
+            f"{_fmt_num(n_total)}.",
         )
+
         pie_data = pd.DataFrame([
-            {"Категория": "со статусом Выполнено",
-             "Количество": n_done_clean},
-            {"Категория": "К листам A",
-             "Количество": n_a_total},
-            {"Категория": "К аннулированным листам",
-             "Количество": n_annul_total},
+            {"Категория": "со статусом Выполнено", "Количество": n_done},
+            {"Категория": "К листам A",            "Количество": n_a_total},
+            {"Категория": "К аннулированным",      "Количество": n_annul_total},
         ])
         pie_data = pie_data[pie_data["Количество"] > 0]
         _pie(
             pie_data, "Категория", "Количество",
             {
-                "со статусом Выполнено":   "#2ca02c",
-                "К листам A":              "#1f77b4",
-                "К аннулированным листам": "#7f7f7f",
+                "со статусом Выполнено": "#2ca02c",
+                "К листам A":            "#1f77b4",
+                "К аннулированным":      "#7f7f7f",
             },
             "sum_pie_customer",
         )
 
+    # ----- Средний -----
     with col_mid:
         _metric(
-            st, f"{EMOJI['green']} со статусом Выполнено",
-            n_done_clean,
+            st, f"{EMOJI['green']} со статусом Выполнено", n_done,
             "Выгрузка из Витро: "
             "COUNT(comments WHERE status='Выполнено').\n\n"
-            "Из них исключены замечания к листам A и аннулированным.",
+            "Из них исключены замечания к листам A и к аннулированным.",
         )
         _metric(
-            st, f"{EMOJI['blue']} К листам A (утверждён)",
-            n_a_total,
-            "Расчёт: все замечания к листам со статусом A.",
+            st, f"{EMOJI['blue']} К листам A (утверждён)", n_a_total,
+            "Все замечания к листам со статусом A (утверждён), "
+            "независимо от статуса замечания.\n\n"
+            "Ожидаем снятия от заказчика.",
         )
         _metric(
             st, f"{EMOJI['black']} К аннулированным листам",
             n_annul_total,
-            "Расчёт: все замечания к аннулированным листам.",
+            "Все замечания к аннулированным листам.\n\n"
+            "Ожидаем снятия от заказчика.",
         )
 
+    # ----- Правый -----
     with col_right:
         _metric(
-            st, " из них срок рассмотрения не превышен",
-            n_ontime,
-            "Расчёт по датам: заказчик ещё в пределах "
-            "10 рабочих дней с момента нашего ответа.",
+            st, " из них срок рассмотрения не превышен", n_in_time,
+            "Расчёт: заказчик ещё в пределах 10 рабочих дней с момента "
+            "нашего ответа.\n\n"
+            "Арифметика: количество замечаний с бакетом «≤10».\n\n"
+            "Входит в «со статусом Выполнено».",
         )
         _metric(
             st, " из них Просрочено рассмотрение (>10 р.д.)",
-            n_overdue_review,
+            n_overdue,
             "Расчёт: заказчик не рассмотрел наш ответ более "
-            "10 рабочих дней.",
+            "10 рабочих дней.\n\n"
+            "Арифметика: количество замечаний с бакетами "
+            "«10–30» + «30–90» + «>90».\n\n"
+            "Входит в «со статусом Выполнено».",
         )
 
 
@@ -678,15 +690,11 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
         st.info("Нет данных.")
         return
 
-    ds = active_df["doc_status"].astype(str).str.strip().str.upper()
-    mask_special = ds.isin([DS_A, DS_ANNULLED])
+    ours = active_df[active_df["holder"] == "ours"]
 
-    ours_statuses = [STATUS_NEW, STATUS_IN_WORK,
-                     STATUS_REJECTED, STATUS_DISCUSSION]
-    mask_ours = (
-        active_df["status"].isin(ours_statuses) & ~mask_special
-    )
-    ours = active_df[mask_ours]
+    if ours.empty:
+        st.info("Нет замечаний на нашей стороне.")
+        return
 
     counts = (
         ours["category"].fillna("Без категории")
@@ -708,7 +716,7 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
             st, "Всего", total,
             "Расчёт: Новое + Принято в работу + Не принято + "
             "К обсуждению.\n\n"
-            "Совпадает с «Всего у АТП ТЛП».",
+            "Совпадает с «Всего у АТП ТЛП» в блоке выше.",
         )
         pie_data = pd.DataFrame([
             {"Категория": CAT_1,           "Количество": n_cat1},
@@ -747,7 +755,7 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
 
 
 # ===========================================================================
-#  Бублик: статусы замечаний
+#  Бублик: статусы замечаний (Секция 1)
 # ===========================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
@@ -824,49 +832,32 @@ def _sheet_distribution_from_df(docs_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
-#  Разрез: сводная таблица
+#  Разрез: по дисциплинам / разделам / комплектам
 # ===========================================================================
 def _build_summary_rows(group_col: str,
                          active_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Сводная таблица для разреза:
-      [группа] | Открытых | Новое | Не принято
-      | К обсуждению | Принято в работу | Выполнено
-
-    Замечания к листам A и к аннулированным — исключены
-    (как в верхних секциях).
-    """
     if active_df.empty:
         return pd.DataFrame()
 
-    ds = active_df["doc_status"].astype(str).str.strip().str.upper()
-    mask_special = ds.isin([DS_A, DS_ANNULLED])
-    clean = active_df[~mask_special]
+    ours = active_df[active_df["holder"] == "ours"]
 
-    if clean.empty:
+    if ours.empty:
         return pd.DataFrame()
 
-    statuses_order = [
-        STATUS_NEW, STATUS_REJECTED, STATUS_DISCUSSION,
-        STATUS_IN_WORK, STATUS_DONE,
-    ]
-
     rows = []
-    for grp, sub in clean.groupby(group_col, dropna=True):
+    for grp, sub in ours.groupby(group_col, dropna=True):
         if not grp:
             continue
 
         row = {group_col: grp}
-        sstatus = sub["status"]
-
-        counts = {}
-        for st in statuses_order:
-            counts[st] = int((sstatus == st).sum())
-
-        row["open_total"] = sum(counts.values())
-        for st in statuses_order:
-            row[st] = counts[st]
-
+        row["total"] = len(sub)
+        row["n_new"] = int((sub["our_status"] == "new").sum())
+        row["n_in_work"] = int((sub["our_status"] == "in_work").sum())
+        row["n_rejected"] = int((sub["our_status"] == "rejected").sum())
+        row["n_disc"] = int((sub["our_status"] == "discussion").sum())
+        row["n_in_time"] = int((sub["our_bucket"] == "≤10").sum())
+        row["n_overdue"] = int(sub["our_bucket"].isin(
+            ["10–30", "30–90", ">90"]).sum())
         rows.append(row)
 
     result = pd.DataFrame(rows)
@@ -920,55 +911,49 @@ def _load_summary_by_complex(disciplines: tuple = (),
 def _render_summary_table(df: pd.DataFrame,
                             group_label: str,
                             level: str) -> None:
-    """
-    Сводная таблица разреза:
-      Код/Раздел/Комплект | [Наименование] | Открытых | 5 статусов
-      + строка ИТОГО в конце.
-    """
     if df.empty:
         st.info("Нет данных по заданным фильтрам.")
         return
 
     view = df.copy()
 
-    # Наименование (для дисциплин)
     if level == "discipline" and "Код" in view.columns:
         view.insert(
             1, "Наименование",
             view["Код"].map(lambda c: discipline_name(c) if c else ""),
         )
 
-    # Красивые названия колонок с эмодзи
     rename_map = {
-        "open_total":       "Открытых",
-        STATUS_NEW:         f"{EMOJI['blue']} Новое",
-        STATUS_REJECTED:    f"{EMOJI['red']} Не принято",
-        STATUS_DISCUSSION:  f"{EMOJI['yellow']} К обсуждению",
-        STATUS_IN_WORK:     f"{EMOJI['globe']} Принято в работу",
-        STATUS_DONE:        f"{EMOJI['green']} Выполнено",
+        "total":        "Всего у АТП ТЛП",
+        "n_new":        f"{EMOJI['blue']} Новое",
+        "n_in_work":    f"{EMOJI['globe']} Принято в работу",
+        "n_rejected":   f"{EMOJI['red']} Не принято",
+        "n_disc":       f"{EMOJI['yellow']} К обсуждению",
+        "n_in_time":    "срок ответа не превышен",
+        "n_overdue":    "Просрочено (>10 р.д.)",
     }
     view = view.rename(columns=rename_map)
 
-    # Порядок колонок
-    cols_order = [group_label]
+    base_order = [group_label]
     if level == "discipline":
-        cols_order.append("Наименование")
-    cols_order += [
-        "Открытых",
+        base_order.append("Наименование")
+
+    cols_order = base_order + [
+        "Всего у АТП ТЛП",
         f"{EMOJI['blue']} Новое",
+        f"{EMOJI['globe']} Принято в работу",
         f"{EMOJI['red']} Не принято",
         f"{EMOJI['yellow']} К обсуждению",
-        f"{EMOJI['globe']} Принято в работу",
-        f"{EMOJI['green']} Выполнено",
+        "срок ответа не превышен",
+        "Просрочено (>10 р.д.)",
     ]
     cols_order = [c for c in cols_order if c in view.columns]
     view = view[cols_order]
 
-    # Сортировка по «Открытых» (убывание)
-    if "Открытых" in view.columns:
-        view = view.sort_values("Открытых", ascending=False)
+    if "Всего у АТП ТЛП" in view.columns:
+        view = view.sort_values("Всего у АТП ТЛП", ascending=False)
 
-    # Строка ИТОГО — в конец
+    # Строка ИТОГО
     totals_row = {group_label: "ИТОГО"}
     if level == "discipline":
         totals_row["Наименование"] = ""
@@ -982,7 +967,6 @@ def _render_summary_table(df: pd.DataFrame,
         ignore_index=True,
     )
 
-    # Стилизация: жирный + серый фон для строки ИТОГО
     def _style_row(row):
         if row.name == len(view_with_total) - 1:
             return ["font-weight: bold; "
