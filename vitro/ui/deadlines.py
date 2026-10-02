@@ -604,12 +604,6 @@ def _apply_filters(df: pd.DataFrame,
 def render():
     st.header("⏰ Сроки")
 
-    sync_date = _load_last_sync_date()
-    st.info(
-        f"### Дата последней выгрузки из Витро: "
-        f"{_fmt_sync_date(sync_date)}"
-    )
-
     st.caption(
         "Инструмент ведущего специалиста: замечания в работе АТП ТЛП "
         "с фильтрацией и инфографикой."

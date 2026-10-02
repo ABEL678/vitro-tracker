@@ -3,9 +3,10 @@
 Главный файл Streamlit-приложения.
 
 Фиксированный хедер с логотипом АТП ТЛП + имя пользователя справа.
+Фиксированная полоса с датой последней выгрузки из Витро.
 Фиксированный футер с именем пользователя и подписью.
-13 вкладок: Сводка, Комплекты, Листы, Категории, Сроки,
-Авторы, Поиск, Динамика, Ревизии, Прогноз, Экспорт, Логи, Управление.
+8 вкладок: Сводка, Динамика, Авторы, Сроки, Категории, Поиск,
+Экспорт, Управление.
 Запуск: streamlit run app.py
 """
 
@@ -17,12 +18,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import base64
+from datetime import datetime
+
 import streamlit as st
 
-from vitro.sqlite_db import init_db
+from vitro.sqlite_db import init_db, get_conn
 from vitro.ui import (
-    summary, complexes, sheets, categories, deadlines,
-    authors, search, dynamics, revisions, forecast, export, logs, admin,
+    summary, dynamics, authors, deadlines,
+    categories, search, export, admin,
 )
 
 import time
@@ -35,7 +38,7 @@ st.set_page_config(
     page_title="Замечания АТП ТЛП",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed",   # сайдбар не нужен
+    initial_sidebar_state="collapsed",
 )
 
 init_db()
@@ -43,6 +46,36 @@ t1 = time.time()
 print(f"[TIMING] app.py: imports + set_page_config: {t1 - _t_start:.2f} сек")
 t2 = time.time()
 print(f"[TIMING] app.py: init_db: {t2 - t1:.2f} сек")
+
+
+# ---------------------------------------------------------------------------
+#  Дата последней выгрузки из Витро
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_sync_date() -> str | None:
+    try:
+        with get_conn() as conn:
+            row = conn.execute("""
+                SELECT MAX(timestamp) AS ts FROM log
+                WHERE event IN ('sync_from_ui', 'refresh')
+                  AND status = 'OK'
+            """).fetchone()
+        if row and row["ts"]:
+            return row["ts"]
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_sync_date(ts) -> str:
+    if not ts:
+        return "—"
+    try:
+        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S")
+        return dt.strftime("%d.%m.%Y, %H:%M")
+    except Exception:
+        return str(ts)
+
 
 # ---------------------------------------------------------------------------
 #  Логотип в base64
@@ -61,10 +94,7 @@ if LOGO_PATH.exists():
 # ---------------------------------------------------------------------------
 @st.dialog("👤 Представьтесь")
 def ask_user_name():
-    """Модальное окно для ввода имени."""
-    st.write(
-        "Имя сохраняется вместе с категориями замечаний. "
-            )
+    st.write("Имя сохраняется вместе с категориями замечаний.")
     name = st.text_input(
         "Фамилия и имя",
         value=st.session_state.get("user", "")
@@ -103,47 +133,57 @@ if "user" not in st.session_state:
 if "user_confirmed" not in st.session_state:
     st.session_state["user_confirmed"] = False
 
-# ---------------------------------------------------------------------------
-#  Показываем диалог ОДИН РАЗ, только если имя ещё не подтверждено
-# ---------------------------------------------------------------------------
-# Флаг user_confirmed НЕ сбрасывается при обычных rerun.
-# Модалка вылезает только если user_confirmed явно False.
 if st.session_state.get("user_confirmed") is not True:
     ask_user_name()
 
 user_label = st.session_state.get("user", "инженер")
 
 # ---------------------------------------------------------------------------
-#  Высота хедера
+#  Высоты
 # ---------------------------------------------------------------------------
 HEADER_HEIGHT_PX = 64
+DATE_BAR_HEIGHT_PX = 70
+TOTAL_TOP_PX = HEADER_HEIGHT_PX + DATE_BAR_HEIGHT_PX
 
 # ---------------------------------------------------------------------------
 #  CSS
 # ---------------------------------------------------------------------------
 st.markdown(f"""
 <style>
-    /* Скрываем служебный хедер Streamlit */
-    header[data-testid="stHeader"] {{
-        display: none;
-    }}
-    button[kind="header"] {{
-        display: none;
-    }}
+    header[data-testid="stHeader"] {{ display: none; }}
+    button[kind="header"] {{ display: none; }}
 
-    /* Основной контейнер */
     .block-container {{
-        padding-top: 5rem !important;
+        padding-top: {TOTAL_TOP_PX + 12}px !important;
         padding-bottom: 3.5rem !important;
         max-width: 100% !important;
     }}
 
-    /* Вкладки — прижаты к хедеру */
+    .date-bar {{
+        position: fixed !important;
+        top: {HEADER_HEIGHT_PX}px !important;
+        left: 0 !important;
+        right: 0 !important;
+        height: {DATE_BAR_HEIGHT_PX}px !important;
+        background: #e8f0f8 !important;
+        border-bottom: 1px solid #d0d0d0 !important;
+        z-index: 2147483645 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif !important;
+        font-size: 15px !important;
+        font-weight: 600 !important;
+        color: #1F4E78 !important;
+        box-sizing: border-box !important;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04) !important;
+    }}
+
     div[data-testid="stTabs"] div[data-baseweb="tab-list"],
     div[data-baseweb="tab-list"],
     [role="tablist"] {{
         position: sticky !important;
-        top: {HEADER_HEIGHT_PX}px !important;
+        top: {TOTAL_TOP_PX}px !important;
         background: #ffffff !important;
         z-index: 9999 !important;
         padding: 4px 0 0 0 !important;
@@ -164,7 +204,6 @@ st.markdown(f"""
     div[data-testid="stMetricLabel"] {{ font-size: 0.7rem !important; }}
     a.header-anchor {{ display: none !important; }}
 
-    /* Кнопка смены пользователя в хедере (правый верхний угол) */
     .st-key-change_user_header_btn button {{
         position: fixed !important;
         top: 16px !important;
@@ -200,7 +239,7 @@ HEADER_HTML = f"""
         right: 0;
         background: #ffffff;
         border-bottom: 1px solid #d0d0d0;
-        padding: 8px 200px 8px 16px;   /* правый отступ 200px под кнопку */
+        padding: 8px 200px 8px 16px;
         z-index: 2147483646;
         height: {HEADER_HEIGHT_PX}px;
         box-sizing: border-box;
@@ -209,10 +248,7 @@ HEADER_HTML = f"""
         font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
     }}
-    .atp-header .logo {{
-        height: 42px;
-        margin-right: 14px;
-    }}
+    .atp-header .logo {{ height: 42px; margin-right: 14px; }}
     .atp-header .title {{
         font-size: 14px;
         font-weight: 600;
@@ -240,7 +276,22 @@ except AttributeError:
     st.markdown(HEADER_HTML, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-#  Кнопка смены пользователя (правый верхний угол, через CSS fixed)
+#  ПОЛОСА С ДАТОЙ ВЫГРУЗКИ
+# ---------------------------------------------------------------------------
+_sync_date = _load_sync_date()
+DATE_BAR_HTML = f"""
+<div class="date-bar">
+    📅 База актуальна на {_fmt_sync_date(_sync_date)}
+</div>
+"""
+
+try:
+    st.html(DATE_BAR_HTML)
+except AttributeError:
+    st.markdown(DATE_BAR_HTML, unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+#  Кнопка смены пользователя
 # ---------------------------------------------------------------------------
 def _open_user_dialog():
     st.session_state["user_confirmed"] = False
@@ -289,36 +340,28 @@ except AttributeError:
     st.markdown(FOOTER_HTML, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-#  Ленивая загрузка вкладок — рендерится только активная
+#  Вкладки
 # ---------------------------------------------------------------------------
 t3 = time.time()
 print(f"[TIMING] app.py: header/footer: {t3 - t2:.2f} сек")
 
-# ---- Список вкладок ----
 _TABS = [
     "📊 Сводка по проекту",
-    "🏗 Комплекты",
-    "📄 Листы",
-    "🏷 Категории",
-    "⏰ Сроки",
-    "👤 Авторы",
-    "🔍 Поиск",
     "📈 Динамика",
-    "🔁 Ревизии",
-    "🔮 Прогноз",
+    "👤 Авторы",
+    "⏰ Сроки",
+    "🏷 Категории",
+    "🔍 Поиск",
     "📄 Экспорт",
-    "📜 Логи",
     "⚙️ Управление",
 ]
 
-# ---- Активная вкладка через session_state ----
 if "active_tab" not in st.session_state:
     st.session_state["active_tab"] = _TABS[0]
 
-# ---- CSS для стилизации radio как вкладок ----
+# CSS для стилизации radio как вкладок
 st.markdown("""
 <style>
-    /* Стилизация radio-кнопок под вкладки */
     div[data-testid="stRadio"] > div[role="radiogroup"] {
         flex-direction: row !important;
         flex-wrap: wrap !important;
@@ -343,18 +386,15 @@ st.markdown("""
         color: #ff4b4b !important;
         font-weight: 600 !important;
     }
-    /* Скрываем сами кружки радио */
     div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child {
         display: none !important;
     }
-    /* Делаем весь лейбл кликабельным */
     div[data-testid="stRadio"] > div[role="radiogroup"] > label > div {
         cursor: pointer !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# ---- Radio как «вкладки» ----
 _active = st.radio(
     "Вкладка",
     options=_TABS,
@@ -364,34 +404,23 @@ _active = st.radio(
     key="tab_selector",
 )
 
-# ---- Обновляем session_state при переключении ----
 if _active != st.session_state["active_tab"]:
     st.session_state["active_tab"] = _active
 
-# ---- Рендер только активной вкладки ----
+# Рендер активной вкладки
 if _active == "📊 Сводка по проекту":
     summary.render()
-elif _active == "🏗 Комплекты":
-    complexes.render()
-elif _active == "📄 Листы":
-    sheets.render()
-elif _active == "🏷 Категории":
-    categories.render()
-elif _active == "⏰ Сроки":
-    deadlines.render()
-elif _active == "👤 Авторы":
-    authors.render()
-elif _active == "🔍 Поиск":
-    search.render()
 elif _active == "📈 Динамика":
     dynamics.render()
-elif _active == "🔁 Ревизии":
-    revisions.render()
-elif _active == "🔮 Прогноз":
-    forecast.render()
+elif _active == "👤 Авторы":
+    authors.render()
+elif _active == "⏰ Сроки":
+    deadlines.render()
+elif _active == "🏷 Категории":
+    categories.render()
+elif _active == "🔍 Поиск":
+    search.render()
 elif _active == "📄 Экспорт":
     export.render()
-elif _active == "📜 Логи":
-    logs.render()
 elif _active == "⚙️ Управление":
     admin.render()
