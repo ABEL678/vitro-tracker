@@ -1,16 +1,14 @@
-
 # vitro/ui/categories.py
 """
 🏷 Категории — аналитика + работа с замечаниями.
 
 Под-вкладки:
-  📈 Анализ — распределение, по дисциплинам, по авторам, A/B.
+  📈 Анализ — распределение, по дисциплинам, по авторам.
   📝 Работа с замечаниями — st.data_editor с каскадными фильтрами.
   📥 Импорт из Excel — массовая загрузка категорий из файлов.
 
-ВАЖНО: вся аналитика считается по АКТИВНЫМ замечаниям
-(5 статусов: Новое, Принято в работу, Не принято, К обсуждению,
-Выполнено). Единый источник — `_load_all_categorized` из deadlines.py.
+Источник — `_load_all_categorized` (deadlines.py).
+Логика: holder == "ours" — только замечания на нашей стороне.
 """
 
 import io
@@ -27,7 +25,6 @@ from vitro.sqlite_db import (
     update_category_safe,
     update_category_force,
 )
-from vitro.ui._utils import download_plotly
 from vitro.disciplines import discipline_name
 
 
@@ -49,7 +46,6 @@ CAT_PREFIX = {
 CAT_OPTIONS_DISPLAY = [f"{CAT_PREFIX[c]} {c}" for c in [CAT_1, CAT_2, CAT_3, CAT_4]]
 CAT_OPTIONS_RAW = [CAT_1, CAT_2, CAT_3, CAT_4]
 
-# Короткие подписи для графиков/таблиц
 CAT_SHORT = {
     CAT_1: "Принято",
     CAT_2: "Формальное",
@@ -58,9 +54,28 @@ CAT_SHORT = {
     "Без категории": "Без категории",
 }
 
-# Маппинг «длинное имя → короткое»
-LONG_TO_SHORT = {v: k for k, v in CAT_SHORT.items()}
-SHORT_TO_LONG = {k: v for k, v in CAT_SHORT.items()}
+CAT_COLORS = {
+    CAT_1:           "#C6EFCE",
+    CAT_2:           "#FFEB9C",
+    CAT_3:           "#BDD7EE",
+    CAT_4:           "#FFC7CE",
+    "Без категории": "#D9D9D9",
+    "Принято":       "#C6EFCE",
+    "Формальное":    "#FFEB9C",
+    "Доп.треб.":     "#BDD7EE",
+    "Не принято":    "#FFC7CE",
+}
+
+STATUS_SHORT = {
+    "Новое": "🆕 Новое",
+    "Принято в работу": "🛠 В работе",
+    "Не принято": "🟪 Не принято",
+    "К обсуждению": "🟣 К обсужд.",
+    "Выполнено": "✅ Выполнено",
+}
+
+STATUS_ORDER = ["🆕 Новое", "🛠 В работе", "🟪 Не принято",
+                "🟣 К обсужд.", "✅ Выполнено"]
 
 
 def _strip_prefix(display_value: str) -> str:
@@ -81,38 +96,8 @@ def _add_prefix(raw_value: str):
     return raw_value
 
 
-CAT_COLORS = {
-    CAT_1:           "#C6EFCE",
-    CAT_2:           "#FFEB9C",
-    CAT_3:           "#BDD7EE",
-    CAT_4:           "#FFC7CE",
-    "Без категории": "#D9D9D9",
-    "Принято":       "#C6EFCE",
-    "Формальное":    "#FFEB9C",
-    "Доп.треб.":     "#BDD7EE",
-    "Не принято":    "#FFC7CE",
-}
-
-API_STATUSES = [
-    "Новое", "Принято в работу", "Не принято",
-    "К обсуждению", "Выполнено",
-]
-
-# Сопоставление API-статуса → колонка кросс-таблицы
-STATUS_SHORT = {
-    "Новое": "🆕 Новое",
-    "Принято в работу": "🛠 В работе",
-    "Не принято": "🟪 Не принято",
-    "К обсуждению": "🟣 К обсужд.",
-    "Выполнено": "✅ Выполнено",
-}
-
-STATUS_ORDER = ["🆕 Новое", "🛠 В работе", "🟪 Не принято",
-                "🟣 К обсужд.", "✅ Выполнено"]
-
-
 # ---------------------------------------------------------------------------
-#  Справочники (без изменений)
+#  Справочники
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_discipline_options() -> dict[str, str]:
@@ -124,21 +109,19 @@ def _load_discipline_options() -> dict[str, str]:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple[str, ...] = ()) -> dict[str, str]:
+def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
     with get_conn() as conn:
         if disciplines:
-            placeholders = ",".join("?" * len(disciplines))
+            ph = ",".join("?" * len(disciplines))
             rows = conn.execute(f"""
-                SELECT DISTINCT section
-                FROM documents
+                SELECT DISTINCT section FROM documents
                 WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({placeholders})
+                  AND discipline IN ({ph})
                 ORDER BY section
             """, tuple(disciplines)).fetchall()
         else:
             rows = conn.execute("""
-                SELECT DISTINCT section
-                FROM documents
+                SELECT DISTINCT section FROM documents
                 WHERE section IS NOT NULL AND section <> ''
                 ORDER BY section
             """).fetchall()
@@ -146,8 +129,8 @@ def _load_section_options(disciplines: tuple[str, ...] = ()) -> dict[str, str]:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple[str, ...] = (),
-                      sections: tuple[str, ...] = ()) -> dict[str, str]:
+def _load_kit_options(disciplines: tuple = (),
+                      sections: tuple = ()) -> dict[str, str]:
     with get_conn() as conn:
         where = ["c.code IS NOT NULL"]
         params: list = []
@@ -157,10 +140,10 @@ def _load_kit_options(disciplines: tuple[str, ...] = (),
             params += list(disciplines)
 
         if sections:
-            placeholders = ",".join("?" * len(sections))
+            ph = ",".join("?" * len(sections))
             where.append(f"""c.code IN (
                 SELECT DISTINCT complex FROM documents
-                WHERE section IN ({placeholders})
+                WHERE section IN ({ph})
                   AND complex IS NOT NULL
             )""")
             params += list(sections)
@@ -181,48 +164,26 @@ def _load_kit_options(disciplines: tuple[str, ...] = (),
 
 
 # ---------------------------------------------------------------------------
-#  Единый срез активных замечаний (с категориями)
+#  Единый срез наших замечаний
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_active_df() -> pd.DataFrame:
-    """
-    Возвращает активные замечания из `_load_all_categorized`.
-    Это ЕДИНЫЙ источник истины для всей аналитики вкладки «Категории».
-
-    Колонки: id, comment, status, doc_status, author, discipline,
-             section, complex, sheet, sheet_name, created, category,
-             category_date, category_user, category_version,
-             category_flag, ...
-
-    Активные = все строки из _load_all_categorized, КРОМЕ abandoned.
-    """
+    """Замечания на нашей стороне (holder == "ours")."""
     from vitro.ui.deadlines import _load_all_categorized
-
     df = _load_all_categorized()
     if df.empty:
         return df
-
-    # Отделяем архив — он не относится к «активной работе»
-    df = df[df["category_flag"] != "abandoned"].copy()
-
-    return df
+    return df[df["holder"] == "ours"].copy()
 
 
 # ---------------------------------------------------------------------------
-#  Прогресс категоризации (по активным)
+#  Прогресс категоризации
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_categorization_progress() -> dict:
-    """
-    Прогресс категоризации — ТОЛЬКО по активным.
-
-    Источник: `_load_all_categorized` минус `abandoned`.
-    «Закрыто» и «Аннулировано» — справочно, из БД.
-    """
     active = _load_active_df()
     total = len(active)
 
-    # Разобрано = есть category
     if total > 0:
         done = active[
             active["category"].notna()
@@ -233,7 +194,6 @@ def _load_categorization_progress() -> dict:
 
     left = total - done
 
-    # Справочно — из БД
     with get_conn() as conn:
         closed = conn.execute(
             "SELECT COUNT(*) FROM comments WHERE status = 'Закрыто'"
@@ -252,11 +212,10 @@ def _load_categorization_progress() -> dict:
 
 
 # ---------------------------------------------------------------------------
-#  Распределение по 4 категориям (среди активных)
+#  Распределение по 4 категориям
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_overall_distribution() -> pd.DataFrame:
-    """Распределение по 4 категориям + Без категории (только активные)."""
     active = _load_active_df()
     if active.empty:
         return pd.DataFrame(columns=["Категория", "Количество"])
@@ -280,15 +239,10 @@ def _load_overall_distribution() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  Кросс-таблица «4 категории × 5 статусов»
+#  Кросс-таблица
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_category_by_status() -> pd.DataFrame:
-    """
-    Кросс-таблица: строки — 4 категории (+ Без категории + Итого),
-    колонки — 5 статусов (Новое, В работе, Не принято,
-    К обсуждению, Выполнено).
-    """
     active = _load_active_df()
     if active.empty:
         return pd.DataFrame()
@@ -298,7 +252,6 @@ def _load_category_by_status() -> pd.DataFrame:
         "", "Без категории")
     df["Статус"] = df["status"].map(STATUS_SHORT).fillna(df["status"])
 
-    # Сводная
     pivot = df.pivot_table(
         index="Категория",
         columns="Статус",
@@ -307,18 +260,14 @@ def _load_category_by_status() -> pd.DataFrame:
         fill_value=0,
     )
 
-    # Порядок строк
     row_order = CAT_OPTIONS_RAW + ["Без категории"]
     pivot = pivot.reindex([r for r in row_order if r in pivot.index])
 
-    # Порядок колонок
     col_order = [c for c in STATUS_ORDER if c in pivot.columns]
     pivot = pivot[col_order]
 
-    # Итого по строке
     pivot["Итого"] = pivot.sum(axis=1)
 
-    # Строка «Итого» снизу
     totals_row = pivot.sum(axis=0).to_frame().T
     totals_row.index = ["Итого"]
     pivot = pd.concat([pivot, totals_row])
@@ -327,11 +276,10 @@ def _load_category_by_status() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  Распределение по дисциплинам (активные)
+#  По дисциплинам
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_by_discipline() -> pd.DataFrame:
-    """Стек-бар: 4 категории по дисциплинам (только активные)."""
     active = _load_active_df()
     if active.empty:
         return pd.DataFrame()
@@ -347,143 +295,7 @@ def _load_by_discipline() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  По авторам (активные)
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def _load_by_author(limit: int = 30) -> pd.DataFrame:
-    """Сводная по авторам: всего + по 4 категориям + без категории."""
-    active = _load_active_df()
-    if active.empty:
-        return pd.DataFrame()
-
-    df = active.copy()
-    df["Категория"] = df["category"].fillna("Без категории").replace(
-        "", "Без категории")
-
-    pivot = df.pivot_table(
-        index="author",
-        columns="Категория",
-        values="id",
-        aggfunc="count",
-        fill_value=0,
-    )
-
-    # Переименовываем колонки в короткие
-    short_map = {
-        CAT_1: "Принято",
-        CAT_2: "Формальное",
-        CAT_3: "Доп.треб.",
-        CAT_4: "Не принято",
-        "Без категории": "Без категории",
-    }
-    pivot = pivot.rename(columns=short_map)
-
-    # Порядок колонок
-    col_order = ["Принято", "Формальное", "Доп.треб.",
-                 "Не принято", "Без категории"]
-    pivot = pivot[[c for c in col_order if c in pivot.columns]]
-
-    pivot["Всего"] = pivot.sum(axis=1)
-    pivot = pivot.sort_values("Всего", ascending=False).head(limit)
-    pivot = pivot.reset_index().rename(columns={"author": "Автор"})
-
-    # Порядок: Автор, Всего, категории
-    cols = ["Автор", "Всего"] + [c for c in col_order if c in pivot.columns]
-    return pivot[cols]
-
-
-# ---------------------------------------------------------------------------
-#  Где нужна работа — топ комплектов по некатегоризированным (активные)
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def _load_top_uncategorized(limit: int = 20) -> pd.DataFrame:
-    """
-    Топ комплектов, где больше всего НЕкатегоризированных замечаний
-    (только активные, без abandoned).
-    """
-    active = _load_active_df()
-    if active.empty:
-        return pd.DataFrame()
-
-    df = active.copy()
-    df["_is_uncat"] = (
-        df["category"].isna()
-        | (df["category"].astype(str).str.strip() == "")
-    )
-
-    grouped = df.groupby(["discipline", "complex"]).agg(
-        total=("id", "count"),
-        uncategorized=("_is_uncat", "sum"),
-    ).reset_index()
-
-    grouped["categorized"] = grouped["total"] - grouped["uncategorized"]
-    grouped = grouped[grouped["uncategorized"] > 0]
-    grouped = grouped.sort_values(
-        "uncategorized", ascending=False).head(limit)
-    grouped["pct"] = grouped.apply(
-        lambda r: round(r["categorized"] / r["total"] * 100, 1)
-        if r["total"] else 0,
-        axis=1,
-    )
-    return grouped
-
-
-# ---------------------------------------------------------------------------
-#  Блок «Учтено (A/B)» — разбивка по 4 категориям
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def _load_closed_by_doc() -> dict:
-    """
-    Учтённые замечания (лист A/B). Возвращает:
-      {
-        "total": N,
-        "a": Na, "b": Nb,
-        "by_cat": DataFrame [Категория, A, B, Всего]
-      }
-    """
-    from vitro.ui.deadlines import _load_all_categorized
-
-    df = _load_all_categorized()
-    if df.empty:
-        return {"total": 0, "a": 0, "b": 0, "by_cat": pd.DataFrame()}
-
-    sub = df[df["category_flag"] == "closed_by_doc_status"].copy()
-    if sub.empty:
-        return {"total": 0, "a": 0, "b": 0, "by_cat": pd.DataFrame()}
-
-    # Сначала добавляем колонку «Категория»
-    sub["Категория"] = (
-        sub["category"].fillna("Без категории").replace("", "Без категории")
-    )
-
-    # Только потом делим на A/B
-    sub_a = sub[sub["doc_status"] == "A"]
-    sub_b = sub[sub["doc_status"] == "B"]
-
-    # Разбивка по 4 категориям
-    rows = []
-    for cat in CAT_OPTIONS_RAW + ["Без категории"]:
-        cnt_a = sub_a[sub_a["Категория"] == cat].shape[0]
-        cnt_b = sub_b[sub_b["Категория"] == cat].shape[0]
-        if cnt_a + cnt_b == 0 and cat == "Без категории":
-            continue
-        rows.append({
-            "Категория": cat,
-            "A (утверждён)": cnt_a,
-            "B (к сдаче)": cnt_b,
-            "Всего": cnt_a + cnt_b,
-        })
-
-    by_cat = pd.DataFrame(rows)
-    return {
-        "total": len(sub),
-        "a": len(sub_a),
-        "b": len(sub_b),
-        "by_cat": by_cat,
-    }
-
-# ---------------------------------------------------------------------------
-#  Активность специалистов (без изменений)
+#  Активность специалистов
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_user_activity() -> pd.DataFrame:
@@ -503,19 +315,16 @@ def _load_user_activity() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  Рендер аналитики
+#  Анализ
 # ---------------------------------------------------------------------------
 def _render_analysis():
-    """Аналитика по категоризации — только активные замечания."""
-
     # =====================================================================
     #  Прогресс категоризации
     # =====================================================================
     st.markdown("### 🎯 Прогресс категоризации")
     st.caption(
-        "Считается **только по активным замечаниям** (5 статусов: "
-        "Новое, Принято в работу, Не принято, К обсуждению, Выполнено). "
-        "«Заброшено» (архив) в прогресс не входит."
+        "Считается **только по замечаниям на нашей стороне** "
+        "(без листов A и аннулированных)."
     )
 
     prog = _load_categorization_progress()
@@ -526,19 +335,18 @@ def _render_analysis():
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
-        "Активных замечаний",
+        "Замечаний у АТП ТЛП",
         f"{total:,}".replace(",", " "),
-        help="Замечания в 5 активных статусах, без архива.",
+        help="Замечания на нашей стороне (без A и аннулированных).",
     )
     c2.metric("Разобрано", f"{done:,}".replace(",", " "))
     c3.metric("Осталось", f"{left:,}".replace(",", " "))
     c4.metric(
         "Прогресс",
         f"{pct}%",
-        help="Доля активных замечаний, у которых уже есть категория.",
+        help="Доля наших замечаний с категорией.",
     )
 
-    # Справочно
     cc1, cc2 = st.columns(2)
     cc1.metric(
         "Закрыто (справочно)",
@@ -553,7 +361,6 @@ def _render_analysis():
 
     st.progress(pct / 100)
 
-    # Прогноз завершения
     with get_conn() as conn:
         recent = conn.execute("""
             SELECT COUNT(*) FROM users_activity
@@ -576,12 +383,9 @@ def _render_analysis():
             f"{days_left:,}".replace(",", " "),
             help="При текущем темпе.",
         )
-        c3.metric(
-            "Прогноз завершения",
-            eta.strftime("%d.%m.%Y"),
-        )
+        c3.metric("Прогноз завершения", eta.strftime("%d.%m.%Y"))
     elif left == 0:
-        st.success("🎉 Все активные замечания категоризированы!")
+        st.success("🎉 Все замечания категоризированы!")
     else:
         st.info(
             "📌 Нет данных за последние 7 дней. Начните категоризировать — "
@@ -595,14 +399,11 @@ def _render_analysis():
     # =====================================================================
     st.markdown("### 📊 Категории × 5 статусов")
     st.caption(
-        "Показывает, **какие категории преобладают в каких статусах**. "
-        "Например, «Формальное» чаще всего у «Новых», а «Принято» — "
-        "у «Выполнено»."
+        "Какие категории преобладают в каких статусах."
     )
 
     cross = _load_category_by_status()
     if not cross.empty:
-        # Красим нулевые ячейки серым, остальные — по категории
         st.dataframe(
             cross,
             use_container_width=True,
@@ -612,30 +413,13 @@ def _render_analysis():
                     "Категория", width="large"),
             },
         )
-
-        # Экспорт
-        with st.expander("📥 Выгрузить кросс-таблицу в Excel",
-                         expanded=False):
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                cross.to_excel(writer, index=False, sheet_name="Категории_статусы")
-            buf.seek(0)
-            st.download_button(
-                label="⬇️ Скачать XLSX",
-                data=buf.getvalue(),
-                file_name=f"Категории_статусы_{datetime.now():%Y%m%d}.xlsx",
-                mime=("application/vnd.openxmlformats-officedocument"
-                      ".spreadsheetml.sheet"),
-                use_container_width=True,
-                key="analysis_download_cross",  # ← НОВАЯ СТРОКА
-            )
     else:
-        st.info("Нет активных замечаний.")
+        st.info("Нет замечаний на нашей стороне.")
 
     st.divider()
 
     # =====================================================================
-    #  Распределение: пирог + стек-бар по дисциплинам
+    #  Распределение
     # =====================================================================
     st.markdown("### 🏷 Распределение по категориям")
 
@@ -648,10 +432,9 @@ def _render_analysis():
                 dist, names="Категория", values="Количество", hole=0.45,
                 color="Категория",
                 color_discrete_map=CAT_COLORS,
-                title="По категориям (активные)",
+                title="По категориям",
             )
             st.plotly_chart(fig, use_container_width=True)
-            download_plotly(fig, "Категории_распределение", "cat_dist")
 
     with col2:
         by_disc = _load_by_discipline()
@@ -660,7 +443,7 @@ def _render_analysis():
                 by_disc, x="Код", y="Количество", color="Категория",
                 barmode="stack",
                 color_discrete_map=CAT_COLORS,
-                title="По дисциплинам (активные)",
+                title="По дисциплинам",
             )
             fig.update_layout(
                 legend_title_text="",
@@ -668,129 +451,12 @@ def _render_analysis():
                 height=400,
             )
             st.plotly_chart(fig, use_container_width=True)
-            download_plotly(fig, "Категории_по_дисциплинам", "cat_disc")
 
     st.divider()
 
-    # =====================================================================
-    #  Где нужна работа — топ комплектов
-    # =====================================================================
-    st.markdown("### 🏗 Где нужна работа — топ комплектов")
-    st.caption(
-        "Комплекты с наибольшим числом **некатегоризированных** "
-        "замечаний. Сюда стоит направить специалистов."
-    )
-
-    top_rows = _load_top_uncategorized(limit=20)
-
-    if not top_rows.empty:
-        chart_df = top_rows.sort_values("uncategorized", ascending=True)
-
-        fig = px.bar(
-            chart_df,
-            x="uncategorized", y="complex", orientation="h",
-            text="uncategorized",
-            color="pct",
-            color_continuous_scale=["#E57373", "#FFB74D", "#A5D6A7"],
-            labels={"uncategorized": "Без категории",
-                    "complex": "",
-                    "pct": "% разобрано"},
-            title="Топ-20 комплектов по некатегоризированным",
-        )
-        fig.update_traces(textposition="outside")
-        fig.update_layout(height=max(500, 25 * len(chart_df)),
-                          coloraxis_showscale=True)
-        st.plotly_chart(fig, use_container_width=True)
-        download_plotly(fig, "Категории_топ_неразобранных",
-                        "cat_top_uncat", width=1400, height=700)
-
-        # Таблица
-        table = top_rows[["discipline", "complex", "total",
-                           "categorized", "uncategorized", "pct"]]
-        table.columns = ["Дисциплина", "Комплект", "Всего",
-                          "Разобрано", "Осталось", "% разобрано"]
-
-        st.dataframe(
-            table, use_container_width=True, hide_index=True,
-            column_config={
-                "% разобрано": st.column_config.ProgressColumn(
-                    "% разобрано", min_value=0, max_value=100,
-                    format="%.1f%%"),
-            },
-        )
-    else:
-        st.success("🎉 Все активные замечания категоризированы!")
-
-    st.divider()
 
     # =====================================================================
-    #  По авторам замечаний (активные)
-    # =====================================================================
-    st.markdown("### 👤 Категории по авторам замечаний")
-    st.caption("Только активные замечания. Топ-30 авторов по количеству.")
-
-    by_author = _load_by_author(limit=30)
-    if not by_author.empty:
-        st.dataframe(by_author, use_container_width=True, hide_index=True)
-    else:
-        st.info("Нет данных по авторам.")
-
-    st.divider()
-
-    # =====================================================================
-    #  Учтено (A/B) — отдельный блок
-    # =====================================================================
-    st.markdown("### 🟢 Учтено (A/B) — замечания не сняты формально")
-    st.caption(
-        "Замечания в статусе «Выполнено», по которым лист получил "
-        "статус **A** (утверждён) или **B** (к сдаче). Фактически "
-        "принято, но в Витрокад **не закрыто**.\n\n"
-        "**Для деталей** → вкладка «⏰ Сроки → 🟢 Учтено (A/B)»."
-    )
-
-    closed = _load_closed_by_doc()
-    if closed["total"] > 0:
-        c1, c2, c3 = st.columns(3)
-        c1.metric(
-            "Всего учтено",
-            f"{closed['total']:,}".replace(",", " "),
-        )
-        c2.metric(
-            "🟢 Лист A — утверждён",
-            f"{closed['a']:,}".replace(",", " "),
-            help="Лист утверждён. Замечания сняты, надо только "
-                 "формально закрыть в Витрокад.",
-        )
-        c3.metric(
-            "🟡 Лист B — к сдаче",
-            f"{closed['b']:,}".replace(",", " "),
-            help="Лист готов к сдаче, но замечания формально "
-                 "НЕ сняты. Заказчик может вернуть на доработку.",
-        )
-
-        if not closed["by_cat"].empty:
-            st.markdown("##### Разбивка по категориям замечаний")
-            st.dataframe(
-                closed["by_cat"],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Категория": st.column_config.TextColumn(
-                        "Категория", width="large"),
-                    "A (утверждён)": st.column_config.NumberColumn(
-                        format="%d"),
-                    "B (к сдаче)": st.column_config.NumberColumn(
-                        format="%d"),
-                    "Всего": st.column_config.NumberColumn(format="%d"),
-                },
-            )
-    else:
-        st.info("Нет учтённых замечаний.")
-
-    st.divider()
-
-    # =====================================================================
-    #  Активность специалистов
+    #  Активность
     # =====================================================================
     st.markdown("### 🎯 Активность специалистов по категоризации")
     activity = _load_user_activity()
@@ -806,15 +472,14 @@ def _render_analysis():
         fig.update_traces(textposition="outside")
         fig.update_layout(height=max(300, 30 * len(activity)))
         st.plotly_chart(fig, use_container_width=True)
-        download_plotly(fig, "Категории_активность", "cat_activity")
     else:
         st.info("Пока никто не назначал категории.")
 
 
 # ---------------------------------------------------------------------------
-#  Визуальная группировка (без изменений)
+#  Визуальная группировка
 # ---------------------------------------------------------------------------
-def _collapse_repeats(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+def _collapse_repeats(df: pd.DataFrame, cols: list) -> pd.DataFrame:
     out = df.copy()
     key_prev = None
     for idx, row in out.iterrows():
@@ -830,13 +495,12 @@ def _collapse_repeats(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 #  Редактор
 # ---------------------------------------------------------------------------
 def _render_editor():
-    """Редактор категорий — только активные замечания."""
     st.markdown("### 📝 Работа с замечаниями")
     st.caption(
-        "Редактор показывает **только активные замечания** "
+        "Редактор показывает **только замечания на нашей стороне** "
         "(Новое, Принято в работу, Не принято, К обсуждению). "
-        "Закрытые и аннулированные сюда не попадают. "
-        "Чтобы увидеть «Выполнено» (ждут заказчика) — включите чекбокс ниже."
+        "Закрытые, аннулированные и замечания к листам A "
+        "сюда не попадают."
     )
 
     st.markdown("""
@@ -852,9 +516,6 @@ def _render_editor():
     </style>
     """, unsafe_allow_html=True)
 
-    # =================================================================
-    #  НАСТРОЙКИ
-    # =================================================================
     c_show, c_only = st.columns([2, 1])
 
     with c_show:
@@ -874,9 +535,6 @@ def _render_editor():
             key="editor_only_uncat",
         )
 
-    # =================================================================
-    #  ФИЛЬТРЫ ПО ИЕРАРХИИ
-    # =================================================================
     disc_options = _load_discipline_options()
 
     with st.expander("🎛 Фильтры", expanded=False):
@@ -929,7 +587,6 @@ def _render_editor():
             sel_kit = [code for code, label in kit_options.items()
                        if label in sel_kit_labels]
 
-        # Определяем список доступных статусов
         if show_waiting:
             status_options = [
                 "Новое", "Принято в работу", "Не принято",
@@ -958,10 +615,6 @@ def _render_editor():
                 value=300, step=50, key="editor_limit",
             )
 
-
-    # =================================================================
-    #  ЗАГРУЗКА СРЕЗА
-    # =================================================================
     df = load_remarks_for_editor(
         disciplines=tuple(sel_disc) if sel_disc else None,
         sections=tuple(sel_section) if sel_section else None,
@@ -1084,7 +737,7 @@ def _render_editor():
 
 
 # ---------------------------------------------------------------------------
-#  Импорт из Excel (без изменений)
+#  Импорт из Excel
 # ---------------------------------------------------------------------------
 def _normalize_category(value) -> str | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -1116,23 +769,7 @@ def _normalize_category(value) -> str | None:
     return None
 
 
-COL_ID_ALIASES  = ["ИД", "ID", "Id", "id", "Код", "№", "N"]
-COL_CAT_ALIASES = ["Категория", "категория", "Category", "category", "Кат."]
-COL_USER_ALIASES = ["Кто изменил", "Кто", "Пользователь", "User", "user", "Специалист"]
-COL_DATE_ALIASES = ["Когда изменил", "Когда", "Дата", "Date", "date", "Дата изменения"]
-
-
-def _find_column(df: pd.DataFrame, aliases: list[str]) -> str | None:
-    cols_norm = {str(c).strip().lower(): c for c in df.columns}
-    for alias in aliases:
-        key = alias.strip().lower()
-        if key in cols_norm:
-            return cols_norm[key]
-    return None
-
-
 def _parse_excel_file(uploaded_file) -> pd.DataFrame:
-    import io
     from openpyxl import load_workbook
 
     rows = []
@@ -1267,8 +904,7 @@ def _render_import():
     st.caption(
         "Перетащите один или несколько Excel-файлов. Мы читаем "
         "**только видимые листы** и берём из каждого колонки "
-        "**«ИД»** и **«Категория замечания»**. "
-        "Скрытые листы (Data_Zamechaniya, История и т. п.) — игнорируются."
+        "**«ИД»** и **«Категория замечания»**."
     )
 
     uploaded = st.file_uploader(
@@ -1276,8 +912,6 @@ def _render_import():
         type=["xlsx", "xls", "xlsm", "xlsb"],
         accept_multiple_files=True,
         key="cat_import_files",
-        help="Поддерживаются xlsx, xls, xlsm (с макросами). "
-             "Читаются только видимые листы.",
     )
 
     if not uploaded:
@@ -1338,15 +972,6 @@ def _render_import():
             ].head(20)
             st.dataframe(unknown_df, use_container_width=True, hide_index=True)
 
-        with st.expander("Первые 10 строк для контроля", expanded=False):
-            cols = ["id", "category", "category_raw",
-                    "source_file", "source_sheet"]
-            available = [c for c in cols if c in combined_unique.columns]
-            st.dataframe(
-                combined_unique.head(10)[available],
-                use_container_width=True, hide_index=True,
-            )
-
     st.divider()
     st.markdown("#### 👤 Автор импорта")
 
@@ -1355,23 +980,13 @@ def _render_import():
         value=user_default if user_default != "инженер" else "",
         placeholder="Фамилия Имя Отчество",
         key="cat_import_user",
-        help="Имя будет записано как автор всех категорий из этого импорта",
     )
 
     force_overwrite = st.checkbox(
         "🔄 Перезаписать существующие категории",
         value=False,
         key="cat_import_force",
-        help="Если включено — импорт перезапишет категории, даже если "
-             "они уже были назначены другим специалистом. "
-             "По умолчанию — выключено (безопасный режим).",
-    )
-
-    st.caption(
-        f"**Автор** — из поля «Кто выполняет импорт». "
-        f"**Дата** — текущее время на момент импорта. "
-        f"**Режим** — "
-        f"{'🔄 принудительная перезапись' if force_overwrite else '🔒 безопасный (без перезаписи)'}."
+        help="Если включено — импорт перезапишет категории.",
     )
 
     apply = st.button(
@@ -1417,9 +1032,7 @@ def _render_import():
             row_user = import_user.strip()
 
             if force_overwrite:
-                ok, msg = update_category_force(
-                    cid, cat, user=row_user,
-                )
+                ok, msg = update_category_force(cid, cat, user=row_user)
             else:
                 ok, msg = update_category_safe(
                     cid, cat, user=row_user,
@@ -1440,22 +1053,13 @@ def _render_import():
         )
 
         if conflicts:
-            with st.expander(f"⚠️ Конфликты ({len(conflicts)})",
-                             expanded=True):
-                st.warning(
-                    "Эти ID уже были категоризированы другим пользователем. "
-                    "Перезапись не выполнена — сохранилась более ранняя "
-                    "категория. Если нужно перезаписать — сделайте это "
-                    "вручную на вкладке «Работа с замечаниями»."
-                )
+            with st.expander(f"⚠️ Конфликты ({len(conflicts)})", expanded=True):
                 for c in conflicts[:50]:
                     st.write(f"- {c}")
-                if len(conflicts) > 50:
-                    st.caption(f"... и ещё {len(conflicts) - 50}")
 
         if saved:
             st.cache_data.clear()
-            st.success(f"✅ Обновлено {saved} записей. Данные обновлены.")
+            st.success(f"✅ Обновлено {saved} записей.")
             st.rerun()
 
 
