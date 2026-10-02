@@ -2,16 +2,16 @@
 """
 📊 Сводка по проекту — главная витрина для Заказчика.
 
-Структура (5 секций, каждая — 3 блока [2, 3, 2]):
-  1. Объём замечаний — Всего + бублик / Активных + % / Закрыто и др.
-  2. Листы РД       — Всего + бублик / A+B+C+% / И и др.
-  3. Замечания на стороне АТП ТЛП — Всего + бублик / состав / сроки.
-  4. Замечания на стороне Заказчика — Всего + бублик / состав / сроки.
-  5. Категории замечаний, оценка АТП ТЛП — Всего + бублик / 5 категорий.
+Структура:
+  1. Объём замечаний — 6 плиток.
+  2. Листы РД — 8 плиток.
+  3. Замечания на стороне АТП ТЛП — 8 плиток.
+  4. Замечания на стороне Заказчика — 6 плиток.
+  5. Категории замечаний, оценка АТП ТЛП — 6 плиток.
   + Разрез по дисциплинам / разделам / комплектам.
 
-Источник: `_load_all_categorized` из deadlines.py.
-Логика: новая (holder / our_status / our_bucket / customer_bucket).
+Источник: `_load_all_categorized` (deadlines.py).
+Фильтры: дисциплина → раздел → расположение → комплект.
 """
 
 import pandas as pd
@@ -29,14 +29,6 @@ CAT_1 = "Принято/корректное"
 CAT_2 = "Формальное/нет влияния на СМР"
 CAT_3 = "Доп.требование/отсутствует в ТЗ"
 CAT_4 = "Не принято/нарушение ТНПА"
-
-DS_A = "A"
-DS_ANNULLED = "АННУЛИРОВАНО"
-
-STATUS_NEW = "Новое"
-STATUS_IN_WORK = "Принято в работу"
-STATUS_REJECTED = "Не принято"
-STATUS_DISCUSSION = "К обсуждению"
 
 BLOCK_OPTIONS = {
     "Корпус 1":                    "1",
@@ -80,13 +72,6 @@ SHEET_COLORS = {
     "Аннулировано":               "#7f7f7f",
 }
 
-BUCKET_COLORS = {
-    "≤10":   "#a5d6a7",   # зелёный — в сроке
-    "10–30": "#ffdd57",   # жёлтый
-    "30–90": "#ff7f0e",   # оранжевый
-    ">90":   "#d62728",   # красный
-}
-
 EMOJI = {
     "blue":   "🔵",
     "globe":  "🌐",
@@ -102,7 +87,7 @@ EMOJI = {
 
 
 # ---------------------------------------------------------------------------
-#  Источник активных замечаний
+#  Источник
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_all_categorized() -> pd.DataFrame:
@@ -144,7 +129,8 @@ def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_kit_options(disciplines: tuple = (),
-                      sections: tuple = ()) -> dict[str, str]:
+                      sections: tuple = (),
+                      block_codes: tuple = ()) -> dict[str, str]:
     with get_conn() as conn:
         where = ["c.code IS NOT NULL"]
         params: list = []
@@ -168,13 +154,23 @@ def _load_kit_options(disciplines: tuple = (),
             ORDER BY c.code
         """, tuple(params)).fetchall()
 
-    return {r["code"]: f"{r['code']} — {r['name']}"
+    result = {r["code"]: f"{r['code']} — {r['name']}"
                        if r["name"] else r["code"]
             for r in rows}
 
+    # Фильтр по расположению (4-й блок) — в Python
+    if block_codes:
+        filtered = {}
+        for code, label in result.items():
+            block = _extract_4th_block(code)
+            if block in block_codes:
+                filtered[code] = label
+        return filtered
+    return result
+
 
 # ---------------------------------------------------------------------------
-#  4-й блок шифра
+#  4-й блок
 # ---------------------------------------------------------------------------
 def _extract_4th_block(complex_code) -> str:
     if not complex_code:
@@ -358,8 +354,7 @@ def _render_scale_section(scale: dict,
         _metric(
             st, "Всего замечаний", scale["total_all"],
             "Выгрузка из Витро: COUNT(comments).\n\n"
-            "Включает: закрытые, аннулированные, без статуса, "
-            "активные.",
+            "Включает: закрытые, аннулированные, без статуса, активные.",
         )
         st_dist = _load_status_distribution_by_filter(
             _filter_key(
@@ -447,18 +442,15 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     with col_mid:
         _metric(
             st, f"{EMOJI['green']} Статус A — утверждён", n_a,
-            "Выгрузка из Витро: "
-            "COUNT(documents WHERE status='A').",
+            "Выгрузка из Витро: COUNT(documents WHERE status='A').",
         )
         _metric(
             st, f"{EMOJI['yellow']} Статус B — к сдаче", n_b,
-            "Выгрузка из Витро: "
-            "COUNT(documents WHERE status='B').",
+            "Выгрузка из Витро: COUNT(documents WHERE status='B').",
         )
         _metric(
             st, f"{EMOJI['orange']} Статус C — в работе", n_c,
-            "Выгрузка из Витро: "
-            "COUNT(documents WHERE status='C').",
+            "Выгрузка из Витро: COUNT(documents WHERE status='C').",
         )
         _metric(
             st, " % готовых (A+B)", f"{pct_ab}%",
@@ -514,7 +506,6 @@ def _render_ours_section(active_df: pd.DataFrame) -> None:
 
     col_left, col_mid, col_right = st.columns([2, 3, 2])
 
-    # ----- Левый -----
     with col_left:
         _metric(
             st, "Всего у АТП ТЛП", n_total,
@@ -537,7 +528,6 @@ def _render_ours_section(active_df: pd.DataFrame) -> None:
         _pie(pie_data, "Статус", "Количество", STATUS_COLORS,
              "sum_pie_ours")
 
-    # ----- Средний -----
     with col_mid:
         _metric(
             st, f"{EMOJI['blue']} Новое", n_new,
@@ -564,7 +554,6 @@ def _render_ours_section(active_df: pd.DataFrame) -> None:
             "Входит в «Всего у АТП ТЛП».",
         )
 
-    # ----- Правый -----
     with col_right:
         _metric(
             st, " из них срок ответа не превышен", n_in_time,
@@ -612,7 +601,6 @@ def _render_customer_section(active_df: pd.DataFrame) -> None:
 
     col_left, col_mid, col_right = st.columns([2, 3, 2])
 
-    # ----- Левый -----
     with col_left:
         _metric(
             st, "Всего у заказчика", n_total,
@@ -639,7 +627,6 @@ def _render_customer_section(active_df: pd.DataFrame) -> None:
             "sum_pie_customer",
         )
 
-    # ----- Средний -----
     with col_mid:
         _metric(
             st, f"{EMOJI['green']} со статусом Выполнено", n_done,
@@ -660,7 +647,6 @@ def _render_customer_section(active_df: pd.DataFrame) -> None:
             "Ожидаем снятия от заказчика.",
         )
 
-    # ----- Правый -----
     with col_right:
         _metric(
             st, " из них срок рассмотрения не превышен", n_in_time,
@@ -681,7 +667,7 @@ def _render_customer_section(active_df: pd.DataFrame) -> None:
 
 
 # ===========================================================================
-#  СЕКЦИЯ 5. Категории замечаний, оценка АТП ТЛП
+#  СЕКЦИЯ 5. Категории замечаний
 # ===========================================================================
 def _render_categories_section(active_df: pd.DataFrame) -> None:
     st.markdown("##### Категории замечаний, оценка АТП ТЛП")
@@ -755,7 +741,7 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
 
 
 # ===========================================================================
-#  Бублик: статусы замечаний (Секция 1)
+#  Бублик статусов замечаний
 # ===========================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
@@ -832,38 +818,94 @@ def _sheet_distribution_from_df(docs_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===========================================================================
-#  Разрез: по дисциплинам / разделам / комплектам
+#  Разрез
 # ===========================================================================
 def _build_summary_rows(group_col: str,
-                         active_df: pd.DataFrame) -> pd.DataFrame:
-    if active_df.empty:
+                         active_df: pd.DataFrame,
+                         docs_df: pd.DataFrame) -> pd.DataFrame:
+    if docs_df.empty and active_df.empty:
         return pd.DataFrame()
 
-    ours = active_df[active_df["holder"] == "ours"]
+    # --- Листы ---
+    if not docs_df.empty:
+        doc_rows = []
+        for grp, sub in docs_df.groupby(group_col, dropna=True):
+            if not grp:
+                continue
+            total = len(sub)
+            statuses = sub["status"].astype(str).str.strip().str.upper()
+            a = int((statuses == "A").sum())
+            b = int((statuses == "B").sum())
+            c = int((statuses == "C").sum())
+            i = int((statuses == "И").sum())
+            annulled = int((statuses == "АННУЛИРОВАНО").sum())
+            pct_ab = (round((a + b) / total * 100, 1)
+                      if total > 0 else 0.0)
+            doc_rows.append({
+                group_col: grp,
+                "docs_total": total,
+                "doc_a": a,
+                "doc_b": b,
+                "doc_c": c,
+                "doc_i": i,
+                "doc_annulled": annulled,
+                "doc_other": total - a - b - c - i - annulled,
+                "pct_ab": pct_ab,
+            })
+        docs_grp = pd.DataFrame(doc_rows)
+    else:
+        docs_grp = pd.DataFrame()
 
-    if ours.empty:
+    # --- Замечания (только наши) ---
+    if not active_df.empty:
+        ours = active_df[active_df["holder"] == "ours"].copy()
+
+        if not ours.empty:
+            rows = []
+            for grp, sub in ours.groupby(group_col, dropna=True):
+                if not grp:
+                    continue
+
+                statuses = sub["status"]
+                buckets = sub["our_bucket"]
+                cat_counts = (
+                    sub["category"].fillna("Без категории")
+                    .replace("", "Без категории")
+                    .value_counts()
+                )
+
+                rows.append({
+                    group_col: grp,
+                    "active_total": len(sub),
+                    "n_new": int((statuses == "Новое").sum()),
+                    "n_in_work": int(
+                        (statuses == "Принято в работу").sum()),
+                    "n_rejected": int((statuses == "Не принято").sum()),
+                    "n_discussion": int(
+                        (statuses == "К обсуждению").sum()),
+                    "n_in_time": int((buckets == "≤10").sum()),
+                    "n_overdue": int(buckets.isin(
+                        ["10–30", "30–90", ">90"]).sum()),
+                    "cat_1": int(cat_counts.get(CAT_1, 0)),
+                    "cat_2": int(cat_counts.get(CAT_2, 0)),
+                    "cat_3": int(cat_counts.get(CAT_3, 0)),
+                    "cat_4": int(cat_counts.get(CAT_4, 0)),
+                    "cat_none": int(cat_counts.get("Без категории", 0)),
+                })
+            active_grp = pd.DataFrame(rows)
+        else:
+            active_grp = pd.DataFrame()
+    else:
+        active_grp = pd.DataFrame()
+
+    if docs_grp.empty and active_grp.empty:
         return pd.DataFrame()
-
-    rows = []
-    for grp, sub in ours.groupby(group_col, dropna=True):
-        if not grp:
-            continue
-
-        row = {group_col: grp}
-        row["total"] = len(sub)
-        row["n_new"] = int((sub["our_status"] == "new").sum())
-        row["n_in_work"] = int((sub["our_status"] == "in_work").sum())
-        row["n_rejected"] = int((sub["our_status"] == "rejected").sum())
-        row["n_disc"] = int((sub["our_status"] == "discussion").sum())
-        row["n_in_time"] = int((sub["our_bucket"] == "≤10").sum())
-        row["n_overdue"] = int(sub["our_bucket"].isin(
-            ["10–30", "30–90", ">90"]).sum())
-        rows.append(row)
-
-    result = pd.DataFrame(rows)
-    if result.empty:
-        return result
-
+    if docs_grp.empty:
+        result = active_grp
+    elif active_grp.empty:
+        result = docs_grp
+    else:
+        result = docs_grp.merge(active_grp, on=group_col, how="outer")
     result = result.fillna(0)
 
     group_col_names = {
@@ -876,36 +918,64 @@ def _build_summary_rows(group_col: str,
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_summary_by_discipline(disciplines: tuple = (),
-                                  sections: tuple = (),
-                                  kits: tuple = (),
-                                  block_codes: tuple = ()) -> pd.DataFrame:
+def _load_summary_by_discipline(
+    disciplines: tuple = (),
+    sections: tuple = (),
+    kits: tuple = (),
+    block_codes: tuple = (),
+) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
                              block_codes)
-    return _build_summary_rows("discipline", active)
+    docs = _load_documents()
+    docs = _filter_documents(docs, disciplines, sections, kits,
+                              block_codes)
+    return _build_summary_rows("discipline", active, docs)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_summary_by_section(disciplines: tuple = (),
-                               sections: tuple = (),
-                               kits: tuple = (),
-                               block_codes: tuple = ()) -> pd.DataFrame:
+def _load_summary_by_section(
+    disciplines: tuple = (),
+    sections: tuple = (),
+    kits: tuple = (),
+    block_codes: tuple = (),
+) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
                              block_codes)
-    return _build_summary_rows("section", active)
+    docs = _load_documents()
+    docs = _filter_documents(docs, disciplines, sections, kits,
+                              block_codes)
+    return _build_summary_rows("section", active, docs)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_summary_by_complex(disciplines: tuple = (),
-                               sections: tuple = (),
-                               kits: tuple = (),
-                               block_codes: tuple = ()) -> pd.DataFrame:
+def _load_summary_by_complex(
+    disciplines: tuple = (),
+    sections: tuple = (),
+    kits: tuple = (),
+    block_codes: tuple = (),
+) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
                              block_codes)
-    return _build_summary_rows("complex", active)
+    docs = _load_documents()
+    docs = _filter_documents(docs, disciplines, sections, kits,
+                              block_codes)
+    result = _build_summary_rows("complex", active, docs)
+
+    # Добавляем «Наименование» из complexes
+    if not result.empty and "Комплект" in result.columns:
+        with get_conn() as conn:
+            names_df = pd.read_sql(
+                'SELECT code AS "Комплект", name AS "Наименование" '
+                "FROM complexes",
+                conn,
+            )
+        result = result.merge(names_df, on="Комплект", how="left")
+        result["Наименование"] = result["Наименование"].fillna("")
+
+    return result
 
 
 def _render_summary_table(df: pd.DataFrame,
@@ -917,56 +987,71 @@ def _render_summary_table(df: pd.DataFrame,
 
     view = df.copy()
 
+    # Для дисциплин — «Наименование» через справочник
     if level == "discipline" and "Код" in view.columns:
         view.insert(
             1, "Наименование",
-            view["Код"].map(lambda c: discipline_name(c) if c else ""),
+            view["Код"].map(
+                lambda c: discipline_name(c) if c else ""
+            ),
         )
 
+    # Для комплектов — «Наименование» уже из merge
+    if level == "complex" and "Наименование" in view.columns:
+        cols = list(view.columns)
+        cols.remove("Наименование")
+        cols.insert(1, "Наименование")
+        view = view[cols]
+
+    # Переименование
     rename_map = {
-        "total":        "Всего у АТП ТЛП",
-        "n_new":        f"{EMOJI['blue']} Новое",
-        "n_in_work":    f"{EMOJI['globe']} Принято в работу",
-        "n_rejected":   f"{EMOJI['red']} Не принято",
-        "n_disc":       f"{EMOJI['yellow']} К обсуждению",
+        "active_total": "Всего у АТП ТЛП",
         "n_in_time":    "срок ответа не превышен",
         "n_overdue":    "Просрочено (>10 р.д.)",
+        "docs_total":   "Листов",
     }
     view = view.rename(columns=rename_map)
 
-    base_order = [group_label]
-    if level == "discipline":
-        base_order.append("Наименование")
+    # Приводим числовые колонки к int (из-за merge — float)
+    for c in ["Всего у АТП ТЛП", "срок ответа не превышен",
+              "Просрочено (>10 р.д.)", "Листов"]:
+        if c in view.columns:
+            view[c] = view[c].fillna(0).astype(int)
 
-    cols_order = base_order + [
+    # Оставляем только нужные колонки
+    base = [group_label]
+    if level in ("discipline", "complex"):
+        base.append("Наименование")
+
+    cols_order = base + [
         "Всего у АТП ТЛП",
-        f"{EMOJI['blue']} Новое",
-        f"{EMOJI['globe']} Принято в работу",
-        f"{EMOJI['red']} Не принято",
-        f"{EMOJI['yellow']} К обсуждению",
         "срок ответа не превышен",
         "Просрочено (>10 р.д.)",
+        "Листов",
     ]
     cols_order = [c for c in cols_order if c in view.columns]
     view = view[cols_order]
 
+    # Сортировка по «Всего у АТП ТЛП»
     if "Всего у АТП ТЛП" in view.columns:
         view = view.sort_values("Всего у АТП ТЛП", ascending=False)
 
-    # Строка ИТОГО
+    # ===== Строка ИТОГО =====
     totals_row = {group_label: "ИТОГО"}
-    if level == "discipline":
+    if level in ("discipline", "complex"):
         totals_row["Наименование"] = ""
+
     for c in view.columns:
         if c in (group_label, "Наименование"):
             continue
-        totals_row[c] = int(view[c].sum())
+        totals_row[c] = int(view[c].fillna(0).sum())
 
     view_with_total = pd.concat(
         [view, pd.DataFrame([totals_row])],
         ignore_index=True,
     )
 
+    # Стилизация: жирный + серый фон для ИТОГО
     def _style_row(row):
         if row.name == len(view_with_total) - 1:
             return ["font-weight: bold; "
@@ -980,13 +1065,20 @@ def _render_summary_table(df: pd.DataFrame,
         use_container_width=True,
         hide_index=True,
         height=600,
+        column_config={
+            "Всего у АТП ТЛП": st.column_config.NumberColumn(
+                format="%d"),
+            "срок ответа не превышен": st.column_config.NumberColumn(
+                format="%d"),
+            "Просрочено (>10 р.д.)": st.column_config.NumberColumn(
+                format="%d"),
+            "Листов": st.column_config.NumberColumn(format="%d"),
+        },
     )
 
     st.caption(
-        f"Показано **{len(view)}** групп. "
-        f"Строка **ИТОГО** — внизу таблицы. "
-        f"Замечания к листам A и к аннулированным в разрез "
-        f"не входят."
+        f"Показано **{len(view)}** строк. "
+        f"Строка **ИТОГО** — внизу таблицы."
     )
 
 
@@ -1003,27 +1095,28 @@ def render():
     disc_options = _load_discipline_options()
 
     with st.expander("Фильтры", expanded=True):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
 
+        # 1. Дисциплина
         with c1:
             sel_disc_labels = st.multiselect(
                 "Дисциплина",
                 options=list(disc_options.values()),
-                placeholder="Все дисциплины",
+                placeholder="Все",
                 key="sum_disc",
             )
             sel_disc = [code for code, label in disc_options.items()
                         if label in sel_disc_labels]
 
+        # 2. Раздел
         section_options = _load_section_options(
             tuple(sel_disc) if sel_disc else ())
-
         with c2:
             if section_options:
                 sel_section_labels = st.multiselect(
                     "Раздел",
                     options=list(section_options.values()),
-                    placeholder="Все разделы",
+                    placeholder="Все",
                     key="sum_section",
                 )
                 sel_section = [
@@ -1034,34 +1127,35 @@ def render():
                 sel_section = []
                 st.multiselect(
                     "Раздел", options=[],
-                    placeholder="Разделы не применимы",
+                    placeholder="—",
                     disabled=True, key="sum_section_empty",
                 )
 
+        # 3. Расположение
+        with c3:
+            sel_blocks = st.multiselect(
+                "Расположение",
+                options=list(BLOCK_OPTIONS.keys()),
+                placeholder="Все",
+                key="sum_blocks",
+            )
+            block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
+
+        # 4. Комплект (зависит от всех трёх)
         kit_options = _load_kit_options(
             tuple(sel_disc) if sel_disc else (),
             tuple(sel_section) if sel_section else (),
+            block_codes,
         )
-
-        with c3:
+        with c4:
             sel_kit_labels = st.multiselect(
                 "Комплект",
                 options=list(kit_options.values()),
-                placeholder="Все комплекты",
+                placeholder="Все",
                 key="sum_kit",
             )
             sel_kit = [code for code, label in kit_options.items()
                         if label in sel_kit_labels]
-
-        sel_blocks = st.multiselect(
-            "Расположение (4-й блок шифра)",
-            options=list(BLOCK_OPTIONS.keys()),
-            placeholder="Все комплекты",
-            key="sum_blocks",
-            help="Фильтр по 4-му блоку шифра комплекта. "
-                 "Можно выбрать несколько.",
-        )
-        block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
 
     disc_t = tuple(sel_disc)
     sect_t = tuple(sel_section)
