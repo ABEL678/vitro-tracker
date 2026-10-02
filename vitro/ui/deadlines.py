@@ -4,12 +4,12 @@
 
 Одна вкладка:
   0. Дата последней выгрузки из Витро.
-  1. Фильтры (каскадные): дисциплина → раздел → комплект → лист + расположение.
+  1. Фильтры (каскадные): дисциплина → раздел → расположение →
+     комплект → лист.
   2. KPI: Всего у АТП ТЛП / срок ответа не превышен / Просрочено.
-  3. 3 бублика (с легендой): просрочка ответа / статусы замечаний / статусы листов.
-  4. Список замечаний с фильтрами (AND) и сортировкой.
-
-Источник: `_load_all_categorized` — единый.
+  3. 3 бублика (с легендой): просрочка ответа / статусы замечаний /
+     статусы листов.
+  4. Список замечаний с фильтрами (AND), сортировкой и свёрткой.
 """
 
 import time
@@ -87,7 +87,6 @@ SHEET_GROUP_ORDER = [
     "Прочее",
 ]
 
-# Для вкладки «Сроки» (holder == "ours") — без A и аннулированных
 SHEET_GROUPS_OURS = [
     "B — к сдаче",
     "C — в работе",
@@ -132,32 +131,50 @@ def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_kit_options(disciplines: tuple = (),
-                       sections: tuple = ()) -> dict[str, str]:
+                       sections: tuple = (),
+                       block_codes: tuple = ()) -> dict[str, str]:
+    """
+    Комплекты с учётом дисциплин, разделов и расположения (4-й блок).
+    """
     with get_conn() as conn:
         where = ["c.code IS NOT NULL"]
         params: list = []
+
         if disciplines:
             where.append(
                 f"c.discipline IN ({','.join('?' * len(disciplines))})")
             params += list(disciplines)
+
         if sections:
             ph = ",".join("?" * len(sections))
             where.append(f"""c.code IN (
                 SELECT DISTINCT complex FROM documents
                 WHERE section IN ({ph}) AND complex IS NOT NULL)""")
             params += list(sections)
+
         rows = conn.execute(f"""
             SELECT c.code, c.name FROM complexes c
             WHERE {' AND '.join(where)} ORDER BY c.code
         """, tuple(params)).fetchall()
-    return {r["code"]: f"{r['code']} — {r['name']}"
+
+    result = {r["code"]: f"{r['code']} — {r['name']}"
                        if r["name"] else r["code"]
             for r in rows}
+
+    # Фильтр по расположению (в Python)
+    if block_codes:
+        filtered = {}
+        for code, label in result.items():
+            block = _extract_4th_block(code)
+            if block in block_codes:
+                filtered[code] = label
+        return filtered
+
+    return result
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_sheet_options(kits: tuple = ()) -> list[str]:
-    """Список листов для выбранных комплектов."""
     if not kits:
         return []
     with get_conn() as conn:
@@ -173,7 +190,6 @@ def _load_sheet_options(kits: tuple = ()) -> list[str]:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_last_sync_date() -> str | None:
-    """Дата последней успешной выгрузки из Витро."""
     try:
         with get_conn() as conn:
             row = conn.execute("""
@@ -189,7 +205,6 @@ def _load_last_sync_date() -> str | None:
 
 
 def _fmt_sync_date(ts) -> str:
-    """2026-09-30T10:23:42 → 30.09.2026, 10:23"""
     if not ts:
         return "—"
     try:
@@ -230,6 +245,23 @@ def _sheet_status_group(raw) -> str:
     if s == "АННУЛИРОВАНО":
         return "Аннулировано"
     return "Прочее"
+
+
+def _collapse_repeats(df: pd.DataFrame,
+                       cols: list) -> pd.DataFrame:
+    """
+    Скрывает повторяющиеся значения в колонках.
+    Если значение совпадает с предыдущей строкой — заменяется на "".
+    """
+    out = df.copy()
+    key_prev = None
+    for idx, row in out.iterrows():
+        key = tuple(row[c] for c in cols)
+        if key == key_prev:
+            for c in cols:
+                out.at[idx, c] = ""
+        key_prev = key
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +321,7 @@ def _load_all_categorized() -> pd.DataFrame:
         if cust_due and today > cust_due:
             wd_waiting_customer = workdays_between(cust_due, today)
 
-        # ---- holder ----
+        # holder
         holder = "other"
         if doc_status == "АННУЛИРОВАНО":
             holder = "annulled"
@@ -301,7 +333,6 @@ def _load_all_categorized() -> pd.DataFrame:
                          "Не принято", "К обсуждению"):
             holder = "ours"
 
-        # ---- our_status ----
         our_status = None
         if holder == "ours":
             our_status = {
@@ -311,7 +342,6 @@ def _load_all_categorized() -> pd.DataFrame:
                 "К обсуждению": "discussion",
             }.get(status)
 
-        # ---- our_bucket ----
         our_bucket = None
         if holder == "ours":
             if wd_overdue_work == 0:
@@ -323,7 +353,6 @@ def _load_all_categorized() -> pd.DataFrame:
             else:
                 our_bucket = ">90"
 
-        # ---- customer_bucket ----
         customer_bucket = None
         if holder == "customer":
             if cust_due is None or wd_waiting_customer == 0:
@@ -335,7 +364,7 @@ def _load_all_categorized() -> pd.DataFrame:
             else:
                 customer_bucket = ">90"
 
-        # ---- category_flag (для совместимости) ----
+        # category_flag (для совместимости)
         category = "other"
         if status == "Выполнено":
             if doc_status in ("A", "B"):
@@ -480,6 +509,7 @@ def _render_filters():
 
     c1, c2, c3, c4, c5 = st.columns(5)
 
+    # 1. Дисциплина
     with c1:
         sel_disc_labels = st.multiselect(
             "Дисциплина", options=list(disc_options.values()),
@@ -488,6 +518,7 @@ def _render_filters():
         sel_disc = [c for c, l in disc_options.items()
                     if l in sel_disc_labels]
 
+    # 2. Раздел
     section_options = _load_section_options(
         tuple(sel_disc) if sel_disc else ())
     with c2:
@@ -504,10 +535,23 @@ def _render_filters():
                             placeholder="—",
                             disabled=True, key="dl_section_empty")
 
+    # 3. Расположение
+    with c3:
+        sel_blocks = st.multiselect(
+            "Расположение",
+            options=list(BLOCK_OPTIONS.keys()),
+            placeholder="Все",
+            key="dl_blocks",
+        )
+        block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
+
+    # 4. Комплект (с учётом дисциплины, раздела, расположения)
     kit_options = _load_kit_options(
         tuple(sel_disc) if sel_disc else (),
-        tuple(sel_section) if sel_section else ())
-    with c3:
+        tuple(sel_section) if sel_section else (),
+        block_codes,
+    )
+    with c4:
         sel_kit_labels = st.multiselect(
             "Комплект", options=list(kit_options.values()),
             placeholder="Все", key="dl_kit",
@@ -515,8 +559,8 @@ def _render_filters():
         sel_kit = [c for c, l in kit_options.items()
                     if l in sel_kit_labels]
 
-    # Фильтр «Лист» — каскадный
-    with c4:
+    # 5. Лист (только из выбранного комплекта)
+    with c5:
         if sel_kit:
             sheet_options = _load_sheet_options(tuple(sel_kit))
             sel_sheet = st.multiselect(
@@ -528,15 +572,6 @@ def _render_filters():
             st.multiselect("Лист", options=[],
                             placeholder="Выберите комплект",
                             disabled=True, key="dl_sheet_empty")
-
-    with c5:
-        sel_blocks = st.multiselect(
-            "Расположение",
-            options=list(BLOCK_OPTIONS.keys()),
-            placeholder="Все",
-            key="dl_blocks",
-        )
-        block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
 
     return (tuple(sel_disc), tuple(sel_section),
             tuple(sel_kit), tuple(sel_sheet), block_codes)
@@ -569,7 +604,6 @@ def _apply_filters(df: pd.DataFrame,
 def render():
     st.header("⏰ Сроки")
 
-    # Дата последней выгрузки
     sync_date = _load_last_sync_date()
     st.info(
         f"### Дата последней выгрузки из Витро: "
@@ -677,10 +711,8 @@ def render():
 
     with c1:
         sel_bucket = st.multiselect(
-            "Просрочка",
-            options=BUCKET_ORDER,
-            placeholder="Все",
-            key="dl_f_bucket",
+            "Просрочка", options=BUCKET_ORDER,
+            placeholder="Все", key="dl_f_bucket",
         )
 
     with c2:
@@ -688,19 +720,16 @@ def render():
             "Статус замечания",
             options=["Новое", "Принято в работу",
                      "Не принято", "К обсуждению"],
-            placeholder="Все",
-            key="dl_f_status",
+            placeholder="Все", key="dl_f_status",
         )
 
     with c3:
         sel_sheet_group = st.multiselect(
             "Статус листа",
             options=SHEET_GROUPS_OURS,
-            placeholder="Все",
-            key="dl_f_sheet",
+            placeholder="Все", key="dl_f_sheet",
         )
 
-    # Применяем фильтры (AND)
     filtered = ours.copy()
     if sel_bucket:
         filtered = filtered[filtered["our_bucket"].isin(sel_bucket)]
@@ -714,34 +743,18 @@ def render():
         st.warning("По фильтрам нет замечаний.")
         return
 
-    # Сортировка
-    sort_by = st.selectbox(
-        "Сортировка",
-        options=[
-            "Просрочка ↓ (критичные сверху)",
-            "Просрочка ↑ (свежие сверху)",
-            "Дата создания ↓",
-            "Дата создания ↑",
-            "Комплект ↑",
-        ],
-        key="dl_sort",
+    # Сортировка: Комплект → Лист → Просрочка ↓
+    filtered = filtered.sort_values(
+        ["complex", "sheet", "days_overdue_work"],
+        ascending=[True, True, False],
     )
 
-    if sort_by == "Просрочка ↓ (критичные сверху)":
-        filtered = filtered.sort_values(
-            "days_overdue_work", ascending=False)
-    elif sort_by == "Просрочка ↑ (свежие сверху)":
-        filtered = filtered.sort_values(
-            "days_overdue_work", ascending=True)
-    elif sort_by == "Дата создания ↓":
-        filtered = filtered.sort_values("created_d", ascending=False)
-    elif sort_by == "Дата создания ↑":
-        filtered = filtered.sort_values("created_d", ascending=True)
-    elif sort_by == "Комплект ↑":
-        filtered = filtered.sort_values("complex", ascending=True)
+    # Свёртка повторяющихся значений (Комплект + Лист)
+    filtered_display = _collapse_repeats(
+        filtered, ["complex", "sheet"]
+    )
 
-    # Таблица
-    table = filtered[[
+    table = filtered_display[[
         "id", "complex", "sheet", "comment", "author",
         "status", "created", "days_overdue_work",
     ]].copy().rename(columns={
