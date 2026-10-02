@@ -3,12 +3,12 @@
 👤 Авторы — аналитика по инженерам заказчика.
 
 Данные — из единого источника `_load_all_categorized` (deadlines.py).
-Логика подсчёта — как на вкладке «Сводка по проекту»
-(holder / our_status / our_bucket / customer_bucket).
+Логика подсчёта — как на вкладке «Сводка по проекту».
 
-2 под-вкладки:
+3 под-вкладки:
   📊 Аналитика авторов — KPI, таблица авторов, детали автора.
   🔵 Ждут заказчика    — редактор категорий.
+  📄 К листам A и аннулированным — список замечаний (просмотр).
 """
 
 import pandas as pd
@@ -59,6 +59,20 @@ def _strip_prefix(display_value: str) -> str:
         if display_value.startswith(prefix):
             return display_value[len(prefix):].strip()
     return display_value.strip()
+
+
+def _collapse_repeats(df: pd.DataFrame,
+                       cols: list) -> pd.DataFrame:
+    """Скрывает повторяющиеся значения в колонках."""
+    out = df.copy()
+    key_prev = None
+    for idx, row in out.iterrows():
+        key = tuple(row[c] for c in cols)
+        if key == key_prev:
+            for c in cols:
+                out.at[idx, c] = ""
+        key_prev = key
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +161,6 @@ def _filter_by_hierarchy(df: pd.DataFrame,
 #  KPI
 # ---------------------------------------------------------------------------
 def _render_kpi(df_all: pd.DataFrame, df_ours: pd.DataFrame):
-    """
-    df_all  — все активные (для «Активных»), 33 936.
-    df_ours — только holder == "ours" (для категорий), 20 770.
-    """
     if df_all.empty:
         st.info("Нет данных по авторам с учётом фильтров.")
         return
@@ -208,26 +218,20 @@ def _render_kpi(df_all: pd.DataFrame, df_ours: pd.DataFrame):
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_authors(disciplines: tuple = (), sections: tuple = (),
                    kits: tuple = ()) -> pd.DataFrame:
-    """
-    Сводка по авторам. Логика — как на Сводке.
-    - «Всего выдал» = holder == "ours" для автора.
-    - «Просрочено им» = holder == "customer" + customer_bucket не «≤10».
-    - Категории — по holder == "ours".
-    """
     df = _load_all_categorized()
     df = _filter_by_hierarchy(df, disciplines, sections, kits)
 
     if df.empty:
         return pd.DataFrame()
 
-    # Для «Просрочено им»
+    # Просрочено им (заказчик не рассмотрел > 10 р.д.)
     customers = df[df["holder"] == "customer"]
     customers_overdue = customers[
         customers["customer_bucket"].isin(["10–30", "30–90", ">90"])
     ]
     overdue_by_author = customers_overdue.groupby("author").size()
 
-    # Для «Всего выдал» и категорий
+    # Наши замечания
     ours = df[df["holder"] == "ours"].copy()
     if ours.empty:
         return pd.DataFrame()
@@ -400,29 +404,18 @@ def _render_drilldown(df: pd.DataFrame):
 
     row = df[df["author"] == sel].iloc[0]
 
-    # ---- KPI автора ----
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric(
-        "Всего выдал", int(row["total"]),
-        help="Замечания автора, ожидающие ответа АТП ТЛП.",
-    )
-    c2.metric(
-        "Просрочено им", int(row["customer_overdue"]),
-        help="Заказчик не рассмотрел наш ответ > 10 р.д.",
-    )
-    c3.metric(
-        "Принято", int(row["cat_1"]),
-        help="Оценка АТП ТЛП: замечание принято как корректное.",
-    )
-    c4.metric(
-        "Не принято", int(row["cat_4"]),
-        help="Оценка АТП ТЛП: замечание не принимаем.",
-    )
-    c5.metric(
-        "% принятых", f"{row['pct_accepted']}%",
-        help="Принято / (Принято + Формальное + Доп.треб. + Не принято). "
-             "«Без категории» не учитывается.",
-    )
+    c1.metric("Всего выдал", int(row["total"]),
+              help="Замечания автора, ожидающие ответа АТП ТЛП.")
+    c2.metric("Просрочено им", int(row["customer_overdue"]),
+              help="Заказчик не рассмотрел наш ответ > 10 р.д.")
+    c3.metric("Принято", int(row["cat_1"]),
+              help="Оценка АТП ТЛП: замечание принято как корректное.")
+    c4.metric("Не принято", int(row["cat_4"]),
+              help="Оценка АТП ТЛП: замечание не принимаем.")
+    c5.metric("% принятых", f"{row['pct_accepted']}%",
+              help="Принято / (Принято + Формальное + Доп.треб. + "
+                   "Не принято). «Без категории» не учитывается.")
 
     st.divider()
 
@@ -493,10 +486,6 @@ def _render_drilldown(df: pd.DataFrame):
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_waiting_review(disciplines=None, kits=None,
                           sections=None, authors=None) -> pd.DataFrame:
-    """
-    Замечания, ожидающие рассмотрения заказчика.
-    Логика Сводки: holder == "customer" (включая К листам B).
-    """
     df = _load_all_categorized()
     if df.empty:
         return df
@@ -590,7 +579,6 @@ def _render_waiting_review():
         st.success("🎉 Нет замечаний, ожидающих рассмотрения заказчика.")
         return
 
-    # ---- KPI 4 бакета ----
     buckets_order = ["≤10", "10–30", "30–90", ">90"]
     counts = {b: int((df["customer_bucket"] == b).sum())
               for b in buckets_order}
@@ -635,12 +623,7 @@ def _render_waiting_review():
 
     df["category"] = df["category"].map(_CAT_PREFIX_MAP).fillna(df["category"])
 
-    bucket_priority = {
-        ">90":   0,
-        "30–90": 1,
-        "10–30": 2,
-        "≤10":   3,
-    }
+    bucket_priority = {">90": 0, "30–90": 1, "10–30": 2, "≤10": 3}
     df["_sort"] = df["customer_bucket"].map(bucket_priority)
     df = df.sort_values(["_sort", "days_waiting"],
                          ascending=[True, False]).drop(columns=["_sort"])
@@ -753,6 +736,211 @@ def _render_waiting_review():
 
 
 # ---------------------------------------------------------------------------
+#  К листам A и аннулированным
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_customer_a_annulled(disciplines=None, kits=None,
+                                sections=None) -> pd.DataFrame:
+    """
+    Замечания к листам A и к аннулированным листам.
+    holder IN ('customer_a', 'annulled').
+    """
+    df = _load_all_categorized()
+    if df.empty:
+        return df
+
+    df = df[df["holder"].isin(["customer_a", "annulled"])].copy()
+    if df.empty:
+        return df
+
+    if disciplines:
+        df = df[df["discipline"].isin(disciplines)]
+    if sections:
+        df = df[df["section"].isin(sections)]
+    if kits:
+        df = df[df["complex"].isin(kits)]
+
+    return df
+
+
+def _render_customer_a_annulled():
+    st.markdown("### 📄 Замечания к листам A и аннулированным")
+    st.caption(
+        "Листы A — утверждены, аннулированные — сняты заказчиком. "
+        "Замечания фактически не актуальны, но формально не закрыты. "
+        "Ожидаем снятия от заказчика."
+    )
+
+    disc_options = _load_discipline_options()
+    with st.expander("🎛 Фильтры", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sel_disc_labels = st.multiselect(
+                "Дисциплина", options=list(disc_options.values()),
+                placeholder="Все дисциплины", key="ca_disc",
+            )
+            sel_disc = [c for c, l in disc_options.items()
+                         if l in sel_disc_labels]
+        section_options = _load_section_options(
+            tuple(sel_disc) if sel_disc else ())
+        with c2:
+            if section_options:
+                sel_section_labels = st.multiselect(
+                    "Раздел", options=list(section_options.values()),
+                    placeholder="Все разделы", key="ca_section",
+                )
+                sel_section = [c for c, l in section_options.items()
+                                if l in sel_section_labels]
+            else:
+                sel_section = []
+                st.multiselect("Раздел", options=[],
+                                placeholder="Не применимы",
+                                disabled=True, key="ca_section_empty")
+        kit_options = _load_kit_options(
+            tuple(sel_disc) if sel_disc else (),
+            tuple(sel_section) if sel_section else ())
+        with c3:
+            sel_kit_labels = st.multiselect(
+                "Комплект", options=list(kit_options.values()),
+                placeholder="Все комплекты", key="ca_kit",
+            )
+            sel_kit = [c for c, l in kit_options.items()
+                        if l in sel_kit_labels]
+
+    df = _load_customer_a_annulled(
+        disciplines=tuple(sel_disc) if sel_disc else None,
+        kits=tuple(sel_kit) if sel_kit else None,
+        sections=tuple(sel_section) if sel_section else None,
+    )
+
+    if df.empty:
+        st.success("🎉 Нет замечаний к листам A или аннулированным.")
+        return
+
+    # Группа
+    df = df.copy()
+    df["_group"] = df["holder"].map({
+        "customer_a": "🟢 К листам A (утверждён)",
+        "annulled":   "⚫ К аннулированным",
+    })
+
+    n_a = int((df["holder"] == "customer_a").sum())
+    n_annul = int((df["holder"] == "annulled").sum())
+    n_total = n_a + n_annul
+
+    st.markdown("##### 📊 Объём")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "🟢 К листам A (утверждён)", f"{n_a:,}".replace(",", " "),
+        help="Лист утверждён — заказчик должен снять замечания.",
+    )
+    c2.metric(
+        "⚫ К аннулированным", f"{n_annul:,}".replace(",", " "),
+        help="Лист аннулирован — заказчик должен снять замечания.",
+    )
+    c3.metric(
+        "📊 Итого", f"{n_total:,}".replace(",", " "),
+        help="Суммарно замечаний к листам A и аннулированным.",
+    )
+
+    st.divider()
+
+    # Фильтр по группе
+    st.markdown(f"##### 📋 Список ({len(df):,})".replace(",", " "))
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sel_group = st.multiselect(
+            "Группа",
+            options=["🟢 К листам A (утверждён)",
+                     "⚫ К аннулированным"],
+            placeholder="Все", key="ca_group",
+        )
+    with c2:
+        sel_status = st.multiselect(
+            "Статус замечания",
+            options=["Новое", "Принято в работу",
+                     "Не принято", "К обсуждению", "Выполнено"],
+            placeholder="Все", key="ca_status",
+        )
+    with c3:
+        sel_sheet_status = st.multiselect(
+            "Статус листа",
+            options=["A", "B", "C", "И", "АННУЛИРОВАНО"],
+            placeholder="Все", key="ca_sheet_status",
+        )
+
+    filtered = df.copy()
+    if sel_group:
+        filtered = filtered[filtered["_group"].isin(sel_group)]
+    if sel_status:
+        filtered = filtered[filtered["status"].isin(sel_status)]
+    if sel_sheet_status:
+        ds_upper = filtered["doc_status"].astype(str).str.strip().str.upper()
+        filtered = filtered[ds_upper.isin(sel_sheet_status)]
+
+    if filtered.empty:
+        st.warning("По фильтрам нет замечаний.")
+        return
+
+    # Сортировка: Группа → Комплект → Лист
+    filtered = filtered.sort_values(
+        ["_group", "complex", "sheet"],
+        ascending=[True, True, True],
+    )
+
+    # Свёртка повторяющихся (Комплект + Лист)
+    filtered_display = _collapse_repeats(
+        filtered, ["complex", "sheet"]
+    )
+
+    # Показываем только 500 строк
+    filtered_display = filtered_display.head(500)
+
+    table = filtered_display[[
+        "_group", "id", "complex", "sheet", "comment",
+        "status", "doc_status", "author", "created", "fix_date",
+    ]].copy().rename(columns={
+        "_group": "Группа",
+        "id": "ID",
+        "complex": "Комплект",
+        "sheet": "Лист",
+        "comment": "Замечание",
+        "status": "Статус замечания",
+        "doc_status": "Статус листа",
+        "author": "Автор",
+        "created": "Создано",
+        "fix_date": "Наш ответ",
+    })
+
+    st.caption(
+        f"Показано: **{len(filtered_display):,}** из **{len(filtered):,}**."
+        .replace(",", " ")
+    )
+
+    st.dataframe(
+        table,
+        use_container_width=True, hide_index=True, height=600,
+        column_config={
+            "Группа": st.column_config.TextColumn(width="medium"),
+            "ID": st.column_config.NumberColumn(width="small"),
+            "Комплект": st.column_config.TextColumn(width="medium"),
+            "Лист": st.column_config.TextColumn(width="medium"),
+            "Замечание": st.column_config.TextColumn(width="large"),
+            "Статус замечания": st.column_config.TextColumn(width="small"),
+            "Статус листа": st.column_config.TextColumn(width="small"),
+            "Автор": st.column_config.TextColumn(width="medium"),
+            "Создано": st.column_config.TextColumn(width="small"),
+            "Наш ответ": st.column_config.TextColumn(width="small"),
+        },
+    )
+    if len(filtered) > 500:
+        st.caption(f"Показаны первые 500 из {len(filtered):,}."
+                   .replace(",", " "))
+
+
+# ---------------------------------------------------------------------------
 #  Точка входа
 # ---------------------------------------------------------------------------
 def _render_analytics_tab():
@@ -824,12 +1012,15 @@ def render():
         "как быстро рассматривают наши ответы."
     )
 
-    tab_analytics, tab_waiting = st.tabs([
+    tab_analytics, tab_waiting, tab_a_annulled = st.tabs([
         "📊 Аналитика авторов",
         "🔵 Ждут заказчика",
+        "📄 К листам A и аннулированным",
     ])
 
     with tab_analytics:
         _render_analytics_tab()
     with tab_waiting:
         _render_waiting_review()
+    with tab_a_annulled:
+        _render_customer_a_annulled()
