@@ -17,7 +17,6 @@ import plotly.express as px
 import streamlit as st
 
 from vitro.sqlite_db import get_conn, db_stats, log_event
-from vitro.ui._utils import download_plotly
 
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -25,13 +24,28 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+# ---------------------------------------------------------------------------
+#  Человеческие названия событий
+# ---------------------------------------------------------------------------
+EVENT_LABELS = {
+    "refresh":        "Автоматическая (по расписанию)",
+    "sync_from_ui":   "Ручная (из Управления)",
+    "sync_error":     "Ошибка синхронизации",
+    "xlsx_generated": "Генерация XLSX",
+}
+
+
+def _event_label(event: str) -> str:
+    """Техническое имя события → человеческое."""
+    if not event:
+        return "—"
+    return EVENT_LABELS.get(event, event)
+
+
 # ===========================================================================
 #  ЧАСТЬ 1. УПРАВЛЕНИЕ
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-#  KPI базы данных
-# ---------------------------------------------------------------------------
 def _render_db_stats():
     stats = db_stats()
 
@@ -85,8 +99,6 @@ def _run_sync():
                 f"- Время: **{result['elapsed']} сек**"
             )
             st.cache_data.clear()
-            log_event("sync_from_ui", "Синхронизация из UI",
-                      rows=result["comments"])
         except Exception as e:
             st.error(f"❌ Ошибка синхронизации: {e}")
             st.code(traceback.format_exc())
@@ -155,7 +167,7 @@ def _render_xlsx():
 
 
 # ---------------------------------------------------------------------------
-#  Служебные операции
+#  Опасная зона
 # ---------------------------------------------------------------------------
 def _render_danger_zone():
     st.markdown("##### ⚠️ Опасная зона")
@@ -218,16 +230,13 @@ def _render_admin_tab():
 
 
 # ===========================================================================
-#  ЧАСТЬ 2. ЛОГИ (перенесено из logs.py)
+#  ЧАСТЬ 2. ЛОГИ
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-#  Загрузчики
-# ---------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_logs(limit: int = 500) -> pd.DataFrame:
     with get_conn() as conn:
-        return pd.read_sql(f"""
+        df = pd.read_sql(f"""
             SELECT timestamp AS "Время",
                    event AS "Событие",
                    message AS "Сообщение",
@@ -237,6 +246,10 @@ def _load_logs(limit: int = 500) -> pd.DataFrame:
             ORDER BY timestamp DESC
             LIMIT {limit}
         """, conn)
+    # Маппинг событий → человеческие названия
+    if not df.empty:
+        df["Событие"] = df["Событие"].apply(_event_label)
+    return df
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -258,7 +271,7 @@ def _load_user_activity(limit: int = 500) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_events_stats() -> pd.DataFrame:
     with get_conn() as conn:
-        return pd.read_sql("""
+        df = pd.read_sql("""
             SELECT event AS "Событие",
                    COUNT(*) AS "Количество",
                    MAX(timestamp) AS "Последнее"
@@ -266,11 +279,12 @@ def _load_events_stats() -> pd.DataFrame:
             GROUP BY event
             ORDER BY "Количество" DESC
         """, conn)
+    # Маппинг событий → человеческие названия
+    if not df.empty:
+        df["Событие"] = df["Событие"].apply(_event_label)
+    return df
 
 
-# ---------------------------------------------------------------------------
-#  Подсветка статусов
-# ---------------------------------------------------------------------------
 def _style_status(val):
     if val == "OK":
         return "background-color: #C6EFCE; color: #006100;"
@@ -286,9 +300,6 @@ def _apply_status_style(df: pd.DataFrame):
     return styler.applymap(_style_status, subset=["Статус"])
 
 
-# ---------------------------------------------------------------------------
-#  Рендер Логов
-# ---------------------------------------------------------------------------
 def _render_logs_tab():
     st.caption(
         "Журнал операций синхронизации и история изменений категорий."
@@ -324,7 +335,6 @@ def _render_logs_tab():
                 fig.update_traces(textposition="outside")
                 fig.update_layout(height=max(250, 40 * len(stats)))
                 st.plotly_chart(fig, use_container_width=True)
-                download_plotly(fig, "Логи_события", "logs_events")
 
             st.divider()
             st.markdown(f"##### Последние {len(df)} записей")
@@ -366,7 +376,6 @@ def _render_logs_tab():
         fig.update_traces(textposition="outside")
         fig.update_layout(height=max(200, 40 * len(by_user)))
         st.plotly_chart(fig, use_container_width=True)
-        download_plotly(fig, "Логи_активность_пользователей", "logs_users")
 
         st.divider()
         st.markdown(f"##### Последние {len(activity)} изменений категорий")
