@@ -856,45 +856,64 @@ def _build_summary_rows(group_col: str,
     else:
         docs_grp = pd.DataFrame()
 
-    # --- Замечания (только наши) ---
+    # --- Замечания (ours + customer) ---
     if not active_df.empty:
-        ours = active_df[active_df["holder"] == "ours"].copy()
+        rows = []
+        for grp, sub in active_df.groupby(group_col, dropna=True):
+            if not grp:
+                continue
 
-        if not ours.empty:
-            rows = []
-            for grp, sub in ours.groupby(group_col, dropna=True):
-                if not grp:
-                    continue
+            ours = sub[sub["holder"] == "ours"]
+            customer = sub[sub["holder"] == "customer"]
 
-                statuses = sub["status"]
-                buckets = sub["our_bucket"]
+            # Метрики по ours — используем our_status и our_bucket
+            if not ours.empty:
+                our_status = ours["our_status"]
+                our_bucket = ours["our_bucket"]
                 cat_counts = (
-                    sub["category"].fillna("Без категории")
+                    ours["category"].fillna("Без категории")
                     .replace("", "Без категории")
                     .value_counts()
                 )
 
-                rows.append({
-                    group_col: grp,
-                    "active_total": len(sub),
-                    "n_new": int((statuses == "Новое").sum()),
-                    "n_in_work": int(
-                        (statuses == "Принято в работу").sum()),
-                    "n_rejected": int((statuses == "Не принято").sum()),
-                    "n_discussion": int(
-                        (statuses == "К обсуждению").sum()),
-                    "n_in_time": int((buckets == "≤10").sum()),
-                    "n_overdue": int(buckets.isin(
-                        ["10–30", "30–90", ">90"]).sum()),
-                    "cat_1": int(cat_counts.get(CAT_1, 0)),
-                    "cat_2": int(cat_counts.get(CAT_2, 0)),
-                    "cat_3": int(cat_counts.get(CAT_3, 0)),
-                    "cat_4": int(cat_counts.get(CAT_4, 0)),
-                    "cat_none": int(cat_counts.get("Без категории", 0)),
-                })
-            active_grp = pd.DataFrame(rows)
-        else:
-            active_grp = pd.DataFrame()
+                n_new = int((our_status == "new").sum())
+                n_in_work = int((our_status == "in_work").sum())
+                n_rejected = int((our_status == "rejected").sum())
+                n_discussion = int((our_status == "discussion").sum())
+                n_in_time = int((our_bucket == "≤10").sum())
+                n_overdue = int(our_bucket.isin(
+                    ["10–30", "30–90", ">90"]).sum())
+            else:
+                # ours пусто для этой группы — ставим нули
+                n_new = n_in_work = n_rejected = n_discussion = 0
+                n_in_time = n_overdue = 0
+                cat_counts = pd.Series(dtype=int)
+
+            # Метрики по customer
+            n_customer = len(customer) if not customer.empty else 0
+
+            # active_total = сумма всех открытых
+            active_total = (n_new + n_in_work + n_rejected +
+                            n_discussion + n_customer)
+
+            rows.append({
+                group_col: grp,
+                "active_total": active_total,
+                "n_new": n_new,
+                "n_in_work": n_in_work,
+                "n_rejected": n_rejected,
+                "n_discussion": n_discussion,
+                "n_customer": n_customer,
+                "n_in_time": n_in_time,
+                "n_overdue": n_overdue,
+                "cat_1": int(cat_counts.get(CAT_1, 0)),
+                "cat_2": int(cat_counts.get(CAT_2, 0)),
+                "cat_3": int(cat_counts.get(CAT_3, 0)),
+                "cat_4": int(cat_counts.get(CAT_4, 0)),
+                "cat_none": int(cat_counts.get("Без категории", 0)),
+            })
+
+        active_grp = pd.DataFrame(rows) if rows else pd.DataFrame()
     else:
         active_grp = pd.DataFrame()
 
@@ -979,70 +998,70 @@ def _load_summary_by_complex(
 
 
 def _render_summary_table(df: pd.DataFrame,
-                            group_label: str,
-                            level: str) -> None:
+                          group_label: str,
+                          level: str) -> None:
     if df.empty:
         st.info("Нет данных по заданным фильтрам.")
         return
 
     view = df.copy()
 
-    # Для дисциплин — «Наименование» через справочник
+    # --- Колонка 2: «Полное наименование» ---
     if level == "discipline" and "Код" in view.columns:
-        view.insert(
-            1, "Наименование",
-            view["Код"].map(
-                lambda c: discipline_name(c) if c else ""
-            ),
-        )
+        view.insert(1, "Полное наименование",
+                    view["Код"].map(lambda c: discipline_name(c) if c else ""))
+    elif level == "section":
+        view.insert(1, "Полное наименование", "")
+    elif level == "complex" and "Наименование" in view.columns:
+        view = view.rename(columns={"Наименование": "Полное наименование"})
+    else:
+        view.insert(1, "Полное наименование", "")
 
-    # Для комплектов — «Наименование» уже из merge
-    if level == "complex" and "Наименование" in view.columns:
-        cols = list(view.columns)
-        cols.remove("Наименование")
-        cols.insert(1, "Наименование")
-        view = view[cols]
-
-    # Переименование
-    rename_map = {
-        "active_total": "Всего у АТП ТЛП",
-        "n_in_time":    "срок ответа не превышен",
-        "n_overdue":    "Просрочено (>10 р.д.)",
-        "docs_total":   "Листов",
-    }
-    view = view.rename(columns=rename_map)
-
-    # Приводим числовые колонки к int (из-за merge — float)
-    for c in ["Всего у АТП ТЛП", "срок ответа не превышен",
-              "Просрочено (>10 р.д.)", "Листов"]:
+    # --- Приводим числовые колонки к int ---
+    for c in ["active_total", "n_new", "n_in_work", "n_rejected",
+              "n_discussion", "n_customer"]:
         if c in view.columns:
             view[c] = view[c].fillna(0).astype(int)
 
-    # Оставляем только нужные колонки
-    base = [group_label]
-    if level in ("discipline", "complex"):
-        base.append("Наименование")
+    # --- Формируем финальные колонки ---
+    view = view.rename(columns={
+        "active_total": "Открытых замечаний",
+        "n_new": "🔵 Новое",
+        "n_rejected": "🔴 Не принято",
+        "n_discussion": "🟡 К обсуждению",
+        "n_in_work": "🌐 Принято в работу",
+        "n_customer": "🟢 Выполнено",
+    })
 
-    cols_order = base + [
-        "Всего у АТП ТЛП",
-        "срок ответа не превышен",
-        "Просрочено (>10 р.д.)",
-        "Листов",
+    # Добавляем пустую колонку «Пояснения»
+    view["Пояснения"] = ""
+
+    # Оставляем только 9 колонок нового формата
+    cols_order = [
+        group_label,
+        "Полное наименование",
+        "Открытых замечаний",
+        "🔵 Новое",
+        "🔴 Не принято",
+        "🟡 К обсуждению",
+        "🌐 Принято в работу",
+        "🟢 Выполнено",
+        "Пояснения",
     ]
     cols_order = [c for c in cols_order if c in view.columns]
     view = view[cols_order]
 
-    # Сортировка по «Всего у АТП ТЛП»
-    if "Всего у АТП ТЛП" in view.columns:
-        view = view.sort_values("Всего у АТП ТЛП", ascending=False)
+    # Сортировка по «Открытых замечаний»
+    if "Открытых замечаний" in view.columns:
+        view = view.sort_values("Открытых замечаний", ascending=False)
 
     # ===== Строка ИТОГО =====
     totals_row = {group_label: "ИТОГО"}
-    if level in ("discipline", "complex"):
-        totals_row["Наименование"] = ""
+    totals_row["Полное наименование"] = ""
+    totals_row["Пояснения"] = ""
 
     for c in view.columns:
-        if c in (group_label, "Наименование"):
+        if c in (group_label, "Полное наименование", "Пояснения"):
             continue
         totals_row[c] = int(view[c].fillna(0).sum())
 
@@ -1054,8 +1073,7 @@ def _render_summary_table(df: pd.DataFrame,
     # Стилизация: жирный + серый фон для ИТОГО
     def _style_row(row):
         if row.name == len(view_with_total) - 1:
-            return ["font-weight: bold; "
-                    "background-color: #f0f0f0"] * len(row)
+            return ["font-weight: bold; background-color: #f0f0f0"] * len(row)
         return [""] * len(row)
 
     styled = view_with_total.style.apply(_style_row, axis=1)
@@ -1065,15 +1083,6 @@ def _render_summary_table(df: pd.DataFrame,
         use_container_width=True,
         hide_index=True,
         height=600,
-        column_config={
-            "Всего у АТП ТЛП": st.column_config.NumberColumn(
-                format="%d"),
-            "срок ответа не превышен": st.column_config.NumberColumn(
-                format="%d"),
-            "Просрочено (>10 р.д.)": st.column_config.NumberColumn(
-                format="%d"),
-            "Листов": st.column_config.NumberColumn(format="%d"),
-        },
     )
 
     st.caption(
