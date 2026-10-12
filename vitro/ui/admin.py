@@ -1,6 +1,10 @@
 # vitro/ui/admin.py
 """
-⚙️ Управление — кнопки запуска синхронизации и служебные операции.
+⚙️ Управление — служебные операции + журнал работы.
+
+2 под-вкладки:
+  ⚙️ Управление — синхронизация, генерация отчётов, мониторинг БД.
+  📜 Логи       — журнал операций и история изменений категорий.
 """
 
 import sys
@@ -9,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 from vitro.sqlite_db import get_conn, db_stats, log_event
@@ -20,8 +25,27 @@ if str(ROOT) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-#  KPI базы данных
+#  Человеческие названия событий
 # ---------------------------------------------------------------------------
+EVENT_LABELS = {
+    "refresh":        "Автоматическая (по расписанию)",
+    "sync_from_ui":   "Ручная (из Управления)",
+    "sync_error":     "Ошибка синхронизации",
+    "xlsx_generated": "Генерация XLSX",
+}
+
+
+def _event_label(event: str) -> str:
+    """Техническое имя события → человеческое."""
+    if not event:
+        return "—"
+    return EVENT_LABELS.get(event, event)
+
+
+# ===========================================================================
+#  ЧАСТЬ 1. УПРАВЛЕНИЕ
+# ===========================================================================
+
 def _render_db_stats():
     stats = db_stats()
 
@@ -34,7 +58,6 @@ def _render_db_stats():
     c4.metric("С категорией", f"{stats['categorized']:,}".replace(",", " "))
     c5.metric("Снимков истории", stats["history_snapshots"])
 
-    # Информация о последних снимках
     with get_conn() as conn:
         last_sync = conn.execute("""
             SELECT MAX(timestamp) AS t FROM log WHERE event = 'refresh'
@@ -63,7 +86,6 @@ def _render_db_stats():
 #  Синхронизация
 # ---------------------------------------------------------------------------
 def _run_sync():
-    """Запуск синхронизации из UI. Не блокирует приложение надолго."""
     with st.spinner("Синхронизация с SharePoint... (займёт 3–5 минут)"):
         try:
             from vitro.sync import refresh_data
@@ -77,8 +99,6 @@ def _run_sync():
                 f"- Время: **{result['elapsed']} сек**"
             )
             st.cache_data.clear()
-            log_event("sync_from_ui", "Синхронизация из UI",
-                      rows=result["comments"])
         except Exception as e:
             st.error(f"❌ Ошибка синхронизации: {e}")
             st.code(traceback.format_exc())
@@ -147,7 +167,7 @@ def _render_xlsx():
 
 
 # ---------------------------------------------------------------------------
-#  Служебные операции
+#  Опасная зона
 # ---------------------------------------------------------------------------
 def _render_danger_zone():
     st.markdown("##### ⚠️ Опасная зона")
@@ -196,14 +216,7 @@ def _render_danger_zone():
             st.cache_data.clear()
 
 
-# ---------------------------------------------------------------------------
-#  Точка входа
-# ---------------------------------------------------------------------------
-def render():
-    st.header("⚙️ Управление")
-    st.caption("Служебные операции: синхронизация, генерация отчётов, "
-               "мониторинг БД.")
-
+def _render_admin_tab():
     _render_db_stats()
 
     st.divider()
@@ -214,3 +227,177 @@ def render():
 
     st.divider()
     _render_danger_zone()
+
+
+# ===========================================================================
+#  ЧАСТЬ 2. ЛОГИ
+# ===========================================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_logs(limit: int = 500) -> pd.DataFrame:
+    with get_conn() as conn:
+        df = pd.read_sql(f"""
+            SELECT timestamp AS "Время",
+                   event AS "Событие",
+                   message AS "Сообщение",
+                   rows AS "Строк",
+                   status AS "Статус"
+            FROM log
+            ORDER BY timestamp DESC
+            LIMIT {limit}
+        """, conn)
+    # Маппинг событий → человеческие названия
+    if not df.empty:
+        df["Событие"] = df["Событие"].apply(_event_label)
+    return df
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_user_activity(limit: int = 500) -> pd.DataFrame:
+    with get_conn() as conn:
+        return pd.read_sql(f"""
+            SELECT
+                timestamp AS "Время",
+                user AS "Пользователь",
+                comment_id AS "ID замечания",
+                old_cat AS "Было",
+                new_cat AS "Стало"
+            FROM users_activity
+            ORDER BY timestamp DESC
+            LIMIT {limit}
+        """, conn)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_events_stats() -> pd.DataFrame:
+    with get_conn() as conn:
+        df = pd.read_sql("""
+            SELECT event AS "Событие",
+                   COUNT(*) AS "Количество",
+                   MAX(timestamp) AS "Последнее"
+            FROM log
+            GROUP BY event
+            ORDER BY "Количество" DESC
+        """, conn)
+    # Маппинг событий → человеческие названия
+    if not df.empty:
+        df["Событие"] = df["Событие"].apply(_event_label)
+    return df
+
+
+def _style_status(val):
+    if val == "OK":
+        return "background-color: #C6EFCE; color: #006100;"
+    if val == "ERROR":
+        return "background-color: #FFC7CE; color: #9C0006;"
+    return ""
+
+
+def _apply_status_style(df: pd.DataFrame):
+    styler = df.style
+    if hasattr(styler, "map"):
+        return styler.map(_style_status, subset=["Статус"])
+    return styler.applymap(_style_status, subset=["Статус"])
+
+
+def _render_logs_tab():
+    st.caption(
+        "Журнал операций синхронизации и история изменений категорий."
+    )
+
+    limit = st.slider("Сколько последних записей показать",
+                      min_value=50, max_value=5000,
+                      value=500, step=50, key="logs_limit")
+
+    tab1, tab2 = st.tabs(["📋 Журнал операций", "✏️ История категорий"])
+
+    # ======================================================================
+    #  Журнал операций
+    # ======================================================================
+    with tab1:
+        df = _load_logs(limit=int(limit))
+
+        if df.empty:
+            st.info("Журнал пуст. Записи появятся после запуска синхронизации.")
+        else:
+            stats = _load_events_stats()
+            if not stats.empty:
+                st.markdown("##### Сводка по событиям")
+                st.dataframe(stats, use_container_width=True, hide_index=True)
+
+                fig = px.bar(
+                    stats.sort_values("Количество", ascending=True),
+                    x="Количество", y="Событие", orientation="h",
+                    text="Количество",
+                    title="Количество событий по типам",
+                    color_discrete_sequence=["#64B5F6"],
+                )
+                fig.update_traces(textposition="outside")
+                fig.update_layout(height=max(250, 40 * len(stats)))
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.divider()
+            st.markdown(f"##### Последние {len(df)} записей")
+
+            styled = _apply_status_style(df)
+            st.dataframe(styled, use_container_width=True,
+                         hide_index=True, height=500)
+
+    # ======================================================================
+    #  История изменений категорий
+    # ======================================================================
+    with tab2:
+        activity = _load_user_activity(limit=int(limit))
+
+        if activity.empty:
+            st.info("Пока никто не менял категории. История появится после "
+                    "первого назначения.")
+            return
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Всего изменений", len(activity))
+        c2.metric("Уникальных замечаний",
+                  activity["ID замечания"].nunique())
+        c3.metric("Пользователей",
+                  activity["Пользователь"].nunique())
+
+        st.divider()
+
+        by_user = (activity.groupby("Пользователь").size()
+                   .reset_index(name="Изменений")
+                   .sort_values("Изменений", ascending=True))
+
+        fig = px.bar(
+            by_user, x="Изменений", y="Пользователь", orientation="h",
+            text="Изменений",
+            title="Кто сколько категорий назначил",
+            color_discrete_sequence=["#A5D6A7"],
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=max(200, 40 * len(by_user)))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.markdown(f"##### Последние {len(activity)} изменений категорий")
+
+        st.dataframe(activity, use_container_width=True,
+                     hide_index=True, height=500)
+
+
+# ===========================================================================
+#  ТОЧКА ВХОДА
+# ===========================================================================
+def render():
+    st.header("⚙️ Управление")
+    st.caption("Служебные операции и журнал работы.")
+
+    tab_admin, tab_logs = st.tabs([
+        "⚙️ Управление",
+        "📜 Логи",
+    ])
+
+    with tab_admin:
+        _render_admin_tab()
+
+    with tab_logs:
+        _render_logs_tab()
