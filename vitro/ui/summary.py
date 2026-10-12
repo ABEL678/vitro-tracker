@@ -536,12 +536,6 @@ def _render_ours_section(active_df: pd.DataFrame) -> None:
             "Входит в «Всего у АТП ТЛП».",
         )
         _metric(
-            st, f"{EMOJI['globe']} Принято в работу", n_in_work,
-            "Выгрузка из Витро: "
-            "COUNT(comments WHERE status='Принято в работу').\n\n"
-            "Входит в «Всего у АТП ТЛП».",
-        )
-        _metric(
             st, f"{EMOJI['red']} Не принято", n_rejected,
             "Выгрузка из Витро: "
             "COUNT(comments WHERE status='Не принято').\n\n"
@@ -551,6 +545,12 @@ def _render_ours_section(active_df: pd.DataFrame) -> None:
             st, f"{EMOJI['yellow']} К обсуждению", n_disc,
             "Выгрузка из Витро: "
             "COUNT(comments WHERE status='К обсуждению').\n\n"
+            "Входит в «Всего у АТП ТЛП».",
+        )
+        _metric(
+            st, f"{EMOJI['globe']} Принято в работу", n_in_work,
+            "Выгрузка из Витро: "
+            "COUNT(comments WHERE status='Принято в работу').\n\n"
             "Входит в «Всего у АТП ТЛП».",
         )
 
