@@ -1,5 +1,0 @@
-chore: remove .gigacode and COMMIT_MSG.txt from git
-
-- Add .gigacode/ to .gitignore
-- Remove .gigacode/ from git tracking
-- Remove COMMIT_MSG.txt from git
