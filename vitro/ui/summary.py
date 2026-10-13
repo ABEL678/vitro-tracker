@@ -17,6 +17,7 @@
 import io
 from datetime import datetime
 
+import openpyxl
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -1001,23 +1002,82 @@ def _load_summary_by_complex(
 
 
 def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> bytes:
-    """Формирует XLSX из данных таблицы разреза (со строкой ИТОГО и колонкой Пояснения)."""
+    """Формирует красиво оформленный XLSX с границами, цветами и автофильтром."""
     buf = io.BytesIO()
 
-    # Копия данных — view_with_total (включая строку ИТОГО)
-    export_df = df.copy()
-
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name=group_label)
-
-        # Автоширина колонок
+        df.to_excel(writer, index=False, sheet_name=group_label)
         ws = writer.sheets[group_label]
-        for col_idx, col_name in enumerate(export_df.columns, start=1):
+
+        # --- Цвета ---
+        COLOR_HEADER_NEW = "1F77B4"       # синий
+        COLOR_HEADER_REJECTED = "D62728"  # красный
+        COLOR_HEADER_DISCUSSION = "FFDD57"  # жёлтый
+        COLOR_HEADER_IN_WORK = "17BECF"   # бирюзовый
+        COLOR_HEADER_DONE = "2CA02C"      # зелёный
+        COLOR_HEADER_OTHER = "4472C4"     # синий для остальных
+        COLOR_TOTAL_ROW = "F0F0F0"        # серый для ИТОГО
+        COLOR_WHITE = "FFFFFF"            # белый текст
+
+        # --- Автоширина колонок ---
+        for col_idx, col_name in enumerate(df.columns, start=1):
             max_len = max(
                 len(str(col_name)),
-                export_df[col_name].astype(str).str.len().max() if len(export_df) else 0,
+                df[col_name].astype(str).str.len().max() if len(df) else 0,
             )
-            ws.column_dimensions[chr(64 + col_idx)].width = min(max_len + 2, 80)
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 2, 80)
+
+        # --- Границы на всю таблицу ---
+        from openpyxl.styles import Border, Side
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin'),
+        )
+        last_row = ws.max_row
+        last_col = ws.max_column
+        for r in range(1, last_row + 1):
+            for c in range(1, last_col + 1):
+                ws.cell(row=r, column=c).border = thin_border
+
+        # --- Цветная заливка заголовков (строка 1) ---
+        from openpyxl.styles import PatternFill, Font
+        header_fill_map = {
+            "Новое": COLOR_HEADER_NEW,
+            "Не принято": COLOR_HEADER_REJECTED,
+            "К обсуждению": COLOR_HEADER_DISCUSSION,
+            "Принято в работу": COLOR_HEADER_IN_WORK,
+            "Выполнено": COLOR_HEADER_DONE,
+        }
+
+        for c in range(1, last_col + 1):
+            cell = ws.cell(row=1, column=c)
+
+            # Определяем цвет заголовка
+            col_name = str(cell.value)
+            fill_color = None
+            for key, color in header_fill_map.items():
+                if key in col_name:
+                    fill_color = color
+                    break
+
+            if fill_color:
+                cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
+                cell.font = Font(bold=True, color=COLOR_WHITE)
+            else:
+                cell.fill = PatternFill(start_color=COLOR_HEADER_OTHER, end_color=COLOR_HEADER_OTHER, fill_type="solid")
+                cell.font = Font(bold=True, color=COLOR_WHITE)
+
+        # --- Выделение строки ИТОГО (последняя строка) ---
+        total_fill = PatternFill(start_color=COLOR_TOTAL_ROW, end_color=COLOR_TOTAL_ROW, fill_type="solid")
+        for c in range(1, last_col + 1):
+            cell = ws.cell(row=last_row, column=c)
+            cell.fill = total_fill
+            cell.font = Font(bold=True)
+
+        # --- Автофильтр ---
+        ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(last_col)}{last_row}"
 
     buf.seek(0)
     return buf.getvalue()
