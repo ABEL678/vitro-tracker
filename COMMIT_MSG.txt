@@ -1,4 +1,5 @@
-fix(summary): user-adjusted header colors and column widths
+chore: remove .gigacode and COMMIT_MSG.txt from git
 
-- COLOR_HEADER_OTHER: D6E4F0 → F0F0F0 (бледно-серый)
-- Column widths C-G: 12 → 14, H: 12 → 20
+- Add .gigacode/ to .gitignore
+- Remove .gigacode/ from git tracking
+- Remove COMMIT_MSG.txt from git
