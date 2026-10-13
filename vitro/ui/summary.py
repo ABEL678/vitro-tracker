@@ -1191,6 +1191,7 @@ def _render_summary_table(df: pd.DataFrame,
     # --- Ограничение отображения: первые 100 строк ---
     DISPLAY_LIMIT = 100
     display_df = view_with_total.head(DISPLAY_LIMIT).copy()
+    display_count = len(display_df)  # ← считаем до применения стиля
     display_df = display_df.style.apply(_style_row, axis=1)
 
     # --- Кнопка выгрузки в Excel (полные данные) ---
@@ -1208,7 +1209,7 @@ def _render_summary_table(df: pd.DataFrame,
         display_df,
         use_container_width=True,
         hide_index=True,
-        height=max(500, min(len(display_df) * 45 + 100, 1200)),
+        height=max(500, min(display_count * 45 + 100, 1200)),
     )
 
     st.caption(
