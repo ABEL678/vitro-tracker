@@ -1213,7 +1213,7 @@ def _render_summary_table(df: pd.DataFrame,
     )
 
     st.caption(
-        f"Показано **{len(display_df) - 1}** из **{len(view)}** строк. "
+        f"Показано **{display_count - 1}** из **{len(view)}** строк. "
         f"Строка **ИТОГО** — внизу таблицы. "
         f"Для полного списка нажмите «📥 Выгрузить в Excel»."
     )
