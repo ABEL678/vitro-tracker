@@ -1029,6 +1029,7 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
         ws.column_dimensions["F"].width = 14
         ws.column_dimensions["G"].width = 14
         ws.column_dimensions["H"].width = 20
+        ws.column_dimensions["I"].width = 14
 
         # --- Границы на всю таблицу ---
         from openpyxl.styles import Border, Side
@@ -1137,11 +1138,21 @@ def _render_summary_table(df: pd.DataFrame,
     # Добавляем пустую колонку «Пояснения»
     view["Пояснения"] = ""
 
-    # Оставляем только 9 колонок нового формата
+    # --- Вычисляем "Всего у АТП ТЛП" = Новое + Принято в работу + Не принято + К обсуждению ---
+    if "🔵 Новое" in view.columns and "🌐 Принято в работу" in view.columns:
+        view["Всего у АТП ТЛП"] = (
+            view["🔵 Новое"].fillna(0) +
+            view["🌐 Принято в работу"].fillna(0) +
+            view["🔴 Не принято"].fillna(0) +
+            view["🟡 К обсуждению"].fillna(0)
+        ).astype(int)
+
+    # Оставляем только колонок нового формата
     cols_order = [
         group_label,
         "Полное наименование",
         "Открытых замечаний",
+        "Всего у АТП ТЛП",
         "🔵 Новое",
         "🔴 Не принято",
         "🟡 К обсуждению",
@@ -1171,7 +1182,12 @@ def _render_summary_table(df: pd.DataFrame,
         ignore_index=True,
     )
 
-    # --- Кнопка выгрузки в Excel (после view_with_total) ---
+    # --- Ограничение отображения: первые 100 строк ---
+    DISPLAY_LIMIT = 100
+    display_df = view_with_total.head(DISPLAY_LIMIT).copy()
+    display_df = display_df.style.apply(_style_row, axis=1)
+
+    # --- Кнопка выгрузки в Excel (полные данные) ---
     st.download_button(
         "📥 Выгрузить в Excel",
         data=_export_summary_to_excel(view_with_total, group_label, level),
@@ -1181,24 +1197,18 @@ def _render_summary_table(df: pd.DataFrame,
         key=f"export_{level}",
     )
 
-    # Стилизация: жирный + серый фон для ИТОГО
-    def _style_row(row):
-        if row.name == len(view_with_total) - 1:
-            return ["font-weight: bold; background-color: #f0f0f0"] * len(row)
-        return [""] * len(row)
-
-    styled = view_with_total.style.apply(_style_row, axis=1)
-
+    # --- Таблица с пагинацией ---
     st.dataframe(
-        styled,
+        display_df,
         use_container_width=True,
         hide_index=True,
-        height=max(500, min(len(view) * 45 + 100, 1200)),
+        height=max(500, min(len(display_df) * 45 + 100, 1200)),
     )
 
     st.caption(
-        f"Показано **{len(view)}** строк. "
-        f"Строка **ИТОГО** — внизу таблицы."
+        f"Показано **{len(display_df) - 1}** из **{len(view)}** строк. "
+        f"Строка **ИТОГО** — внизу таблицы. "
+        f"Для полного списка нажмите «📥 Выгрузить в Excel»."
     )
 
 
