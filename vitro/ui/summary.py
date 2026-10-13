@@ -1016,19 +1016,19 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
         COLOR_HEADER_DISCUSSION = "FFF2CC" # бледно-жёлтый
         COLOR_HEADER_IN_WORK = "D0ECE7"    # бледно-бирюзовый
         COLOR_HEADER_DONE = "D9EAD3"       # бледно-зелёный
-        COLOR_HEADER_OTHER = "D6E4F0"      # бледно-синий
+        COLOR_HEADER_OTHER = "F0F0F0"      # бледно-серый
         COLOR_TOTAL_ROW = "F0F0F0"         # серый для ИТОГО
         COLOR_BLACK = "000000"             # чёрный текст
 
         # --- Фиксированная ширина колонок ---
         ws.column_dimensions["A"].width = 20
         ws.column_dimensions["B"].width = 50
-        ws.column_dimensions["C"].width = 12
-        ws.column_dimensions["D"].width = 12
-        ws.column_dimensions["E"].width = 12
-        ws.column_dimensions["F"].width = 12
-        ws.column_dimensions["G"].width = 12
-        ws.column_dimensions["H"].width = 12
+        ws.column_dimensions["C"].width = 14
+        ws.column_dimensions["D"].width = 14
+        ws.column_dimensions["E"].width = 14
+        ws.column_dimensions["F"].width = 14
+        ws.column_dimensions["G"].width = 14
+        ws.column_dimensions["H"].width = 20
 
         # --- Границы на всю таблицу ---
         from openpyxl.styles import Border, Side
