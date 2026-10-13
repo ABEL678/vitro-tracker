@@ -1,0 +1,6 @@
+fix(summary): dynamic table height + Excel export button with TOTAL row
+
+- Add _export_summary_to_excel function (with TOTAL row and Пояснения column)
+- Add "Выгрузить в Excel" download button above table
+- Dynamic height: max(500, min(len(view)*45+100, 1200))
+- Export includes view_with_total (TOTAL row + Пояснения column preserved)

@@ -14,6 +14,9 @@
 Фильтры: дисциплина → раздел → расположение → комплект.
 """
 
+import io
+from datetime import datetime
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -997,6 +1000,29 @@ def _load_summary_by_complex(
     return result
 
 
+def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> bytes:
+    """Формирует XLSX из данных таблицы разреза (со строкой ИТОГО и колонкой Пояснения)."""
+    buf = io.BytesIO()
+
+    # Копия данных — view_with_total (включая строку ИТОГО)
+    export_df = df.copy()
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False, sheet_name=group_label)
+
+        # Автоширина колонок
+        ws = writer.sheets[group_label]
+        for col_idx, col_name in enumerate(export_df.columns, start=1):
+            max_len = max(
+                len(str(col_name)),
+                export_df[col_name].astype(str).str.len().max() if len(export_df) else 0,
+            )
+            ws.column_dimensions[chr(64 + col_idx)].width = min(max_len + 2, 80)
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def _render_summary_table(df: pd.DataFrame,
                           group_label: str,
                           level: str) -> None:
@@ -1070,6 +1096,16 @@ def _render_summary_table(df: pd.DataFrame,
         ignore_index=True,
     )
 
+    # --- Кнопка выгрузки в Excel (после view_with_total) ---
+    st.download_button(
+        "📥 Выгрузить в Excel",
+        data=_export_summary_to_excel(view_with_total, group_label, level),
+        file_name=f"Разрез_{group_label}_{datetime.now():%Y%m%d_%H%M}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key=f"export_{level}",
+    )
+
     # Стилизация: жирный + серый фон для ИТОГО
     def _style_row(row):
         if row.name == len(view_with_total) - 1:
@@ -1082,7 +1118,7 @@ def _render_summary_table(df: pd.DataFrame,
         styled,
         use_container_width=True,
         hide_index=True,
-        height=600,
+        height=max(500, min(len(view) * 45 + 100, 1200)),
     )
 
     st.caption(
