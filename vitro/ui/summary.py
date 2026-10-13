@@ -1182,6 +1182,12 @@ def _render_summary_table(df: pd.DataFrame,
         ignore_index=True,
     )
 
+    # --- Стилизация: жирный + серый фон для ИТОГО ---
+    def _style_row(row):
+        if row.name == len(view_with_total) - 1:
+            return ["font-weight: bold; background-color: #f0f0f0"] * len(row)
+        return [""] * len(row)
+
     # --- Ограничение отображения: первые 100 строк ---
     DISPLAY_LIMIT = 100
     display_df = view_with_total.head(DISPLAY_LIMIT).copy()
