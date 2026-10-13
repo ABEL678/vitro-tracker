@@ -1002,30 +1002,33 @@ def _load_summary_by_complex(
 
 
 def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> bytes:
-    """Формирует красиво оформленный XLSX с границами, цветами и автофильтром."""
+    """Формирует красиво оформленный XLSX с бледными цветами и переносом строк."""
+    import re
     buf = io.BytesIO()
 
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=group_label)
         ws = writer.sheets[group_label]
 
-        # --- Цвета ---
-        COLOR_HEADER_NEW = "1F77B4"       # синий
-        COLOR_HEADER_REJECTED = "D62728"  # красный
-        COLOR_HEADER_DISCUSSION = "FFDD57"  # жёлтый
-        COLOR_HEADER_IN_WORK = "17BECF"   # бирюзовый
-        COLOR_HEADER_DONE = "2CA02C"      # зелёный
-        COLOR_HEADER_OTHER = "4472C4"     # синий для остальных
-        COLOR_TOTAL_ROW = "F0F0F0"        # серый для ИТОГО
-        COLOR_WHITE = "FFFFFF"            # белый текст
+        # --- Бледные цвета заголовков ---
+        COLOR_HEADER_NEW = "D6E4F0"        # бледно-синий
+        COLOR_HEADER_REJECTED = "FCE4E4"   # бледно-красный
+        COLOR_HEADER_DISCUSSION = "FFF2CC" # бледно-жёлтый
+        COLOR_HEADER_IN_WORK = "D0ECE7"    # бледно-бирюзовый
+        COLOR_HEADER_DONE = "D9EAD3"       # бледно-зелёный
+        COLOR_HEADER_OTHER = "D6E4F0"      # бледно-синий
+        COLOR_TOTAL_ROW = "F0F0F0"         # серый для ИТОГО
+        COLOR_BLACK = "000000"             # чёрный текст
 
-        # --- Автоширина колонок ---
-        for col_idx, col_name in enumerate(df.columns, start=1):
-            max_len = max(
-                len(str(col_name)),
-                df[col_name].astype(str).str.len().max() if len(df) else 0,
-            )
-            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 2, 80)
+        # --- Фиксированная ширина колонок ---
+        ws.column_dimensions["A"].width = 20
+        ws.column_dimensions["B"].width = 50
+        ws.column_dimensions["C"].width = 12
+        ws.column_dimensions["D"].width = 12
+        ws.column_dimensions["E"].width = 12
+        ws.column_dimensions["F"].width = 12
+        ws.column_dimensions["G"].width = 12
+        ws.column_dimensions["H"].width = 12
 
         # --- Границы на всю таблицу ---
         from openpyxl.styles import Border, Side
@@ -1041,8 +1044,8 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
             for c in range(1, last_col + 1):
                 ws.cell(row=r, column=c).border = thin_border
 
-        # --- Цветная заливка заголовков (строка 1) ---
-        from openpyxl.styles import PatternFill, Font
+        # --- Заголовки: убрать эмодзи, бледный цвет, чёрный текст, по центру, wrap ---
+        from openpyxl.styles import PatternFill, Font, Alignment
         header_fill_map = {
             "Новое": COLOR_HEADER_NEW,
             "Не принято": COLOR_HEADER_REJECTED,
@@ -1054,6 +1057,11 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
         for c in range(1, last_col + 1):
             cell = ws.cell(row=1, column=c)
 
+            # Убрать эмодзи из заголовка
+            if isinstance(cell.value, str):
+                clean_name = re.sub(r'[\U0001F300-\U0001F9FF]', '', cell.value).strip()
+                cell.value = clean_name
+
             # Определяем цвет заголовка
             col_name = str(cell.value)
             fill_color = None
@@ -1064,10 +1072,17 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
 
             if fill_color:
                 cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-                cell.font = Font(bold=True, color=COLOR_WHITE)
+                cell.font = Font(bold=True, color=COLOR_BLACK)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrapText=True)
             else:
                 cell.fill = PatternFill(start_color=COLOR_HEADER_OTHER, end_color=COLOR_HEADER_OTHER, fill_type="solid")
-                cell.font = Font(bold=True, color=COLOR_WHITE)
+                cell.font = Font(bold=True, color=COLOR_BLACK)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrapText=True)
+
+        # --- Перенос строк в колонке B (наименование) ---
+        for r in range(2, last_row + 1):
+            cell = ws.cell(row=r, column=2)
+            cell.alignment = Alignment(wrapText=True)
 
         # --- Выделение строки ИТОГО (последняя строка) ---
         total_fill = PatternFill(start_color=COLOR_TOTAL_ROW, end_color=COLOR_TOTAL_ROW, fill_type="solid")
