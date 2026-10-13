@@ -1028,8 +1028,12 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
         ws.column_dimensions["E"].width = 14
         ws.column_dimensions["F"].width = 14
         ws.column_dimensions["G"].width = 14
-        ws.column_dimensions["H"].width = 20
+        ws.column_dimensions["H"].width = 14
         ws.column_dimensions["I"].width = 14
+        ws.column_dimensions["J"].width = 14
+
+        # --- Закрепить заголовок ---
+        ws.freeze_panes = "A2"
 
         # --- Границы на всю таблицу ---
         from openpyxl.styles import Border, Side
