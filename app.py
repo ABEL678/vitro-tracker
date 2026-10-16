@@ -2,9 +2,9 @@
 """
 Главный файл Streamlit-приложения.
 
-Фиксированный хедер с логотипом АТП ТЛП + имя пользователя справа.
+Фиксированный хедер с логотипом АТП ТЛП.
 Фиксированная полоса с датой последней выгрузки из Витро.
-Фиксированный футер с именем пользователя и подписью.
+Фиксированный футер с версией приложения.
 8 вкладок: Сводка, Динамика, Авторы, Сроки, Категории, Поиск,
 Экспорт, Управление.
 Запуск: streamlit run app.py
@@ -23,6 +23,7 @@ from datetime import datetime
 import streamlit as st
 
 from vitro.sqlite_db import init_db, get_conn
+from vitro.config import APP_VERSION
 from vitro.ui import (
     summary, dynamics, authors, deadlines,
     categories, search, export, admin,
@@ -90,53 +91,12 @@ if LOGO_PATH.exists():
         LOGO_B64 = ""
 
 # ---------------------------------------------------------------------------
-#  Модальный диалог ввода имени
-# ---------------------------------------------------------------------------
-@st.dialog("👤 Представьтесь")
-def ask_user_name():
-    st.write("Имя сохраняется вместе с категориями замечаний.")
-    name = st.text_input(
-        "Фамилия и имя",
-        value=st.session_state.get("user", "")
-              if st.session_state.get("user") != "инженер" else "",
-        key="dialog_user_input",
-        placeholder="Например: Иванов Пётр",
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("💾 Сохранить", type="primary",
-                     use_container_width=True,
-                     key="dialog_save_btn"):
-            if name.strip():
-                st.session_state["user"] = name.strip()
-                st.session_state["user_confirmed"] = True
-                st.rerun()
-            else:
-                st.error("Введите имя")
-
-    with col2:
-        if st.button("Отмена", use_container_width=True,
-                     key="dialog_cancel_btn"):
-            if not st.session_state.get("user"):
-                st.session_state["user"] = "инженер"
-            st.session_state["user_confirmed"] = True
-            st.rerun()
-
-
-# ---------------------------------------------------------------------------
 #  Инициализация session_state
 # ---------------------------------------------------------------------------
 if "user" not in st.session_state:
     st.session_state["user"] = ""
 if "user_confirmed" not in st.session_state:
     st.session_state["user_confirmed"] = False
-
-if st.session_state.get("user_confirmed") is not True:
-    ask_user_name()
-
-user_label = st.session_state.get("user", "инженер")
 
 # ---------------------------------------------------------------------------
 #  Высоты
@@ -203,27 +163,6 @@ st.markdown(f"""
     div[data-testid="stMetricValue"] {{ font-size: 1.25rem !important; }}
     div[data-testid="stMetricLabel"] {{ font-size: 0.7rem !important; }}
     a.header-anchor {{ display: none !important; }}
-
-    .st-key-change_user_header_btn button {{
-        position: fixed !important;
-        top: 16px !important;
-        right: 16px !important;
-        z-index: 2147483647 !important;
-        width: auto !important;
-        height: 32px !important;
-        padding: 0 12px !important;
-        font-size: 12px !important;
-        background: #ffffff !important;
-        border: 1px solid #d0d0d0 !important;
-        border-radius: 6px !important;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05) !important;
-        color: #1F4E78 !important;
-    }}
-
-    .st-key-change_user_header_btn button:hover {{
-        background: #f0f0f0 !important;
-        border-color: #1F4E78 !important;
-    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -291,19 +230,6 @@ except AttributeError:
     st.markdown(DATE_BAR_HTML, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-#  Кнопка смены пользователя
-# ---------------------------------------------------------------------------
-def _open_user_dialog():
-    st.session_state["user_confirmed"] = False
-    st.rerun()
-
-st.button(
-    f"👤 {user_label}",
-    key="change_user_header_btn",
-    on_click=_open_user_dialog,
-)
-
-# ---------------------------------------------------------------------------
 #  ФУТЕР
 # ---------------------------------------------------------------------------
 FOOTER_HTML = f"""
@@ -329,8 +255,7 @@ FOOTER_HTML = f"""
     }}
 </style>
 <div class="atp-footer">
-    © АТП ТЛП · 2026 · замечания к комплектам РД ·
-    пользователь: <b>{user_label}</b>
+    © АТП ТЛП · 2026 · замечания к комплектам РД · версия {APP_VERSION}
 </div>
 """
 

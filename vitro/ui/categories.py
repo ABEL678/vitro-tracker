@@ -26,6 +26,7 @@ from vitro.sqlite_db import (
     update_category_force,
 )
 from vitro.disciplines import discipline_name
+from vitro.ui._auth import ensure_user
 from vitro.ui._filters import _filter_by_marka
 
 
@@ -720,7 +721,11 @@ def _render_editor():
                                  use_container_width=True)
 
     if save_clicked:
-        user = st.session_state.get("user", "инженер")
+        user = ensure_user()
+        if user is None:
+            st.warning("⚠️ Введите имя в диалоге, чтобы сохранить изменения.")
+            return
+
         saved, conflicts = 0, []
 
         for _, row in edited.iterrows():
@@ -1027,6 +1032,15 @@ def _render_import():
             st.error("Нет данных для применения.")
             return
 
+        # Проверяем имя пользователя — если пусто, показываем диалог
+        user_confirmed = ensure_user()
+        if user_confirmed is None:
+            st.warning("⚠️ Введите имя в диалоге, чтобы применить категории.")
+            return
+
+        # Используем import_user из поля (или user_confirmed — как fallback)
+        row_user = import_user.strip() or user_confirmed
+
         ids = combined_unique["id"].astype(int).tolist()
         with get_conn() as conn:
             placeholders = ",".join("?" * len(ids))
@@ -1051,8 +1065,6 @@ def _render_import():
             if cid not in existing:
                 skipped_missing += 1
                 continue
-
-            row_user = import_user.strip()
 
             if force_overwrite:
                 ok, msg = update_category_force(cid, cat, user=row_user)

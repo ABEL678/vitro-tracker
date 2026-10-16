@@ -10,3 +10,6 @@ VITRO_OKHTA_URL = VITRO_BASE_URL + "/okhta"
 VITRO_VERIFY_SSL = os.getenv("VITRO_VERIFY_SSL", "false").lower() == "true"
 
 HEADERS = {"Accept": "application/json;odata=verbose"}
+
+# Версия приложения
+APP_VERSION = "1.2 от 16.10.2026"

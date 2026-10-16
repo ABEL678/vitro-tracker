@@ -17,6 +17,7 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn, update_category_safe
 from vitro.disciplines import discipline_name
+from vitro.ui._auth import ensure_user
 from vitro.ui._filters import (
     REMARK_STATUS_OPTIONS,
     SHEET_GROUP_OPTIONS,
@@ -763,7 +764,11 @@ def _render_waiting_review():
     with col_save:
         if st.button("💾 Сохранить изменения", type="primary",
                       use_container_width=True, key="wait_save"):
-            user = st.session_state.get("user", "инженер")
+            user = ensure_user()
+            if user is None:
+                st.warning("⚠️ Введите имя в диалоге, чтобы сохранить изменения.")
+                return
+
             saved, conflicts = 0, []
 
             df_by_id = df.set_index("id", drop=False)
