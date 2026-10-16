@@ -22,6 +22,7 @@ from vitro.ui._filters import (
     SHEET_GROUP_OPTIONS,
     _sheet_groups_to_sql,
 )
+from vitro.ui._urls import build_vitro_comment_url
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +137,9 @@ def _search_comments(query: str,
             c.status AS "Статус",
             c.author AS "Автор",
             strftime('%d.%m.%Y %H:%M:%S', c.created) AS "Создано",
-            c.category AS "Категория"
+            c.category AS "Категория",
+            d.vitro_guid AS vitro_guid,
+            d.vitro_version AS vitro_version
         FROM comments c
         JOIN documents d ON c.doc_id = d.id
         WHERE 1=1
@@ -214,7 +217,8 @@ def _export_to_excel(df: pd.DataFrame, query: str) -> bytes:
     """Формирует XLSX в память и возвращает байты."""
     buf = io.BytesIO()
 
-    export_df = df.drop(columns=["discipline", "section"], errors="ignore").copy()
+    drop_cols = ["discipline", "section", "vitro_guid", "vitro_version"]
+    export_df = df.drop(columns=drop_cols, errors="ignore").copy()
 
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         export_df.to_excel(writer, index=False, sheet_name="Результаты поиска")
@@ -378,7 +382,21 @@ def render():
     st.divider()
 
     # --- Таблица ---
-    table_df = df.drop(columns=["discipline", "section"], errors="ignore")
+    table_df = df.drop(columns=["discipline", "section"], errors="ignore").copy()
+
+    # Собираем прямую ссылку на замечание в Витро
+    if "vitro_guid" in table_df.columns and "vitro_version" in table_df.columns:
+        table_df["_vitro_url"] = table_df.apply(
+            lambda r: build_vitro_comment_url(
+                r["vitro_guid"], r["vitro_version"], r["ID"]
+            ),
+            axis=1,
+        )
+        table_df = table_df.drop(columns=["vitro_guid", "vitro_version"])
+        table_df = table_df.rename(columns={"_vitro_url": "Витро"})
+    else:
+        table_df["Витро"] = ""
+
     st.dataframe(
         table_df,
         use_container_width=True,
@@ -388,6 +406,12 @@ def render():
             "Замечание":     st.column_config.TextColumn(width="large"),
             "Название листа": st.column_config.TextColumn(width="large"),
             "Создано":       st.column_config.TextColumn(width="medium"),
+            "Витро": st.column_config.LinkColumn(
+                "Витро",
+                display_text="🔗 Открыть",
+                width="small",
+                help="Открыть замечание в Витро (подсветится на листе)",
+            ),
         },
     )
 
