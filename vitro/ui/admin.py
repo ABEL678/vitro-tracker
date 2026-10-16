@@ -17,6 +17,7 @@ import plotly.express as px
 import streamlit as st
 
 from vitro.sqlite_db import get_conn, db_stats, log_event
+from vitro.time_utils import fmt_msk
 
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -72,7 +73,7 @@ def _render_db_stats():
 
     st.caption(
         f"**Последняя синхронизация:** "
-        f"{last_sync if last_sync else 'ещё не было'}"
+        f"{fmt_msk(last_sync) if last_sync else 'ещё не было'}"
     )
 
     if last_snapshots:
@@ -249,13 +250,14 @@ def _load_logs(limit: int = 500) -> pd.DataFrame:
     # Маппинг событий → человеческие названия
     if not df.empty:
         df["Событие"] = df["Событие"].apply(_event_label)
+        df["Время"] = df["Время"].apply(fmt_msk)
     return df
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_user_activity(limit: int = 500) -> pd.DataFrame:
     with get_conn() as conn:
-        return pd.read_sql(f"""
+        df = pd.read_sql(f"""
             SELECT
                 timestamp AS "Время",
                 user AS "Пользователь",
@@ -266,6 +268,9 @@ def _load_user_activity(limit: int = 500) -> pd.DataFrame:
             ORDER BY timestamp DESC
             LIMIT {limit}
         """, conn)
+    if not df.empty:
+        df["Время"] = df["Время"].apply(fmt_msk)
+    return df
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -282,6 +287,7 @@ def _load_events_stats() -> pd.DataFrame:
     # Маппинг событий → человеческие названия
     if not df.empty:
         df["Событие"] = df["Событие"].apply(_event_label)
+        df["Последнее"] = df["Последнее"].apply(fmt_msk)
     return df
 
 

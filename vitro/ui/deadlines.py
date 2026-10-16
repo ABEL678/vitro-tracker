@@ -13,7 +13,7 @@
 """
 
 import time
-from datetime import date, datetime
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
@@ -23,6 +23,7 @@ from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.workdays import add_workdays, parse_date, workdays_between
 from vitro.text_utils import clean_leaf_key
+from vitro.time_utils import fmt_msk
 from vitro.ui._urls import build_vitro_comment_url
 from vitro.ui._filters import _filter_by_marka
 
@@ -204,16 +205,6 @@ def _load_last_sync_date() -> str | None:
     except Exception:
         pass
     return None
-
-
-def _fmt_sync_date(ts) -> str:
-    if not ts:
-        return "—"
-    try:
-        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S")
-        return dt.strftime("%d.%m.%Y, %H:%M")
-    except Exception:
-        return str(ts)
 
 
 # ---------------------------------------------------------------------------

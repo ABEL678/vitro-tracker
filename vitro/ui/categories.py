@@ -26,6 +26,7 @@ from vitro.sqlite_db import (
     update_category_force,
 )
 from vitro.disciplines import discipline_name
+from vitro.time_utils import fmt_msk
 from vitro.ui._auth import ensure_user
 from vitro.ui._filters import _filter_by_marka
 
@@ -302,7 +303,7 @@ def _load_by_discipline() -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_user_activity() -> pd.DataFrame:
     with get_conn() as conn:
-        return pd.read_sql("""
+        df = pd.read_sql("""
             SELECT
                 user AS "Специалист",
                 COUNT(*) AS "Изменений",
@@ -314,6 +315,10 @@ def _load_user_activity() -> pd.DataFrame:
             GROUP BY user
             ORDER BY "Изменений" DESC
         """, conn)
+    if not df.empty:
+        df["Первое"] = df["Первое"].apply(fmt_msk)
+        df["Последнее"] = df["Последнее"].apply(fmt_msk)
+    return df
 
 
 # ---------------------------------------------------------------------------

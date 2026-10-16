@@ -18,12 +18,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import base64
-from datetime import datetime
 
 import streamlit as st
 
 from vitro.sqlite_db import init_db, get_conn
 from vitro.config import APP_VERSION
+from vitro.time_utils import fmt_msk
 from vitro.ui import (
     summary, dynamics, authors, deadlines,
     categories, search, export, admin,
@@ -66,16 +66,6 @@ def _load_sync_date() -> str | None:
     except Exception:
         pass
     return None
-
-
-def _fmt_sync_date(ts) -> str:
-    if not ts:
-        return "—"
-    try:
-        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S")
-        return dt.strftime("%d.%m.%Y, %H:%M")
-    except Exception:
-        return str(ts)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +210,7 @@ except AttributeError:
 _sync_date = _load_sync_date()
 DATE_BAR_HTML = f"""
 <div class="date-bar">
-    📅 База актуальна на {_fmt_sync_date(_sync_date)}
+    📅 База актуальна на {fmt_msk(_sync_date, with_msk_label=True)}
 </div>
 """
 
