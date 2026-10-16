@@ -18,6 +18,10 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
+from vitro.ui._filters import (
+    SHEET_GROUP_OPTIONS,
+    _sheet_groups_to_sql,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +118,7 @@ def _search_comments(query: str,
                      disciplines=(), sections=(), kits=(),
                      statuses=(), authors=(), categories=(),
                      complex_mask: str = "",
+                     sheet_groups=(),
                      limit: int = 2000) -> pd.DataFrame:
     """
     Поиск замечаний по подстроке с фильтрами.
@@ -165,6 +170,11 @@ def _search_comments(query: str,
     if categories:
         q += f" AND c.category IN ({','.join('?' * len(categories))})"
         params += list(categories)
+    if sheet_groups:
+        cond, extra_params = _sheet_groups_to_sql(sheet_groups, "d")
+        if cond:
+            q += cond
+            params += extra_params
 
     q += " ORDER BY c.created DESC LIMIT ?"
     params.append(limit)
@@ -305,7 +315,7 @@ def render():
         c4, c5, c6 = st.columns(3)
         with c4:
             sel_status = st.multiselect(
-                "Статус", STATUSES,
+                "Статус замечания", STATUSES,
                 placeholder="Все статусы", key="search_status")
         with c5:
             sel_author = st.multiselect(
@@ -316,14 +326,21 @@ def render():
                 "Категория", CATEGORIES,
                 placeholder="Все категории", key="search_category")
 
-        c7, c8 = st.columns([1, 1])
+        c7, c8, c9 = st.columns(3)
         with c7:
+            sel_sheet_groups = st.multiselect(
+                "Статус листа", SHEET_GROUP_OPTIONS,
+                placeholder="Все статусы листов",
+                key="search_sheet_group")
+
+        c10, c11 = st.columns([1, 1])
+        with c10:
             limit = st.number_input(
                 "Лимит результатов", min_value=100, max_value=10000,
                 value=2000, step=100, key="search_limit",
                 help="Максимум строк, которые будут загружены для отображения",
             )
-        with c8:
+        with c11:
             # Показывать ли пустой поиск (без запроса)
             show_all = st.checkbox(
                 "Показывать всё без запроса", value=False,
@@ -346,7 +363,8 @@ def render():
             statuses=tuple(sel_status) if sel_status else (),
             authors=tuple(sel_author) if sel_author else (),
             categories=tuple(sel_category) if sel_category else (),
-            complex_mask=complex_mask,  # ← НОВОЕ
+            complex_mask=complex_mask,
+            sheet_groups=tuple(sel_sheet_groups) if sel_sheet_groups else (),
             limit=int(limit),
         )
 
