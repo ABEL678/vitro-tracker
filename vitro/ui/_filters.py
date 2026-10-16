@@ -118,3 +118,33 @@ def _sheet_groups_to_sql(sheet_groups: tuple, doc_alias: str = "d"):
         return "", []
 
     return " AND (" + " OR ".join(conditions) + ")", params
+
+
+def _extract_2nd_block(complex_code) -> str:
+    """
+    Вытащить 2-й блок шифра комплекта (марку).
+    Пример: АТ-РД-КЖ1-1-00 → КЖ1.
+    Возвращает верхний регистр или пустую строку.
+    """
+    if not complex_code:
+        return ""
+    parts = str(complex_code).split("-")
+    if len(parts) >= 3:
+        return parts[2].strip().upper()
+    return ""
+
+
+def _filter_by_marka(df, marka: str):
+    """
+    Строгий фильтр DataFrame по 2-му блоку шифра комплекта (марке).
+    marka='КЖ1' → оставит только комплекты, у которых блок 2 = 'КЖ1'.
+    Не найдёт КЖ11, КЖ10, КЖ1.2.
+    Если marka пустая или df пустой — возвращает df без изменений.
+    """
+    if marka is None or df is None or df.empty:
+        return df
+    m = marka.strip().upper()
+    if not m:
+        return df
+    mask = df["complex"].apply(_extract_2nd_block) == m
+    return df[mask]

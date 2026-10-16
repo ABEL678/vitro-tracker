@@ -28,6 +28,7 @@ from vitro.ui._filters import (
     REMARK_STATUS_OPTIONS,
     SHEET_GROUP_OPTIONS,
     _doc_status_group,
+    _filter_by_marka,
     _sheet_groups_to_sql,
 )
 
@@ -208,7 +209,8 @@ def _filter_active(df: pd.DataFrame,
                     kits: tuple = (),
                     block_codes: tuple = (),
                     remark_statuses: tuple = (),
-                    sheet_groups: tuple = ()) -> pd.DataFrame:
+                    sheet_groups: tuple = (),
+                    marka: str = "") -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -224,6 +226,8 @@ def _filter_active(df: pd.DataFrame,
         out = out[out["status"].isin(remark_statuses)]
     if sheet_groups:
         out = out[out["doc_status"].apply(_doc_status_group).isin(sheet_groups)]
+    if marka:
+        out = _filter_by_marka(out, marka)
     return out
 
 
@@ -232,7 +236,8 @@ def _filter_documents(df: pd.DataFrame,
                        sections: tuple = (),
                        kits: tuple = (),
                        block_codes: tuple = (),
-                       sheet_groups: tuple = ()) -> pd.DataFrame:
+                       sheet_groups: tuple = (),
+                       marka: str = "") -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -246,6 +251,8 @@ def _filter_documents(df: pd.DataFrame,
         out = _filter_by_blocks(out, block_codes)
     if sheet_groups:
         out = out[out["status"].apply(_doc_status_group).isin(sheet_groups)]
+    if marka:
+        out = _filter_by_marka(out, marka)
     return out
 
 
@@ -274,7 +281,8 @@ def _load_scale(disciplines: tuple = (),
                  kits: tuple = (),
                  block_codes: tuple = (),
                  remark_statuses: tuple = (),
-                 sheet_groups: tuple = ()) -> dict:
+                 sheet_groups: tuple = (),
+                 marka: str = "") -> dict:
     q = """
         SELECT
             COUNT(*) AS total_all,
@@ -309,6 +317,13 @@ def _load_scale(disciplines: tuple = (),
         if cond:
             q += cond
             params += extra_params
+    if marka:
+        # Строгое совпадение 2-го блока шифра: -КЖ1- найдёт только КЖ1,
+        # не найдёт КЖ11 или КЖ10 (у них -КЖ11-, -КЖ10-).
+        m = marka.strip().upper()
+        if m:
+            q += " AND d.complex LIKE ?"
+            params.append(f"%-{m}-%")
 
     with get_conn() as conn:
         row = conn.execute(q, tuple(params)).fetchone()
@@ -396,6 +411,7 @@ def _render_scale_section(scale: dict,
                 _LAST_FILTERS.get("block_codes", ()),
                 _LAST_FILTERS.get("remark_statuses", ()),
                 _LAST_FILTERS.get("sheet_groups", ()),
+                _LAST_FILTERS.get("marka", ""),
             )
         )
         _pie(st_dist, "Статус", "Количество", STATUS_COLORS,
@@ -780,7 +796,7 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
     (disciplines, sections, kits, block_codes,
-     remark_statuses, sheet_groups) = filter_key
+     remark_statuses, sheet_groups, marka) = filter_key
     q = """
         SELECT
             CASE WHEN c.status IS NULL OR c.status = ''
@@ -811,6 +827,11 @@ def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
         if cond:
             q += cond
             params += extra_params
+    if marka:
+        m = marka.strip().upper()
+        if m:
+            q += " AND d.complex LIKE ?"
+            params.append(f"%-{m}-%")
     q += ' GROUP BY "Статус" ORDER BY "Количество" DESC'
     with get_conn() as conn:
         return pd.read_sql(q, conn, params=params)
@@ -819,7 +840,8 @@ def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
 def _filter_key(disc_t: tuple, sect_t: tuple,
                  kit_t: tuple, block_codes: tuple,
                  remark_statuses: tuple = (),
-                 sheet_groups: tuple = ()) -> tuple:
+                 sheet_groups: tuple = (),
+                 marka: str = "") -> tuple:
     return (
         tuple(sorted(disc_t)),
         tuple(sorted(sect_t)),
@@ -827,12 +849,13 @@ def _filter_key(disc_t: tuple, sect_t: tuple,
         tuple(sorted(block_codes)),
         tuple(sorted(remark_statuses)),
         tuple(sorted(sheet_groups)),
+        (marka or "").strip().upper(),
     )
 
 
 _LAST_FILTERS: dict = {
     "disc_t": (), "sect_t": (), "kit_t": (), "block_codes": (),
-    "remark_statuses": (), "sheet_groups": (),
+    "remark_statuses": (), "sheet_groups": (), "marka": "",
 }
 
 
@@ -972,13 +995,15 @@ def _load_summary_by_discipline(
     block_codes: tuple = (),
     remark_statuses: tuple = (),
     sheet_groups: tuple = (),
+    marka: str = "",
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             block_codes, remark_statuses, sheet_groups)
+                             block_codes, remark_statuses, sheet_groups,
+                             marka)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes, sheet_groups)
+                              block_codes, sheet_groups, marka)
     return _build_summary_rows("discipline", active, docs)
 
 
@@ -990,13 +1015,15 @@ def _load_summary_by_section(
     block_codes: tuple = (),
     remark_statuses: tuple = (),
     sheet_groups: tuple = (),
+    marka: str = "",
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             block_codes, remark_statuses, sheet_groups)
+                             block_codes, remark_statuses, sheet_groups,
+                             marka)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes, sheet_groups)
+                              block_codes, sheet_groups, marka)
     return _build_summary_rows("section", active, docs)
 
 
@@ -1008,13 +1035,15 @@ def _load_summary_by_complex(
     block_codes: tuple = (),
     remark_statuses: tuple = (),
     sheet_groups: tuple = (),
+    marka: str = "",
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             block_codes, remark_statuses, sheet_groups)
+                             block_codes, remark_statuses, sheet_groups,
+                             marka)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes, sheet_groups)
+                              block_codes, sheet_groups, marka)
     result = _build_summary_rows("complex", active, docs)
 
     # Добавляем «Наименование» из complexes
@@ -1265,7 +1294,7 @@ def render():
     disc_options = _load_discipline_options()
 
     with st.expander("Фильтры", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
 
         # 1. Дисциплина
         with c1:
@@ -1327,16 +1356,26 @@ def render():
             sel_kit = [code for code, label in kit_options.items()
                         if label in sel_kit_labels]
 
-        st.write("")
-        c5, c6 = st.columns(2)
+        # 5. Марка комплекта (блок 2 шифра)
         with c5:
+            sel_marka = st.text_input(
+                "Марка комплекта",
+                placeholder="например: КЖ1",
+                key="sum_marka",
+                help="Точное совпадение 2-го блока шифра (марки). "
+                     "КЖ1 не найдёт КЖ11 или КЖ10.",
+            )
+
+        st.write("")
+        c6, c7 = st.columns(2)
+        with c6:
             sel_remark_statuses = st.multiselect(
                 "Статус замечания",
                 options=REMARK_STATUS_OPTIONS,
                 placeholder="Все",
                 key="sum_remark_status",
             )
-        with c6:
+        with c7:
             sel_sheet_groups = st.multiselect(
                 "Статус листа",
                 options=SHEET_GROUP_OPTIONS,
@@ -1349,6 +1388,7 @@ def render():
     kit_t = tuple(sel_kit)
     remark_statuses_t = tuple(sel_remark_statuses) if sel_remark_statuses else ()
     sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
+    marka_t = (sel_marka or "").strip()
 
     _LAST_FILTERS["disc_t"] = disc_t
     _LAST_FILTERS["sect_t"] = sect_t
@@ -1356,19 +1396,20 @@ def render():
     _LAST_FILTERS["block_codes"] = block_codes
     _LAST_FILTERS["remark_statuses"] = remark_statuses_t
     _LAST_FILTERS["sheet_groups"] = sheet_groups_t
+    _LAST_FILTERS["marka"] = marka_t
 
     with st.spinner("Загрузка данных..."):
         active_all = _load_all_categorized()
         active_filtered = _filter_active(
             active_all, disc_t, sect_t, kit_t, block_codes,
-            remark_statuses_t, sheet_groups_t)
+            remark_statuses_t, sheet_groups_t, marka_t)
         docs_all = _load_documents()
         docs_filtered = _filter_documents(
             docs_all, disc_t, sect_t, kit_t, block_codes,
-            sheet_groups_t)
+            sheet_groups_t, marka_t)
         scale = _load_scale(
             disc_t, sect_t, kit_t, block_codes,
-            remark_statuses_t, sheet_groups_t)
+            remark_statuses_t, sheet_groups_t, marka_t)
 
     active_count = len(active_filtered)
 
@@ -1391,15 +1432,15 @@ def render():
     with tab_disc:
         df = _load_summary_by_discipline(
             disc_t, sect_t, kit_t, block_codes,
-            remark_statuses_t, sheet_groups_t)
+            remark_statuses_t, sheet_groups_t, marka_t)
         _render_summary_table(df, "Код", "discipline")
     with tab_sect:
         df = _load_summary_by_section(
             disc_t, sect_t, kit_t, block_codes,
-            remark_statuses_t, sheet_groups_t)
+            remark_statuses_t, sheet_groups_t, marka_t)
         _render_summary_table(df, "Раздел", "section")
     with tab_cx:
         df = _load_summary_by_complex(
             disc_t, sect_t, kit_t, block_codes,
-            remark_statuses_t, sheet_groups_t)
+            remark_statuses_t, sheet_groups_t, marka_t)
         _render_summary_table(df, "Комплект", "complex")
