@@ -25,6 +25,7 @@ import streamlit as st
 from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
+    REMARK_STATUS_OPTIONS,
     SHEET_GROUP_OPTIONS,
     _doc_status_group,
     _sheet_groups_to_sql,
@@ -48,15 +49,6 @@ BLOCK_OPTIONS = {
     "Генплан":                     "ГП",
     "Автомобильные дороги (УДС)":  "А",
 }
-
-# Статусы замечаний (сырые из Витрокад) — для фильтра «Статус замечания"
-REMARK_STATUS_OPTIONS = [
-    "Новое",
-    "Принято в работу",
-    "Не принято",
-    "К обсуждению",
-    "Выполнено",
-]
 
 # ---------------------------------------------------------------------------
 #  Палитры
