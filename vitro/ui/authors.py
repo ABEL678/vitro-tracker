@@ -17,6 +17,10 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn, update_category_safe
 from vitro.disciplines import discipline_name
+from vitro.ui._filters import (
+    SHEET_GROUP_OPTIONS,
+    _doc_status_group,
+)
 
 
 # ---- Категории замечаний ----
@@ -144,7 +148,8 @@ def _load_kit_options(disciplines: tuple = (),
 def _filter_by_hierarchy(df: pd.DataFrame,
                           disciplines: tuple = (),
                           sections: tuple = (),
-                          kits: tuple = ()) -> pd.DataFrame:
+                          kits: tuple = (),
+                          sheet_groups: tuple = ()) -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -154,6 +159,10 @@ def _filter_by_hierarchy(df: pd.DataFrame,
         out = out[out["section"].isin(sections)]
     if kits:
         out = out[out["complex"].isin(kits)]
+    if sheet_groups:
+        out = out[
+            out["doc_status"].apply(_doc_status_group).isin(sheet_groups)
+        ]
     return out
 
 
@@ -217,9 +226,11 @@ def _render_kpi(df_all: pd.DataFrame, df_ours: pd.DataFrame):
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_authors(disciplines: tuple = (), sections: tuple = (),
-                   kits: tuple = ()) -> pd.DataFrame:
+                   kits: tuple = (),
+                   sheet_groups: tuple = ()) -> pd.DataFrame:
     df = _load_all_categorized()
-    df = _filter_by_hierarchy(df, disciplines, sections, kits)
+    df = _filter_by_hierarchy(df, disciplines, sections, kits,
+                               sheet_groups)
 
     if df.empty:
         return pd.DataFrame()
@@ -328,11 +339,17 @@ def _render_authors_table(df: pd.DataFrame):
 #  Детали автора
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_author_by_discipline(author: str) -> pd.DataFrame:
+def _load_author_by_discipline(author: str,
+                                sheet_groups: tuple = ()) -> pd.DataFrame:
     df = _load_all_categorized()
     ours = df[df["holder"] == "ours"]
     if ours.empty:
         return pd.DataFrame()
+
+    if sheet_groups:
+        ours = ours[
+            ours["doc_status"].apply(_doc_status_group).isin(sheet_groups)
+        ]
 
     sub = ours[ours["author"] == author].copy()
     if sub.empty:
@@ -360,11 +377,17 @@ def _load_author_by_discipline(author: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_author_comments(author: str) -> pd.DataFrame:
+def _load_author_comments(author: str,
+                          sheet_groups: tuple = ()) -> pd.DataFrame:
     df = _load_all_categorized()
     ours = df[df["holder"] == "ours"]
     if ours.empty:
         return pd.DataFrame()
+
+    if sheet_groups:
+        ours = ours[
+            ours["doc_status"].apply(_doc_status_group).isin(sheet_groups)
+        ]
 
     sub = ours[ours["author"] == author].copy()
     if sub.empty:
@@ -387,7 +410,8 @@ def _load_author_comments(author: str) -> pd.DataFrame:
     return view
 
 
-def _render_drilldown(df: pd.DataFrame):
+def _render_drilldown(df: pd.DataFrame,
+                       sheet_groups: tuple = ()):
     st.markdown("### 🔍 Детали автора")
     if df.empty:
         st.info("Нет данных.")
@@ -450,7 +474,7 @@ def _render_drilldown(df: pd.DataFrame):
             st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        by_disc = _load_author_by_discipline(sel)
+        by_disc = _load_author_by_discipline(sel, sheet_groups)
         if not by_disc.empty:
             by_disc["label"] = by_disc["discipline"].apply(
                 lambda c: f"{c} — {discipline_name(c)}")
@@ -467,7 +491,7 @@ def _render_drilldown(df: pd.DataFrame):
     st.divider()
 
     st.markdown(f"**Все замечания автора `{sel}`**")
-    details = _load_author_comments(sel)
+    details = _load_author_comments(sel, sheet_groups)
     if details.empty:
         st.info("У автора нет замечаний.")
         return
@@ -984,17 +1008,30 @@ def _render_analytics_tab():
         sel_kit = [c for c, l in kit_options.items()
                     if l in sel_kit_labels]
 
+    # Второй ряд: Статус листа
+    st.write("")
+    c4, _ = st.columns([1, 2])
+    with c4:
+        sel_sheet_groups = st.multiselect(
+            "Статус листа",
+            options=SHEET_GROUP_OPTIONS,
+            placeholder="Все статусы листов",
+            key="authors_sheet_group",
+        )
+
     disc_t = tuple(sel_disc) if sel_disc else ()
     sect_t = tuple(sel_section) if sel_section else ()
     kit_t = tuple(sel_kit) if sel_kit else ()
+    sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
 
     df_all = _load_all_categorized()
-    df_all = _filter_by_hierarchy(df_all, disc_t, sect_t, kit_t)
+    df_all = _filter_by_hierarchy(df_all, disc_t, sect_t, kit_t,
+                                   sheet_groups_t)
     df_ours = df_all[df_all["holder"] == "ours"]
 
     _render_kpi(df_all, df_ours)
 
-    df = _load_authors(disc_t, sect_t, kit_t)
+    df = _load_authors(disc_t, sect_t, kit_t, sheet_groups_t)
     if df.empty:
         st.info("Нет данных по авторам с учётом фильтров.")
         return
@@ -1002,7 +1039,7 @@ def _render_analytics_tab():
     st.divider()
     _render_authors_table(df)
     st.divider()
-    _render_drilldown(df)
+    _render_drilldown(df, sheet_groups_t)
 
 
 def render():
