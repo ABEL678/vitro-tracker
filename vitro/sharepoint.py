@@ -203,7 +203,8 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
            f"and substringof('.pdf', FileLeafRef)")
     raw = _fetch_all(
         VITRO_OKHTA_URL, LIST_DOCS,
-        ["Id", "FileLeafRef", "FileDirRef",
+        ["Id", "UniqueId", "OData__UIVersionString",
+         "FileLeafRef", "FileDirRef",
          "VitroBaseStatus", "VitroBaseDocumentRevision",
          "VitroBaseFullName", "VitroBaseStatusDate",
          "VitroBaseDocSheetNumber"],
@@ -225,6 +226,12 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
         if not comp:
             continue
 
+        ui_version_raw = it.get("OData__UIVersionString") or ""
+        try:
+            vitro_version = int(float(str(ui_version_raw)))
+        except (ValueError, TypeError):
+            vitro_version = 1
+
         docs.append({
             "id": it.get("Id"),
             "leaf": leaf,
@@ -237,6 +244,8 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             "name": it.get("VitroBaseFullName"),
             "status_date": it.get("VitroBaseStatusDate"),
             "sheet_number": it.get("VitroBaseDocSheetNumber"),
+            "vitro_guid": it.get("UniqueId"),
+            "vitro_version": vitro_version,
         })
     return docs
 

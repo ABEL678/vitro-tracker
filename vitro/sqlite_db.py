@@ -52,17 +52,19 @@ def init_db() -> None:
     with get_conn() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS documents (
-            id            INTEGER PRIMARY KEY,
-            leaf          TEXT NOT NULL,
-            discipline    TEXT,
-            section       TEXT,
-            complex       TEXT,
-            status        TEXT,
-            revision      TEXT,
-            dir_ref       TEXT,
-            name          TEXT,
-            status_date   TEXT,
-            sheet_number  TEXT
+            id             INTEGER PRIMARY KEY,
+            leaf           TEXT NOT NULL,
+            discipline     TEXT,
+            section        TEXT,
+            complex        TEXT,
+            status         TEXT,
+            revision       TEXT,
+            dir_ref        TEXT,
+            name           TEXT,
+            status_date    TEXT,
+            sheet_number   TEXT,
+            vitro_guid     TEXT,
+            vitro_version  INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_documents_complex    ON documents(complex);
         CREATE INDEX IF NOT EXISTS idx_documents_discipline ON documents(discipline);
@@ -139,6 +141,15 @@ def init_db() -> None:
         ]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE comments ADD COLUMN {col} {ddl}")
+
+        # Мягкая миграция для documents — новые поля для ссылок на Витро
+        doc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(documents)")}
+        for col, ddl in [
+            ("vitro_guid",    "TEXT"),
+            ("vitro_version", "INTEGER"),
+        ]:
+            if col not in doc_cols:
+                conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {ddl}")
 
 
 # ---------------------------------------------------------------------------
@@ -346,13 +357,15 @@ def save_all(docs: list[dict], comments: list[dict], doc_ids: set) -> tuple:
             conn.executemany("""
                 INSERT INTO documents
                     (id, leaf, discipline, section, complex, status,
-                     revision, dir_ref, name, status_date, sheet_number)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     revision, dir_ref, name, status_date, sheet_number,
+                     vitro_guid, vitro_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 (d["id"], d["leaf"], d.get("discipline"), d.get("section"),
                  d.get("complex"), d.get("status"), d.get("revision"),
                  d.get("dir_ref"), d.get("name"), d.get("status_date"),
-                 d.get("sheet_number"))
+                 d.get("sheet_number"),
+                 d.get("vitro_guid"), d.get("vitro_version"))
                 for d in docs
             ])
 
