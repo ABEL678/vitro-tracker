@@ -44,6 +44,48 @@ BLOCK_OPTIONS = {
     "Автомобильные дороги (УДС)":  "А",
 }
 
+# Статусы замечаний (сырые из Витрокад) — для фильтра «Статус замечания"
+REMARK_STATUS_OPTIONS = [
+    "Новое",
+    "Принято в работу",
+    "Не принято",
+    "К обсуждению",
+    "Выполнено",
+]
+
+# Группы статусов листов — для фильтра «Статус листа"
+# Совпадают с бубликом Секции 2 и функцией _group()
+SHEET_GROUP_OPTIONS = [
+    "A — утверждён",
+    "B — к сдаче",
+    "C — в работе",
+    "И — информационный",
+    "На согласовании Заказчика",
+    "Готовится к загрузке",
+    "Аннулировано",
+    "Прочее",
+]
+
+# Обратный маппинг: группа → список сырых статусов (для SQL-фильтра)
+_SHEET_GROUP_TO_RAW = {
+    "A — утверждён":              ["A"],
+    "B — к сдаче":                ["B"],
+    "C — в работе":               ["C"],
+    "И — информационный":         ["И"],
+    "На согласовании Заказчика":  ["ДЛЯ СОГЛАСОВАНИЯ", "НА РАССМОТРЕНИИ"],
+    "Готовится к загрузке":       ["НА КОРРЕКТИРОВКЕ", "РАЗМЕЩЕНО"],
+    "Аннулировано":               ["АННУЛИРОВАНО"],
+    # «Прочее» обрабатывается отдельно — через NOT IN
+}
+
+# Все известные сырые статусы — для группы «Прочее»
+_ALL_KNOWN_RAW_STATUSES = [
+    "A", "B", "C", "И",
+    "ДЛЯ СОГЛАСОВАНИЯ", "НА РАССМОТРЕНИИ",
+    "НА КОРРЕКТИРОВКЕ", "РАЗМЕЩЕНО",
+    "АННУЛИРОВАНО",
+]
+
 # ---------------------------------------------------------------------------
 #  Палитры
 # ---------------------------------------------------------------------------
@@ -200,7 +242,9 @@ def _filter_active(df: pd.DataFrame,
                     disciplines: tuple = (),
                     sections: tuple = (),
                     kits: tuple = (),
-                    block_codes: tuple = ()) -> pd.DataFrame:
+                    block_codes: tuple = (),
+                    remark_statuses: tuple = (),
+                    sheet_groups: tuple = ()) -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -212,6 +256,10 @@ def _filter_active(df: pd.DataFrame,
         out = out[out["complex"].isin(kits)]
     if block_codes:
         out = _filter_by_blocks(out, block_codes)
+    if remark_statuses:
+        out = out[out["status"].isin(remark_statuses)]
+    if sheet_groups:
+        out = out[out["doc_status"].apply(_doc_status_group).isin(sheet_groups)]
     return out
 
 
@@ -219,7 +267,8 @@ def _filter_documents(df: pd.DataFrame,
                        disciplines: tuple = (),
                        sections: tuple = (),
                        kits: tuple = (),
-                       block_codes: tuple = ()) -> pd.DataFrame:
+                       block_codes: tuple = (),
+                       sheet_groups: tuple = ()) -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -231,6 +280,8 @@ def _filter_documents(df: pd.DataFrame,
         out = out[out["complex"].isin(kits)]
     if block_codes:
         out = _filter_by_blocks(out, block_codes)
+    if sheet_groups:
+        out = out[out["status"].apply(_doc_status_group).isin(sheet_groups)]
     return out
 
 
@@ -248,13 +299,55 @@ def _load_documents() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+#  SQL-хелпер для групп статусов листов
+# ---------------------------------------------------------------------------
+def _sheet_groups_to_sql(sheet_groups: tuple, doc_alias: str = "d"):
+    """
+    Возвращает (sql_condition, params) для фильтра по группам статусов листов.
+    sql_condition — строка вида " AND (...)" или "".
+    Использует NOT IN для группы «Прочее».
+    """
+    if not sheet_groups:
+        return "", []
+
+    raw = []
+    for g in sheet_groups:
+        raw += _SHEET_GROUP_TO_RAW.get(g, [])
+
+    conditions = []
+    params: list = []
+
+    if raw:
+        conditions.append(
+            f"{doc_alias}.status IN ({','.join('?' * len(raw))})"
+        )
+        params += raw
+
+    if "Прочее" in sheet_groups:
+        placeholders = ",".join("?" * len(_ALL_KNOWN_RAW_STATUSES))
+        conditions.append(
+            f"({doc_alias}.status NOT IN ({placeholders}) "
+            f"OR {doc_alias}.status IS NULL "
+            f"OR {doc_alias}.status = '')"
+        )
+        params += _ALL_KNOWN_RAW_STATUSES
+
+    if not conditions:
+        return "", []
+
+    return " AND (" + " OR ".join(conditions) + ")", params
+
+
+# ---------------------------------------------------------------------------
 #  Общий объём
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_scale(disciplines: tuple = (),
                  sections: tuple = (),
                  kits: tuple = (),
-                 block_codes: tuple = ()) -> dict:
+                 block_codes: tuple = (),
+                 remark_statuses: tuple = (),
+                 sheet_groups: tuple = ()) -> dict:
     q = """
         SELECT
             COUNT(*) AS total_all,
@@ -281,6 +374,14 @@ def _load_scale(disciplines: tuple = (),
     if block_codes:
         ors = [f"d.complex LIKE '%-{bc}-%'" for bc in block_codes]
         q += " AND (" + " OR ".join(ors) + ")"
+    if remark_statuses:
+        q += f" AND c.status IN ({','.join('?' * len(remark_statuses))})"
+        params += list(remark_statuses)
+    if sheet_groups:
+        cond, extra_params = _sheet_groups_to_sql(sheet_groups, "d")
+        if cond:
+            q += cond
+            params += extra_params
 
     with get_conn() as conn:
         row = conn.execute(q, tuple(params)).fetchone()
@@ -366,6 +467,8 @@ def _render_scale_section(scale: dict,
                 _LAST_FILTERS.get("sect_t", ()),
                 _LAST_FILTERS.get("kit_t", ()),
                 _LAST_FILTERS.get("block_codes", ()),
+                _LAST_FILTERS.get("remark_statuses", ()),
+                _LAST_FILTERS.get("sheet_groups", ()),
             )
         )
         _pie(st_dist, "Статус", "Количество", STATUS_COLORS,
@@ -749,7 +852,8 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
 # ===========================================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
-    disciplines, sections, kits, block_codes = filter_key
+    (disciplines, sections, kits, block_codes,
+     remark_statuses, sheet_groups) = filter_key
     q = """
         SELECT
             CASE WHEN c.status IS NULL OR c.status = ''
@@ -772,23 +876,58 @@ def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
     if block_codes:
         ors = [f"d.complex LIKE '%-{bc}-%'" for bc in block_codes]
         q += " AND (" + " OR ".join(ors) + ")"
+    if remark_statuses:
+        q += f" AND c.status IN ({','.join('?' * len(remark_statuses))})"
+        params += list(remark_statuses)
+    if sheet_groups:
+        cond, extra_params = _sheet_groups_to_sql(sheet_groups, "d")
+        if cond:
+            q += cond
+            params += extra_params
     q += ' GROUP BY "Статус" ORDER BY "Количество" DESC'
     with get_conn() as conn:
         return pd.read_sql(q, conn, params=params)
 
 
+def _doc_status_group(raw) -> str:
+    """Сырой doc_status → группа (как в бублике Секции 2)."""
+    if raw is None:
+        return "Прочее"
+    s = str(raw).strip().upper()
+    if s == "A":
+        return "A — утверждён"
+    if s == "B":
+        return "B — к сдаче"
+    if s == "C":
+        return "C — в работе"
+    if s == "И":
+        return "И — информационный"
+    if s in ("ДЛЯ СОГЛАСОВАНИЯ", "НА РАССМОТРЕНИИ"):
+        return "На согласовании Заказчика"
+    if s in ("НА КОРРЕКТИРОВКЕ", "РАЗМЕЩЕНО"):
+        return "Готовится к загрузке"
+    if s == "АННУЛИРОВАНО":
+        return "Аннулировано"
+    return "Прочее"
+
+
 def _filter_key(disc_t: tuple, sect_t: tuple,
-                 kit_t: tuple, block_codes: tuple) -> tuple:
+                 kit_t: tuple, block_codes: tuple,
+                 remark_statuses: tuple = (),
+                 sheet_groups: tuple = ()) -> tuple:
     return (
         tuple(sorted(disc_t)),
         tuple(sorted(sect_t)),
         tuple(sorted(kit_t)),
         tuple(sorted(block_codes)),
+        tuple(sorted(remark_statuses)),
+        tuple(sorted(sheet_groups)),
     )
 
 
 _LAST_FILTERS: dict = {
     "disc_t": (), "sect_t": (), "kit_t": (), "block_codes": (),
+    "remark_statuses": (), "sheet_groups": (),
 }
 
 
@@ -796,27 +935,7 @@ def _sheet_distribution_from_df(docs_df: pd.DataFrame) -> pd.DataFrame:
     if docs_df.empty:
         return pd.DataFrame()
 
-    def _group(raw) -> str:
-        if raw is None:
-            return "Прочее"
-        s = str(raw).strip().upper()
-        if s == "A":
-            return "A — утверждён"
-        if s == "B":
-            return "B — к сдаче"
-        if s == "C":
-            return "C — в работе"
-        if s == "И":
-            return "И — информационный"
-        if s in ("ДЛЯ СОГЛАСОВАНИЯ", "НА РАССМОТРЕНИИ"):
-            return "На согласовании Заказчика"
-        if s in ("НА КОРРЕКТИРОВКЕ", "РАЗМЕЩЕНО"):
-            return "Готовится к загрузке"
-        if s == "АННУЛИРОВАНО":
-            return "Аннулировано"
-        return "Прочее"
-
-    grp = docs_df["status"].apply(_group).value_counts().reset_index()
+    grp = docs_df["status"].apply(_doc_status_group).value_counts().reset_index()
     grp.columns = ["Статус листа", "Количество"]
     return grp
 
@@ -946,13 +1065,15 @@ def _load_summary_by_discipline(
     sections: tuple = (),
     kits: tuple = (),
     block_codes: tuple = (),
+    remark_statuses: tuple = (),
+    sheet_groups: tuple = (),
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             block_codes)
+                             block_codes, remark_statuses, sheet_groups)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes)
+                              block_codes, sheet_groups)
     return _build_summary_rows("discipline", active, docs)
 
 
@@ -962,13 +1083,15 @@ def _load_summary_by_section(
     sections: tuple = (),
     kits: tuple = (),
     block_codes: tuple = (),
+    remark_statuses: tuple = (),
+    sheet_groups: tuple = (),
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             block_codes)
+                             block_codes, remark_statuses, sheet_groups)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes)
+                              block_codes, sheet_groups)
     return _build_summary_rows("section", active, docs)
 
 
@@ -978,13 +1101,15 @@ def _load_summary_by_complex(
     sections: tuple = (),
     kits: tuple = (),
     block_codes: tuple = (),
+    remark_statuses: tuple = (),
+    sheet_groups: tuple = (),
 ) -> pd.DataFrame:
     active = _load_all_categorized()
     active = _filter_active(active, disciplines, sections, kits,
-                             block_codes)
+                             block_codes, remark_statuses, sheet_groups)
     docs = _load_documents()
     docs = _filter_documents(docs, disciplines, sections, kits,
-                              block_codes)
+                              block_codes, sheet_groups)
     result = _build_summary_rows("complex", active, docs)
 
     # Добавляем «Наименование» из complexes
@@ -1192,9 +1317,8 @@ def _render_summary_table(df: pd.DataFrame,
             return ["font-weight: bold; background-color: #f0f0f0"] * len(row)
         return [""] * len(row)
 
-    # --- Ограничение отображения: первые 100 строк ---
-    DISPLAY_LIMIT = 100
-    display_df = view_with_total.head(DISPLAY_LIMIT).copy()
+    # --- Отображение: все строки (строка ИТОГО должна быть видна) ---
+    display_df = view_with_total.copy()
     display_count = len(display_df)  # ← считаем до применения стиля
     display_df = display_df.style.apply(_style_row, axis=1)
 
@@ -1217,9 +1341,9 @@ def _render_summary_table(df: pd.DataFrame,
     )
 
     st.caption(
-        f"Показано **{display_count - 1}** из **{len(view)}** строк. "
+        f"Всего строк: **{len(view)}**. "
         f"Строка **ИТОГО** — внизу таблицы. "
-        f"Для полного списка нажмите «📥 Выгрузить в Excel»."
+        f"Для выгрузки нажмите «📥 Выгрузить в Excel»."
     )
 
 
@@ -1298,23 +1422,48 @@ def render():
             sel_kit = [code for code, label in kit_options.items()
                         if label in sel_kit_labels]
 
+        st.write("")
+        c5, c6 = st.columns(2)
+        with c5:
+            sel_remark_statuses = st.multiselect(
+                "Статус замечания",
+                options=REMARK_STATUS_OPTIONS,
+                placeholder="Все",
+                key="sum_remark_status",
+            )
+        with c6:
+            sel_sheet_groups = st.multiselect(
+                "Статус листа",
+                options=SHEET_GROUP_OPTIONS,
+                placeholder="Все",
+                key="sum_sheet_group",
+            )
+
     disc_t = tuple(sel_disc)
     sect_t = tuple(sel_section)
     kit_t = tuple(sel_kit)
+    remark_statuses_t = tuple(sel_remark_statuses) if sel_remark_statuses else ()
+    sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
 
     _LAST_FILTERS["disc_t"] = disc_t
     _LAST_FILTERS["sect_t"] = sect_t
     _LAST_FILTERS["kit_t"] = kit_t
     _LAST_FILTERS["block_codes"] = block_codes
+    _LAST_FILTERS["remark_statuses"] = remark_statuses_t
+    _LAST_FILTERS["sheet_groups"] = sheet_groups_t
 
     with st.spinner("Загрузка данных..."):
         active_all = _load_all_categorized()
         active_filtered = _filter_active(
-            active_all, disc_t, sect_t, kit_t, block_codes)
+            active_all, disc_t, sect_t, kit_t, block_codes,
+            remark_statuses_t, sheet_groups_t)
         docs_all = _load_documents()
         docs_filtered = _filter_documents(
-            docs_all, disc_t, sect_t, kit_t, block_codes)
-        scale = _load_scale(disc_t, sect_t, kit_t, block_codes)
+            docs_all, disc_t, sect_t, kit_t, block_codes,
+            sheet_groups_t)
+        scale = _load_scale(
+            disc_t, sect_t, kit_t, block_codes,
+            remark_statuses_t, sheet_groups_t)
 
     active_count = len(active_filtered)
 
@@ -1335,14 +1484,17 @@ def render():
         "По дисциплинам", "По разделам", "По комплектам",
     ])
     with tab_disc:
-        df = _load_summary_by_discipline(disc_t, sect_t, kit_t,
-                                          block_codes)
+        df = _load_summary_by_discipline(
+            disc_t, sect_t, kit_t, block_codes,
+            remark_statuses_t, sheet_groups_t)
         _render_summary_table(df, "Код", "discipline")
     with tab_sect:
-        df = _load_summary_by_section(disc_t, sect_t, kit_t,
-                                       block_codes)
+        df = _load_summary_by_section(
+            disc_t, sect_t, kit_t, block_codes,
+            remark_statuses_t, sheet_groups_t)
         _render_summary_table(df, "Раздел", "section")
     with tab_cx:
-        df = _load_summary_by_complex(disc_t, sect_t, kit_t,
-                                       block_codes)
+        df = _load_summary_by_complex(
+            disc_t, sect_t, kit_t, block_codes,
+            remark_statuses_t, sheet_groups_t)
         _render_summary_table(df, "Комплект", "complex")
