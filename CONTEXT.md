@@ -10,7 +10,7 @@
 
 - **Python 3.14**
 - **Streamlit 1.64** (ленивая загрузка вкладок через radio)
-- **SQLite** (`data/vitro.db`, ~35 МБ, ~66 000 замечаний)
+- **SQLite** (`data/vitro.db`, ~35 МБ, ~68 000 замечаний)
 - **Plotly 7.1** (все графики — с `key=`, иначе DuplicateElementId)
 - **pandas 3.0**, **openpyxl 3.1**, **reportlab 5.0**
 - **Git** + приватный GitHub: https://github.com/ABEL678/vitro-tracker
@@ -52,16 +52,20 @@ Vitro_tracker/
 ├── assets/logo.png
 ├── scripts/check.py           # Диагностика
 └── vitro/
-    ├── config.py              # .env + переменные
+    ├── config.py              # .env + переменные (APP_VERSION)
     ├── disciplines.py         # Справочник дисциплин
     ├── sharepoint.py          # Загрузка из Витрокад
     ├── sqlite_db.py           # Работа с БД
     ├── sync.py                # Логика синхронизации
     ├── workdays.py            # Производственный календарь РФ
     ├── text_utils.py          # clean_leaf_key, normalize_homoglyphs
+    ├── time_utils.py          # Время UTC → МСК
     ├── xlsx_builder.py        # Генерация XLSX
     ├── pdf_builder.py         # Генерация PDF
     └── ui/
+        ├── _auth.py           # Авторизация по требованию
+        ├── _filters.py        # Общие фильтры (статусы, марка)
+        ├── _urls.py           # Ссылки на Витро
         ├── _utils.py          # download_plotly (только для Экспорта)
         ├── summary.py         # Сводка по проекту
         ├── dynamics.py        # Динамика (потоки по месяцам)
@@ -121,13 +125,58 @@ Vitro_tracker/
 - **Секции 3, 4, 5**: оба фильтра.
 - **Разрез (табы)**: оба фильтра.
 
-Маппинг групп статусов листов: `_sheet_groups_to_sql()` в `summary.py`.
+Маппинг групп статусов листов: `_sheet_groups_to_sql()` в `_filters.py`.
 Обратный маппинг групп в сырые статусы: `_SHEET_GROUP_TO_RAW`.
 Группа «Прочее» обрабатывается через `NOT IN` (`_ALL_KNOWN_RAW_STATUSES`).
 
 ВАЖНО:
 - Группа «На согласовании Заказчика» = «ДЛЯ СОГЛАСОВАНИЯ» + «НА РАССМОТРЕНИИ».
 - Группа «Готовится к загрузке» = «НА КОРРЕКТИРОВКЕ» + «РАЗМЕЩЕНО».
+
+#### Общие модули в vitro/ui/
+
+- **`_filters.py`** — общие фильтры: статусы листов, статусы замечаний, марка комплекта.
+  - `SHEET_GROUP_OPTIONS`, `REMARK_STATUS_OPTIONS`, `_SHEET_GROUP_TO_RAW`, `_ALL_KNOWN_RAW_STATUSES`.
+  - Функции: `_doc_status_group`, `_sheet_groups_to_sql`, `_extract_2nd_block`, `_filter_by_marka`.
+
+- **`_urls.py`** — `build_vitro_comment_url(vitro_guid, vitro_version, note_id)`.
+
+- **`_auth.py`** — авторизация по требованию: `ask_user_name_dialog`, `ensure_user`.
+  - Диалог ввода имени — ТОЛЬКО при сохранении (categories.py, authors.py).
+  - Если отмена — сохранение прерывается.
+
+#### Фильтр «Марка комплекта» (блок 2 шифра)
+
+Во всех 5 вкладках есть фильтр «Марка комплекта».
+- Строгое совпадение 2-го блока шифра.
+- `КЖ1` не найдёт `КЖ11`, `КЖ10`.
+- В SQL — `LIKE '%-{marka}-%'`.
+- В Python — `_filter_by_marka`.
+
+#### Ссылки на Витро
+
+- В БД есть `documents.vitro_guid` и `documents.vitro_version`.
+- Колонка «Витро» с `LinkColumn` в трёх местах: Авторы (drilldown), Сроки (список), Поиск (результаты).
+- URL строится через `build_vitro_comment_url`.
+- Активные замечания — подсветка, закрытые/аннулированные — без подсветки (OK).
+
+#### Часовой пояс
+
+- **Все timestamp в БД — UTC.**
+- При показе — **МСК (+3)** через `vitro/time_utils.py` (`fmt_msk`).
+- В хедерах — с пометкой «(МСК)».
+- В логах и таблицах — без пометки.
+
+#### Версия приложения
+
+- В `vitro/config.py` — `APP_VERSION`.
+- В футере app.py — отображается.
+
+#### Авторизация
+
+- Имя пользователя — в `st.session_state["user"]`.
+- Диалог показывается через `ensure_user()` ТОЛЬКО при сохранении.
+- Если пользователь отменил — `ensure_user()` возвращает `None`, сохранение прерывается.
 
 ### 5. Терминология в UI
 
@@ -174,7 +223,10 @@ Vitro_tracker/
 ## Что можно трогать
 
 - **`vitro/ui/`** — вкладки.
+- **`vitro/ui/_filters.py`**, **`_urls.py`**, **`_auth.py`** — общие модули.
+- **`vitro/time_utils.py`** — утилиты времени.
 - **`vitro/text_utils.py`**, **`vitro/workdays.py`** — утилиты.
+- **`vitro/config.py`** — константы (в т.ч. `APP_VERSION`).
 - **`scripts/`** — диагностика.
 
 ## Что НЕЛЬЗЯ трогать без явной просьбы
