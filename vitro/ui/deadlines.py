@@ -280,7 +280,9 @@ def _load_all_categorized() -> pd.DataFrame:
                 d.discipline, d.section, d.complex,
                 d.leaf AS sheet_raw,
                 d.name AS sheet_name,
-                d.status AS doc_status
+                d.status AS doc_status,
+                d.vitro_guid AS vitro_guid,
+                d.vitro_version AS vitro_version
             FROM comments c
             JOIN documents d ON c.doc_id = d.id
             WHERE c.status IN (
@@ -449,6 +451,8 @@ def _load_all_categorized() -> pd.DataFrame:
             "our_bucket": our_bucket,
             "customer_bucket": customer_bucket,
             "category_flag": category,
+            "vitro_guid": r["vitro_guid"],
+            "vitro_version": r["vitro_version"],
         })
 
     t2 = time.time()

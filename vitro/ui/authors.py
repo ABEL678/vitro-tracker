@@ -23,6 +23,31 @@ from vitro.ui._filters import (
 )
 
 
+# ---------------------------------------------------------------------------
+#  Ссылки на замечания в Витро
+# ---------------------------------------------------------------------------
+VITRO_BASE_URL = "https://pdm-lakhta.ru/okhta"
+
+
+def build_vitro_comment_url(vitro_guid, vitro_version, note_id) -> str:
+    """
+    Собирает прямую ссылку на замечание в Витро.
+    Формат: https://pdm-lakhta.ru/okhta/_layouts/15/Vitro/Viewer/PDF/web/Viewer.aspx
+            ?Id={vitro_guid}&version={vitro_version}&noteId={note_id}
+    Для закрытых/аннулированных замечаний открывает лист без подсветки — это нормально.
+    """
+    if not vitro_guid or not note_id:
+        return ""
+    try:
+        ver = int(vitro_version) if vitro_version else 1
+    except (ValueError, TypeError):
+        ver = 1
+    return (
+        f"{VITRO_BASE_URL}/_layouts/15/Vitro/Viewer/PDF/web/Viewer.aspx"
+        f"?Id={vitro_guid}&version={ver}&noteId={note_id}"
+    )
+
+
 # ---- Категории замечаний ----
 CAT_1 = "Принято/корректное"
 CAT_2 = "Формальное/нет влияния на СМР"
@@ -396,7 +421,20 @@ def _load_author_comments(author: str,
     view = sub[[
         "id", "discipline", "complex", "sheet", "comment",
         "status", "doc_status", "created", "category",
-    ]].rename(columns={
+        "vitro_guid", "vitro_version",
+    ]].copy()
+
+    # Собираем прямую ссылку на замечание в Витро
+    view["_vitro_url"] = view.apply(
+        lambda r: build_vitro_comment_url(
+            r["vitro_guid"], r["vitro_version"], r["id"]
+        ),
+        axis=1,
+    )
+
+    view = view.drop(columns=["vitro_guid", "vitro_version"])
+
+    view = view.rename(columns={
         "id": "ID",
         "discipline": "Дисциплина",
         "complex": "Комплект",
@@ -406,6 +444,7 @@ def _load_author_comments(author: str,
         "doc_status": "Статус листа",
         "created": "Создано",
         "category": "Категория",
+        "_vitro_url": "Витро",
     })
     return view
 
@@ -500,6 +539,12 @@ def _render_drilldown(df: pd.DataFrame,
         height=500,
         column_config={
             "Замечание": st.column_config.TextColumn(width="large"),
+            "Витро": st.column_config.LinkColumn(
+                "Витро",
+                display_text="🔗 Открыть",
+                width="small",
+                help="Открыть замечание в Витро (подсветится на листе)",
+            ),
         },
     )
 
