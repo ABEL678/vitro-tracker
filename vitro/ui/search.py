@@ -20,6 +20,7 @@ from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
     SHEET_GROUP_OPTIONS,
+    _filter_by_marka,
     _sheet_groups_to_sql,
 )
 from vitro.ui._urls import build_vitro_comment_url
@@ -316,6 +317,16 @@ def render():
                  "подстрока. Регистронезависимо.",
         )
 
+        # ---- Строка марки комплекта ----
+        sel_marka = st.text_input(
+            "Марка комплекта",
+            placeholder="например: КЖ1",
+            key="search_marka",
+            help="Точное совпадение 2-го блока шифра (марки). "
+                 "КЖ1 не найдёт КЖ11 или КЖ10. "
+                 "Работает вместе с маской (AND).",
+        )
+
         c4, c5, c6 = st.columns(3)
         with c4:
             sel_status = st.multiselect(
@@ -375,6 +386,18 @@ def render():
     if df.empty:
         st.warning(f"Ничего не найдено по запросу «{query}» с текущими фильтрами.")
         return
+
+    # Фильтр по марке (блок 2 шифра) — в Python после SQL
+    marka_t = (sel_marka or "").strip()
+    if marka_t:
+        df = _filter_by_marka(df, marka_t)
+        if df.empty:
+            st.warning(
+                f"По марке «{marka_t}» ничего не найдено. "
+                f"Марка сравнивается точно по 2-му блоку шифра "
+                f"(например, КЖ1). Лимит применён до фильтра."
+            )
+            return
 
     # --- KPI ---
     _render_kpi(df)

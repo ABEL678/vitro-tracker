@@ -26,6 +26,7 @@ from vitro.sqlite_db import (
     update_category_force,
 )
 from vitro.disciplines import discipline_name
+from vitro.ui._filters import _filter_by_marka
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +539,7 @@ def _render_editor():
     disc_options = _load_discipline_options()
 
     with st.expander("🎛 Фильтры", expanded=False):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
 
         with c1:
             sel_disc_labels = st.multiselect(
@@ -587,6 +588,16 @@ def _render_editor():
             sel_kit = [code for code, label in kit_options.items()
                        if label in sel_kit_labels]
 
+        with c4:
+            sel_marka = st.text_input(
+                "Марка комплекта",
+                placeholder="например: КЖ1",
+                key="editor_marka",
+                help="Точное совпадение 2-го блока шифра (марки). "
+                     "КЖ1 не найдёт КЖ11 или КЖ10. "
+                     "Применяется после лимита строк.",
+            )
+
         if show_waiting:
             status_options = [
                 "Новое", "Принято в работу", "Не принято",
@@ -598,8 +609,8 @@ def _render_editor():
                 "Не принято", "К обсуждению",
             ]
 
-        c4, c5 = st.columns(2)
-        with c4:
+        c5, c6 = st.columns(2)
+        with c5:
             sel_status = st.multiselect(
                 "Статус замечания",
                 options=status_options,
@@ -608,7 +619,7 @@ def _render_editor():
                 key="editor_status",
             )
 
-        with c5:
+        with c6:
             limit = st.number_input(
                 "Лимит строк",
                 min_value=50, max_value=2000,
@@ -628,6 +639,18 @@ def _render_editor():
     if df.empty:
         st.info("Нет замечаний по заданным фильтрам.")
         return
+
+    # Фильтр по марке (блок 2 шифра) — в Python после SQL
+    marka_t = (sel_marka or "").strip()
+    if marka_t:
+        df = _filter_by_marka(df, marka_t)
+        if df.empty:
+            st.warning(
+                f"По марке «{marka_t}» замечаний не найдено. "
+                f"Марка сравнивается точно по 2-му блоку шифра "
+                f"(например, КЖ1). Лимит строк применён до фильтра."
+            )
+            return
 
     st.caption(
         f"Загружено **{len(df)}** строк. "
