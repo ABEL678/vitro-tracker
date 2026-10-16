@@ -18,34 +18,11 @@ import streamlit as st
 from vitro.sqlite_db import get_conn, update_category_safe
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
+    REMARK_STATUS_OPTIONS,
     SHEET_GROUP_OPTIONS,
     _doc_status_group,
 )
-
-
-# ---------------------------------------------------------------------------
-#  Ссылки на замечания в Витро
-# ---------------------------------------------------------------------------
-VITRO_BASE_URL = "https://pdm-lakhta.ru/okhta"
-
-
-def build_vitro_comment_url(vitro_guid, vitro_version, note_id) -> str:
-    """
-    Собирает прямую ссылку на замечание в Витро.
-    Формат: https://pdm-lakhta.ru/okhta/_layouts/15/Vitro/Viewer/PDF/web/Viewer.aspx
-            ?Id={vitro_guid}&version={vitro_version}&noteId={note_id}
-    Для закрытых/аннулированных замечаний открывает лист без подсветки — это нормально.
-    """
-    if not vitro_guid or not note_id:
-        return ""
-    try:
-        ver = int(vitro_version) if vitro_version else 1
-    except (ValueError, TypeError):
-        ver = 1
-    return (
-        f"{VITRO_BASE_URL}/_layouts/15/Vitro/Viewer/PDF/web/Viewer.aspx"
-        f"?Id={vitro_guid}&version={ver}&noteId={note_id}"
-    )
+from vitro.ui._urls import build_vitro_comment_url
 
 
 # ---- Категории замечаний ----
@@ -174,7 +151,8 @@ def _filter_by_hierarchy(df: pd.DataFrame,
                           disciplines: tuple = (),
                           sections: tuple = (),
                           kits: tuple = (),
-                          sheet_groups: tuple = ()) -> pd.DataFrame:
+                          sheet_groups: tuple = (),
+                          remark_statuses: tuple = ()) -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -188,6 +166,8 @@ def _filter_by_hierarchy(df: pd.DataFrame,
         out = out[
             out["doc_status"].apply(_doc_status_group).isin(sheet_groups)
         ]
+    if remark_statuses:
+        out = out[out["status"].isin(remark_statuses)]
     return out
 
 
@@ -252,10 +232,11 @@ def _render_kpi(df_all: pd.DataFrame, df_ours: pd.DataFrame):
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_authors(disciplines: tuple = (), sections: tuple = (),
                    kits: tuple = (),
-                   sheet_groups: tuple = ()) -> pd.DataFrame:
+                   sheet_groups: tuple = (),
+                   remark_statuses: tuple = ()) -> pd.DataFrame:
     df = _load_all_categorized()
     df = _filter_by_hierarchy(df, disciplines, sections, kits,
-                               sheet_groups)
+                               sheet_groups, remark_statuses)
 
     if df.empty:
         return pd.DataFrame()
@@ -365,7 +346,8 @@ def _render_authors_table(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_author_by_discipline(author: str,
-                                sheet_groups: tuple = ()) -> pd.DataFrame:
+                                sheet_groups: tuple = (),
+                                remark_statuses: tuple = ()) -> pd.DataFrame:
     df = _load_all_categorized()
     ours = df[df["holder"] == "ours"]
     if ours.empty:
@@ -375,6 +357,8 @@ def _load_author_by_discipline(author: str,
         ours = ours[
             ours["doc_status"].apply(_doc_status_group).isin(sheet_groups)
         ]
+    if remark_statuses:
+        ours = ours[ours["status"].isin(remark_statuses)]
 
     sub = ours[ours["author"] == author].copy()
     if sub.empty:
@@ -403,7 +387,8 @@ def _load_author_by_discipline(author: str,
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_author_comments(author: str,
-                          sheet_groups: tuple = ()) -> pd.DataFrame:
+                          sheet_groups: tuple = (),
+                          remark_statuses: tuple = ()) -> pd.DataFrame:
     df = _load_all_categorized()
     ours = df[df["holder"] == "ours"]
     if ours.empty:
@@ -413,6 +398,8 @@ def _load_author_comments(author: str,
         ours = ours[
             ours["doc_status"].apply(_doc_status_group).isin(sheet_groups)
         ]
+    if remark_statuses:
+        ours = ours[ours["status"].isin(remark_statuses)]
 
     sub = ours[ours["author"] == author].copy()
     if sub.empty:
@@ -450,7 +437,8 @@ def _load_author_comments(author: str,
 
 
 def _render_drilldown(df: pd.DataFrame,
-                       sheet_groups: tuple = ()):
+                       sheet_groups: tuple = (),
+                       remark_statuses: tuple = ()):
     st.markdown("### 🔍 Детали автора")
     if df.empty:
         st.info("Нет данных.")
@@ -513,7 +501,8 @@ def _render_drilldown(df: pd.DataFrame,
             st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        by_disc = _load_author_by_discipline(sel, sheet_groups)
+        by_disc = _load_author_by_discipline(sel, sheet_groups,
+                                              remark_statuses)
         if not by_disc.empty:
             by_disc["label"] = by_disc["discipline"].apply(
                 lambda c: f"{c} — {discipline_name(c)}")
@@ -530,7 +519,8 @@ def _render_drilldown(df: pd.DataFrame,
     st.divider()
 
     st.markdown(f"**Все замечания автора `{sel}`**")
-    details = _load_author_comments(sel, sheet_groups)
+    details = _load_author_comments(sel, sheet_groups,
+                                     remark_statuses)
     if details.empty:
         st.info("У автора нет замечаний.")
         return
@@ -1053,10 +1043,18 @@ def _render_analytics_tab():
         sel_kit = [c for c, l in kit_options.items()
                     if l in sel_kit_labels]
 
-    # Второй ряд: Статус листа
+    # Второй ряд: Статус замечания + Статус листа
     st.write("")
-    c4, _ = st.columns([1, 2])
+    c4, c5 = st.columns(2)
     with c4:
+        sel_remark_statuses = st.multiselect(
+            "Статус замечания",
+            options=REMARK_STATUS_OPTIONS,
+            placeholder="Все статусы",
+            key="authors_remark_status",
+            help="Выполнено, Закрыто, Аннулировано не участвуют в аналитике авторов.",
+        )
+    with c5:
         sel_sheet_groups = st.multiselect(
             "Статус листа",
             options=SHEET_GROUP_OPTIONS,
@@ -1068,15 +1066,17 @@ def _render_analytics_tab():
     sect_t = tuple(sel_section) if sel_section else ()
     kit_t = tuple(sel_kit) if sel_kit else ()
     sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
+    remark_statuses_t = tuple(sel_remark_statuses) if sel_remark_statuses else ()
 
     df_all = _load_all_categorized()
     df_all = _filter_by_hierarchy(df_all, disc_t, sect_t, kit_t,
-                                   sheet_groups_t)
+                                   sheet_groups_t, remark_statuses_t)
     df_ours = df_all[df_all["holder"] == "ours"]
 
     _render_kpi(df_all, df_ours)
 
-    df = _load_authors(disc_t, sect_t, kit_t, sheet_groups_t)
+    df = _load_authors(disc_t, sect_t, kit_t, sheet_groups_t,
+                        remark_statuses_t)
     if df.empty:
         st.info("Нет данных по авторам с учётом фильтров.")
         return
@@ -1084,7 +1084,7 @@ def _render_analytics_tab():
     st.divider()
     _render_authors_table(df)
     st.divider()
-    _render_drilldown(df, sheet_groups_t)
+    _render_drilldown(df, sheet_groups_t, remark_statuses_t)
 
 
 def render():

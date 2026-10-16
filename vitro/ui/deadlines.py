@@ -23,6 +23,7 @@ from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.workdays import add_workdays, parse_date, workdays_between
 from vitro.text_utils import clean_leaf_key
+from vitro.ui._urls import build_vitro_comment_url
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +756,18 @@ def render():
     table = filtered_display[[
         "id", "complex", "sheet", "comment", "author",
         "status", "created", "days_overdue_work",
-    ]].copy().rename(columns={
+        "vitro_guid", "vitro_version",
+    ]].copy()
+
+    table["_vitro_url"] = table.apply(
+        lambda r: build_vitro_comment_url(
+            r["vitro_guid"], r["vitro_version"], r["id"]
+        ),
+        axis=1,
+    )
+    table = table.drop(columns=["vitro_guid", "vitro_version"])
+
+    table = table.rename(columns={
         "id": "ID",
         "complex": "Комплект",
         "sheet": "Лист",
@@ -764,6 +776,7 @@ def render():
         "status": "Статус замечания",
         "created": "Создано",
         "days_overdue_work": "Просрочено (р.д.)",
+        "_vitro_url": "Витро",
     })
 
     st.caption(
@@ -784,6 +797,12 @@ def render():
             "Создано": st.column_config.TextColumn(width="small"),
             "Просрочено (р.д.)": st.column_config.NumberColumn(
                 width="small", format="%d"),
+            "Витро": st.column_config.LinkColumn(
+                "Витро",
+                display_text="🔗 Открыть",
+                width="small",
+                help="Открыть замечание в Витро (подсветится на листе)",
+            ),
         },
     )
     if len(filtered) > 500:
