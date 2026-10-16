@@ -24,6 +24,7 @@ from vitro.disciplines import discipline_name
 from vitro.workdays import add_workdays, parse_date, workdays_between
 from vitro.text_utils import clean_leaf_key
 from vitro.ui._urls import build_vitro_comment_url
+from vitro.ui._filters import _filter_by_marka
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +513,7 @@ def _pie_with_legend(data: pd.DataFrame,
 def _render_filters():
     disc_options = _load_discipline_options()
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     # 1. Дисциплина
     with c1:
@@ -564,8 +565,18 @@ def _render_filters():
         sel_kit = [c for c, l in kit_options.items()
                     if l in sel_kit_labels]
 
-    # 5. Лист (только из выбранного комплекта)
+    # 5. Марка комплекта (блок 2 шифра)
     with c5:
+        sel_marka = st.text_input(
+            "Марка комплекта",
+            placeholder="например: КЖ1",
+            key="dl_marka",
+            help="Точное совпадение 2-го блока шифра (марки). "
+                 "КЖ1 не найдёт КЖ11 или КЖ10.",
+        )
+
+    # 6. Лист (только из выбранного комплекта)
+    with c6:
         if sel_kit:
             sheet_options = _load_sheet_options(tuple(sel_kit))
             sel_sheet = st.multiselect(
@@ -579,13 +590,15 @@ def _render_filters():
                             disabled=True, key="dl_sheet_empty")
 
     return (tuple(sel_disc), tuple(sel_section),
-            tuple(sel_kit), tuple(sel_sheet), block_codes)
+            tuple(sel_kit), tuple(sel_sheet), block_codes,
+            (sel_marka or "").strip())
 
 
 def _apply_filters(df: pd.DataFrame,
                     disc_t: tuple, sect_t: tuple,
                     kit_t: tuple, sheet_t: tuple,
-                    block_codes: tuple) -> pd.DataFrame:
+                    block_codes: tuple,
+                    marka: str = "") -> pd.DataFrame:
     if df.empty:
         return df
     out = df
@@ -600,6 +613,8 @@ def _apply_filters(df: pd.DataFrame,
     if block_codes:
         blocks = out["complex"].apply(_extract_4th_block)
         out = out[blocks.isin(block_codes)]
+    if marka:
+        out = _filter_by_marka(out, marka)
     return out
 
 
@@ -614,7 +629,7 @@ def render():
         "с фильтрацией и инфографикой."
     )
 
-    disc_t, sect_t, kit_t, sheet_t, block_codes = _render_filters()
+    disc_t, sect_t, kit_t, sheet_t, block_codes, marka_t = _render_filters()
 
     st.divider()
 
@@ -625,7 +640,8 @@ def render():
         st.warning("Нет данных. Запустите синхронизацию.")
         return
 
-    df = _apply_filters(df, disc_t, sect_t, kit_t, sheet_t, block_codes)
+    df = _apply_filters(df, disc_t, sect_t, kit_t, sheet_t, block_codes,
+                         marka_t)
 
     ours = df[df["holder"] == "ours"].copy()
     if ours.empty:
