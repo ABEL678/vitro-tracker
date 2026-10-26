@@ -1079,17 +1079,27 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
         COLOR_TOTAL_ROW = "F0F0F0"         # серый для ИТОГО
         COLOR_BLACK = "000000"             # чёрный текст
 
-        # --- Фиксированная ширина колонок ---
-        ws.column_dimensions["A"].width = 20
-        ws.column_dimensions["B"].width = 50
-        ws.column_dimensions["C"].width = 14
-        ws.column_dimensions["D"].width = 14
-        ws.column_dimensions["E"].width = 14
-        ws.column_dimensions["F"].width = 14
-        ws.column_dimensions["G"].width = 14
-        ws.column_dimensions["H"].width = 14
-        ws.column_dimensions["I"].width = 14
-        ws.column_dimensions["J"].width = 14
+        # --- Ширина колонок по названию заголовка ---
+        column_width_map = {
+            group_label: 20,
+            "Полное наименование": 50,
+            "Открытых замечаний": 14,
+            "Всего у АТП ТЛП": 14,
+            "Всего у Синергии": 18,
+            "Новое": 14,
+            "Не принято": 14,
+            "К обсуждению": 14,
+            "Принято в работу": 14,
+            "Выполнено": 14,
+            "Пояснения": 14,
+        }
+        DEFAULT_COLUMN_WIDTH = 14
+        for c in range(1, ws.max_column + 1):
+            header_val = ws.cell(row=1, column=c).value
+            clean_header = re.sub(r'[\U0001F300-\U0001F9FF]', '', str(header_val or "")).strip()
+            ws.column_dimensions[openpyxl.utils.get_column_letter(c)].width = (
+                column_width_map.get(clean_header, DEFAULT_COLUMN_WIDTH)
+            )
 
         # --- Закрепить заголовок ---
         ws.freeze_panes = "A2"
@@ -1116,6 +1126,7 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
             "К обсуждению": COLOR_HEADER_DISCUSSION,
             "Принято в работу": COLOR_HEADER_IN_WORK,
             "Выполнено": COLOR_HEADER_DONE,
+            "Всего у Синергии": COLOR_HEADER_DONE,
         }
 
         for c in range(1, last_col + 1):
@@ -1210,12 +1221,17 @@ def _render_summary_table(df: pd.DataFrame,
             view["🟡 К обсуждению"].fillna(0)
         ).astype(int)
 
+    # --- Вычисляем "Всего у Синергии" = Выполнено ---
+    if "🟢 Выполнено" in view.columns:
+        view["Всего у Синергии"] = view["🟢 Выполнено"].fillna(0).astype(int)
+
     # Оставляем только колонок нового формата
     cols_order = [
         group_label,
         "Полное наименование",
         "Открытых замечаний",
         "Всего у АТП ТЛП",
+        "Всего у Синергии",
         "🔵 Новое",
         "🔴 Не принято",
         "🟡 К обсуждению",

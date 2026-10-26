@@ -13,10 +13,11 @@
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from vitro.time_utils import msk_now_str
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -162,7 +163,7 @@ def update_category_safe(comment_id: int, category: str, user: str,
     Возвращает (успех, сообщение).
     Записывает действие в users_activity.
     """
-    now = datetime.now().isoformat(timespec="seconds")
+    now = msk_now_str()
     with get_conn() as conn:
         old_row = conn.execute(
             "SELECT category FROM comments WHERE id = ?", (comment_id,)
@@ -203,7 +204,7 @@ def update_category_force(comment_id: int, category: str,
     Принудительно обновляет категорию, игнорируя версию.
     Используется при импорте с флагом «Перезаписать».
     """
-    now = datetime.now().isoformat(timespec="seconds")
+    now = msk_now_str()
     with get_conn() as conn:
         old_row = conn.execute(
             "SELECT category FROM comments WHERE id = ?", (comment_id,)
@@ -467,7 +468,7 @@ def log_event(event: str, message: str = "", rows: int = 0, status: str = "OK") 
         conn.execute("""
             INSERT INTO log (timestamp, event, message, rows, status)
             VALUES (?, ?, ?, ?, ?)
-        """, (datetime.now().isoformat(timespec="seconds"), event, message, rows, status))
+        """, (msk_now_str(), event, message, rows, status))
 
 
 # ---------------------------------------------------------------------------

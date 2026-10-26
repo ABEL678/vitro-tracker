@@ -11,6 +11,10 @@
   📄 К листам A и аннулированным — список замечаний (просмотр).
 """
 
+import io
+from datetime import datetime
+
+import openpyxl
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -59,6 +63,19 @@ _CAT_PREFIX_MAP = {
     CAT_4: f"🔴 {CAT_4}",
 }
 
+# ---- Расположение (4-й блок шифра) ----
+BLOCK_OPTIONS = {
+    "Корпус 1":                    "1",
+    "Корпус 2":                    "2",
+    "Общие":                       "0",
+    "Стилобат":                    "С",
+    "Газовая котельная":           "ГК",
+    "Генплан":                     "ГП",
+    "Автомобильные дороги (УДС)":  "А",
+}
+
+ALL_AUTHORS = "— Все авторы —"
+
 
 def _strip_prefix(display_value: str) -> str:
     if not display_value:
@@ -67,6 +84,23 @@ def _strip_prefix(display_value: str) -> str:
         if display_value.startswith(prefix):
             return display_value[len(prefix):].strip()
     return display_value.strip()
+
+
+def _extract_4th_block(complex_code) -> str:
+    if not complex_code:
+        return ""
+    parts = str(complex_code).split("-")
+    if len(parts) >= 4:
+        return parts[3].strip().upper()
+    return ""
+
+
+def _filter_by_blocks(df: pd.DataFrame,
+                       block_codes: tuple = ()) -> pd.DataFrame:
+    if df.empty or not block_codes:
+        return df
+    blocks = df["complex"].apply(_extract_4th_block)
+    return df[blocks.isin(block_codes)]
 
 
 def _collapse_repeats(df: pd.DataFrame,
@@ -125,7 +159,8 @@ def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _load_kit_options(disciplines: tuple = (),
-                       sections: tuple = ()) -> dict[str, str]:
+                       sections: tuple = (),
+                       block_codes: tuple = ()) -> dict[str, str]:
     with get_conn() as conn:
         where = ["c.code IS NOT NULL"]
         params: list = []
@@ -142,8 +177,15 @@ def _load_kit_options(disciplines: tuple = (),
             SELECT c.code, c.name FROM complexes c
             WHERE {' AND '.join(where)} ORDER BY c.code
         """, tuple(params)).fetchall()
-    return {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
-            for r in rows}
+
+    result = {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
+              for r in rows}
+
+    # Фильтр по расположению (4-й блок) — в Python
+    if block_codes:
+        result = {code: label for code, label in result.items()
+                  if _extract_4th_block(code) in block_codes}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -448,36 +490,112 @@ def _load_author_comments(author: str,
     return view
 
 
-def _render_drilldown(df: pd.DataFrame,
-                       sheet_groups: tuple = (),
-                       remark_statuses: tuple = (),
-                       marka: str = ""):
+_CAT_LABELS = {
+    CAT_1: "Принято",
+    CAT_2: "Формальное",
+    CAT_3: "Доп.треб.",
+    CAT_4: "Не принято",
+    "Без категории": "Без категории",
+}
+
+_COMMENTS_RENAME = {
+    "id": "ID",
+    "discipline": "Дисциплина",
+    "complex": "Комплект",
+    "sheet": "Лист",
+    "comment": "Замечание",
+    "status": "Статус замечания",
+    "doc_status": "Статус листа",
+    "created": "Создано",
+    "category": "Категория",
+    "_vitro_url": "Витро",
+}
+
+
+def _build_cat_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Данные для бублика категорий по переданному срезу."""
+    cats = (df["category"].fillna("Без категории")
+            .replace("", "Без категории"))
+    counts = cats.value_counts()
+    return pd.DataFrame([
+        {"Категория": label, "Количество": int(counts.get(cat, 0))}
+        for cat, label in _CAT_LABELS.items()
+    ])
+
+
+def _build_comments_view(df: pd.DataFrame) -> pd.DataFrame:
+    """Таблица замечаний для drilldown — по текущим фильтрам."""
+    cols = ["id", "discipline", "complex", "sheet", "comment",
+            "status", "doc_status", "created", "category",
+            "vitro_guid", "vitro_version"]
+    cols = [c for c in cols if c in df.columns]
+    view = df[cols].copy()
+
+    view["_vitro_url"] = view.apply(
+        lambda r: build_vitro_comment_url(
+            r["vitro_guid"], r["vitro_version"], r["id"]
+        ),
+        axis=1,
+    )
+
+    view = view.drop(columns=["vitro_guid", "vitro_version"], errors="ignore")
+    return view.rename(columns=_COMMENTS_RENAME)
+
+
+def _render_drilldown(df: pd.DataFrame, df_ours: pd.DataFrame):
     st.markdown("### 🔍 Детали автора")
     if df.empty:
         st.info("Нет данных.")
         return
 
-    authors = sorted(df["author"].dropna().unique())
+    authors = [ALL_AUTHORS] + sorted(
+        a for a in df["author"].dropna().unique() if a
+    )
+
+    # Сброс «залипшего» выбора, если автор пропал после смены фильтров
+    if st.session_state.get("author_drill") not in authors:
+        st.session_state["author_drill"] = ALL_AUTHORS
+
     sel = st.selectbox(
         "Выберите автора", options=authors,
         key="author_drill",
         placeholder="Начните вводить имя...",
     )
-    if not sel:
+
+    if sel == ALL_AUTHORS:
+        sub = df
+        chart_df = df_ours
+        pie_title = "Категории замечаний — все авторы"
+    else:
+        sub = df[df["author"] == sel]
+        chart_df = df_ours[df_ours["author"] == sel]
+        pie_title = "Категории замечаний автора"
+
+    if sub.empty:
+        st.info("Нет данных по выбранному автору.")
         return
 
-    row = df[df["author"] == sel].iloc[0]
+    n_total = int(sub["total"].sum())
+    n_overdue = int(sub["customer_overdue"].sum())
+    cnt_1 = int(sub["cat_1"].sum())
+    cnt_2 = int(sub["cat_2"].sum())
+    cnt_3 = int(sub["cat_3"].sum())
+    cnt_4 = int(sub["cat_4"].sum())
+    cnt_none = int(sub["cat_none"].sum())
+    categorized = cnt_1 + cnt_2 + cnt_3 + cnt_4
+    pct_accepted = (round(cnt_1 / categorized * 100, 1)
+                    if categorized > 0 else 0.0)
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Всего выдал", int(row["total"]),
-              help="Замечания автора, ожидающие ответа АТП ТЛП.")
-    c2.metric("Просрочено им", int(row["customer_overdue"]),
+    c1.metric("Всего выдал", n_total,
+              help="Замечания, ожидающие ответа АТП ТЛП.")
+    c2.metric("Просрочено им", n_overdue,
               help="Заказчик не рассмотрел наш ответ > 10 р.д.")
-    c3.metric("Принято", int(row["cat_1"]),
+    c3.metric("Принято", cnt_1,
               help="Оценка АТП ТЛП: замечание принято как корректное.")
-    c4.metric("Не принято", int(row["cat_4"]),
+    c4.metric("Не принято", cnt_4,
               help="Оценка АТП ТЛП: замечание не принимаем.")
-    c5.metric("% принятых", f"{row['pct_accepted']}%",
+    c5.metric("% принятых", f"{pct_accepted}%",
               help="Принято / (Принято + Формальное + Доп.треб. + "
                    "Не принято). «Без категории» не учитывается.")
 
@@ -486,21 +604,16 @@ def _render_drilldown(df: pd.DataFrame,
     col1, col2 = st.columns(2)
 
     with col1:
-        cat_data = pd.DataFrame([
-            {"Категория": "Принято", "Количество": int(row["cat_1"])},
-            {"Категория": "Формальное", "Количество": int(row["cat_2"])},
-            {"Категория": "Доп.треб.", "Количество": int(row["cat_3"])},
-            {"Категория": "Не принято", "Количество": int(row["cat_4"])},
-            {"Категория": "Без категории",
-             "Количество": int(row["cat_none"])},
-        ])
+        cat_data = _build_cat_data(chart_df)
         cat_data = cat_data[cat_data["Количество"] > 0]
-        if not cat_data.empty:
+        if cat_data.empty:
+            st.caption("Нет данных по категориям.")
+        else:
             fig = px.pie(
                 cat_data, names="Категория", values="Количество",
                 hole=0.45, color="Категория",
                 color_discrete_map=CAT_COLORS,
-                title="Категории замечаний автора",
+                title=pie_title,
             )
             fig.update_traces(
                 textposition="inside", textinfo="percent",
@@ -511,12 +624,17 @@ def _render_drilldown(df: pd.DataFrame,
                 margin=dict(l=10, r=10, t=40, b=10),
                 height=320,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True,
+                            key="authors_drill_cat_pie")
 
     with col2:
-        by_disc = _load_author_by_discipline(sel, sheet_groups,
-                                              remark_statuses, marka)
-        if not by_disc.empty:
+        by_disc = (
+            chart_df.groupby("discipline").size()
+            .reset_index(name="n")
+        )
+        if by_disc.empty:
+            st.caption("Нет данных по дисциплинам.")
+        else:
             by_disc["label"] = by_disc["discipline"].apply(
                 lambda c: f"{c} — {discipline_name(c)}")
             fig = px.bar(
@@ -527,13 +645,31 @@ def _render_drilldown(df: pd.DataFrame,
             )
             fig.update_traces(textposition="outside")
             fig.update_layout(height=max(300, 25 * len(by_disc)))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True,
+                            key="authors_drill_disc_bar")
 
     st.divider()
 
-    st.markdown(f"**Все замечания автора `{sel}`**")
-    details = _load_author_comments(sel, sheet_groups,
-                                     remark_statuses, marka)
+    if sel == ALL_AUTHORS:
+        st.markdown("**Все замечания — все авторы**")
+    else:
+        st.markdown(f"**Все замечания автора `{sel}`**")
+
+    if chart_df.empty:
+        st.info("Нет замечаний по текущим фильтрам.")
+        return
+
+    # Ограничиваем вывод, чтобы браузер не зависал
+    MAX_ROWS = 500
+    n_details = len(chart_df)
+    details = _build_comments_view(chart_df.head(MAX_ROWS))
+
+    if n_details > MAX_ROWS:
+        n_details_fmt = f"{n_details:,}".replace(",", " ")
+        st.caption(
+            f"Показано **{MAX_ROWS}** из **{n_details_fmt}** замечаний."
+        )
+
     if details.empty:
         st.info("У автора нет замечаний.")
         return
@@ -816,7 +952,8 @@ def _render_waiting_review():
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_customer_a_annulled(disciplines=None, kits=None,
-                                sections=None) -> pd.DataFrame:
+                                sections=None,
+                                block_codes=None) -> pd.DataFrame:
     """
     Замечания к листам A и к аннулированным листам.
     holder IN ('customer_a', 'annulled').
@@ -835,8 +972,126 @@ def _load_customer_a_annulled(disciplines=None, kits=None,
         df = df[df["section"].isin(sections)]
     if kits:
         df = df[df["complex"].isin(kits)]
+    if block_codes:
+        df = _filter_by_blocks(df, tuple(block_codes))
 
     return df
+
+
+_CA_COLUMNS = {
+    "_group": "Группа",
+    "id": "ID",
+    "complex": "Комплект",
+    "sheet": "Лист",
+    "comment": "Замечание",
+    "status": "Статус замечания",
+    "doc_status": "Статус листа",
+    "author": "Автор",
+    "created": "Создано",
+    "fix_date": "Наш ответ",
+}
+
+
+def _build_ca_view(df: pd.DataFrame,
+                    collapse: bool = True,
+                    limit: int | None = 500) -> pd.DataFrame:
+    """Собирает таблицу «К листам A и аннулированным».
+
+    collapse=True — скрывает повторы Комплект+Лист (для показа).
+    limit — обрезка строк (None — без обрезки, для выгрузки).
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    view = df
+
+    sort_cols = [c for c in ("_group", "complex", "sheet") if c in view.columns]
+    if sort_cols:
+        view = view.sort_values(sort_cols, ascending=[True] * len(sort_cols))
+
+    if collapse:
+        view = _collapse_repeats(view, ["complex", "sheet"])
+    if limit:
+        view = view.head(limit)
+
+    cols = [c for c in _CA_COLUMNS if c in view.columns]
+    return view[cols].copy().rename(columns=_CA_COLUMNS)
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=4)
+def _export_rows_to_excel(df: pd.DataFrame) -> bytes:
+    """Формирует XLSX из готовой таблицы: заголовки, границы, автофильтр."""
+    import numbers
+
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    def _cell_value(v):
+        if v is None or pd.isna(v):
+            return ""
+        if isinstance(v, numbers.Number) and not isinstance(v, complex):
+            return v
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    buf = io.BytesIO()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Замечания"
+
+    headers = [str(c) for c in df.columns]
+    ws.append(headers)
+
+    for row in df.itertuples(index=False, name=None):
+        ws.append([_cell_value(v) for v in row])
+
+    width_map = {
+        "Группа": 32,
+        "ID": 10,
+        "Комплект": 24,
+        "Лист": 22,
+        "Замечание": 70,
+        "Статус замечания": 18,
+        "Статус листа": 14,
+        "Автор": 26,
+        "Создано": 18,
+        "Наш ответ": 14,
+    }
+    for c, name in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(c)].width = width_map.get(name, 16)
+
+    header_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0",
+                              fill_type="solid")
+    thin = Side(style="thin", color="B0B0B0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for c in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center",
+                                   wrapText=True)
+        cell.border = border
+
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, len(headers) + 1):
+            ws.cell(row=r, column=c).border = border
+
+    if "Замечание" in headers:
+        col_idx = headers.index("Замечание") + 1
+        for r in range(2, ws.max_row + 1):
+            ws.cell(row=r, column=col_idx).alignment = Alignment(
+                wrapText=True, vertical="top")
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = (
+        f"A1:{get_column_letter(len(headers))}{ws.max_row}"
+    )
+
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def _render_customer_a_annulled():
@@ -849,7 +1104,7 @@ def _render_customer_a_annulled():
 
     disc_options = _load_discipline_options()
     with st.expander("🎛 Фильтры", expanded=False):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             sel_disc_labels = st.multiselect(
                 "Дисциплина", options=list(disc_options.values()),
@@ -872,10 +1127,17 @@ def _render_customer_a_annulled():
                 st.multiselect("Раздел", options=[],
                                 placeholder="Не применимы",
                                 disabled=True, key="ca_section_empty")
+        with c3:
+            sel_blocks = st.multiselect(
+                "Расположение", options=list(BLOCK_OPTIONS.keys()),
+                placeholder="Все", key="ca_blocks",
+            )
+            block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
         kit_options = _load_kit_options(
             tuple(sel_disc) if sel_disc else (),
-            tuple(sel_section) if sel_section else ())
-        with c3:
+            tuple(sel_section) if sel_section else (),
+            block_codes)
+        with c4:
             sel_kit_labels = st.multiselect(
                 "Комплект", options=list(kit_options.values()),
                 placeholder="Все комплекты", key="ca_kit",
@@ -887,6 +1149,7 @@ def _render_customer_a_annulled():
         disciplines=tuple(sel_disc) if sel_disc else None,
         kits=tuple(sel_kit) if sel_kit else None,
         sections=tuple(sel_section) if sel_section else None,
+        block_codes=block_codes if block_codes else None,
     )
 
     if df.empty:
@@ -960,39 +1223,27 @@ def _render_customer_a_annulled():
         st.warning("По фильтрам нет замечаний.")
         return
 
-    # Сортировка: Группа → Комплект → Лист
-    filtered = filtered.sort_values(
-        ["_group", "complex", "sheet"],
-        ascending=[True, True, True],
-    )
-
-    # Свёртка повторяющихся (Комплект + Лист)
-    filtered_display = _collapse_repeats(
-        filtered, ["complex", "sheet"]
-    )
-
-    # Показываем только 500 строк
-    filtered_display = filtered_display.head(500)
-
-    table = filtered_display[[
-        "_group", "id", "complex", "sheet", "comment",
-        "status", "doc_status", "author", "created", "fix_date",
-    ]].copy().rename(columns={
-        "_group": "Группа",
-        "id": "ID",
-        "complex": "Комплект",
-        "sheet": "Лист",
-        "comment": "Замечание",
-        "status": "Статус замечания",
-        "doc_status": "Статус листа",
-        "author": "Автор",
-        "created": "Создано",
-        "fix_date": "Наш ответ",
-    })
+    # Таблица для показа: свёртка повторов + обрезка до 500 строк
+    table = _build_ca_view(filtered)
 
     st.caption(
-        f"Показано: **{len(filtered_display):,}** из **{len(filtered):,}**."
+        f"Показано: **{len(table):,}** из **{len(filtered):,}**."
         .replace(",", " ")
+    )
+
+    # Выгрузка: полный отфильтрованный список, без свёртки и обрезки
+    st.download_button(
+        "📥 Выгрузить в Excel",
+        data=_export_rows_to_excel(
+            _build_ca_view(filtered, collapse=False, limit=None)
+        ),
+        file_name=(
+            f"Листы_A_и_аннулированные_{datetime.now():%Y%m%d_%H%M}.xlsx"
+        ),
+        mime="application/vnd.openxmlformats-officedocument."
+             "spreadsheetml.sheet",
+        use_container_width=True,
+        key="ca_export",
     )
 
     st.dataframe(
@@ -1011,9 +1262,6 @@ def _render_customer_a_annulled():
             "Наш ответ": st.column_config.TextColumn(width="small"),
         },
     )
-    if len(filtered) > 500:
-        st.caption(f"Показаны первые 500 из {len(filtered):,}."
-                   .replace(",", " "))
 
 
 # ---------------------------------------------------------------------------
@@ -1111,7 +1359,7 @@ def _render_analytics_tab():
     st.divider()
     _render_authors_table(df)
     st.divider()
-    _render_drilldown(df, sheet_groups_t, remark_statuses_t, marka_t)
+    _render_drilldown(df, df_ours)
 
 
 def render():
