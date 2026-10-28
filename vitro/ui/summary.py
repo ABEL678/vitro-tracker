@@ -916,6 +916,8 @@ def _build_summary_rows(group_col: str,
 
             ours = sub[sub["holder"] == "ours"]
             customer = sub[sub["holder"] == "customer"]
+            customer_a = sub[sub["holder"] == "customer_a"]
+            annulled = sub[sub["holder"] == "annulled"]
 
             # Метрики по ours — используем our_status и our_bucket
             if not ours.empty:
@@ -942,6 +944,8 @@ def _build_summary_rows(group_col: str,
 
             # Метрики по customer
             n_customer = len(customer) if not customer.empty else 0
+            n_customer_a = len(customer_a) if not customer_a.empty else 0
+            n_annulled = len(annulled) if not annulled.empty else 0
 
             # active_total = сумма всех открытых
             active_total = (n_new + n_in_work + n_rejected +
@@ -955,6 +959,8 @@ def _build_summary_rows(group_col: str,
                 "n_rejected": n_rejected,
                 "n_discussion": n_discussion,
                 "n_customer": n_customer,
+                "n_customer_a": n_customer_a,
+                "n_annulled": n_annulled,
                 "n_in_time": n_in_time,
                 "n_overdue": n_overdue,
                 "cat_1": int(cat_counts.get(CAT_1, 0)),
@@ -1085,7 +1091,7 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
             "Полное наименование": 50,
             "Открытых замечаний": 14,
             "Всего у АТП ТЛП": 14,
-            "Всего у Синергии": 18,
+            "Всего у Заказчика": 18,
             "Новое": 14,
             "Не принято": 14,
             "К обсуждению": 14,
@@ -1126,7 +1132,7 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
             "К обсуждению": COLOR_HEADER_DISCUSSION,
             "Принято в работу": COLOR_HEADER_IN_WORK,
             "Выполнено": COLOR_HEADER_DONE,
-            "Всего у Синергии": COLOR_HEADER_DONE,
+            "Всего у Заказчика": COLOR_HEADER_DONE,
         }
 
         for c in range(1, last_col + 1):
@@ -1195,7 +1201,7 @@ def _render_summary_table(df: pd.DataFrame,
 
     # --- Приводим числовые колонки к int ---
     for c in ["active_total", "n_new", "n_in_work", "n_rejected",
-              "n_discussion", "n_customer"]:
+              "n_discussion", "n_customer", "n_customer_a", "n_annulled"]:
         if c in view.columns:
             view[c] = view[c].fillna(0).astype(int)
 
@@ -1221,9 +1227,15 @@ def _render_summary_table(df: pd.DataFrame,
             view["🟡 К обсуждению"].fillna(0)
         ).astype(int)
 
-    # --- Вычисляем "Всего у Синергии" = Выполнено ---
+    # --- Вычисляем "Всего у Заказчика" =
+    #     Выполнено + К листам A + К аннулированным ---
     if "🟢 Выполнено" in view.columns:
-        view["Всего у Синергии"] = view["🟢 Выполнено"].fillna(0).astype(int)
+        _zero = pd.Series(0, index=view.index, dtype=int)
+        view["Всего у Заказчика"] = (
+            view["🟢 Выполнено"].fillna(0).astype(int)
+            + view.get("n_customer_a", _zero).fillna(0).astype(int)
+            + view.get("n_annulled", _zero).fillna(0).astype(int)
+        ).astype(int)
 
     # Оставляем только колонок нового формата
     cols_order = [
@@ -1231,7 +1243,7 @@ def _render_summary_table(df: pd.DataFrame,
         "Полное наименование",
         "Открытых замечаний",
         "Всего у АТП ТЛП",
-        "Всего у Синергии",
+        "Всего у Заказчика",
         "🔵 Новое",
         "🔴 Не принято",
         "🟡 К обсуждению",
