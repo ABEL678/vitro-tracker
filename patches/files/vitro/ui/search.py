@@ -1,0 +1,380 @@
+# vitro/ui/search.py
+"""
+🔍 Поиск — поиск по тексту замечаний с фильтрами и экспортом.
+
+Возможности:
+  - Полнотекстовый поиск (LIKE %text%).
+  - Каскадные фильтры: дисциплина → раздел → комплект.
+  - Дополнительные фильтры: статус, автор, категория.
+  - KPI по результатам: количество, распределение.
+  - Экспорт результатов в Excel.
+"""
+
+import io
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+
+from vitro.sqlite_db import get_conn
+from vitro.ui._filters import (
+    _filter_by_blocks,
+    _filter_by_marka,
+    _sheet_groups_to_sql,
+    render_standard_filters,
+)
+from vitro.ui._urls import build_vitro_comment_url
+
+
+# ---------------------------------------------------------------------------
+#  Константы
+# ---------------------------------------------------------------------------
+CAT_1 = "Принято/корректное"
+CAT_2 = "Формальное/нет влияния на СМР"
+CAT_3 = "Доп.требование/отсутствует в ТЗ"
+CAT_4 = "Не принято/нарушение ТНПА"
+
+CATEGORIES = [CAT_1, CAT_2, CAT_3, CAT_4]
+
+STATUSES = [
+    "Новое", "Принято в работу", "Не принято",
+    "К обсуждению", "Выполнено", "Закрыто", "Аннулировано",
+]
+
+
+# ---------------------------------------------------------------------------
+#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты),
+#  авторы — локальный справочник поиска
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_author_options() -> list[str]:
+    with get_conn() as conn:
+        return [r["author"] for r in conn.execute("""
+            SELECT DISTINCT author FROM comments
+            WHERE author IS NOT NULL AND author <> ''
+            ORDER BY author
+        """)]
+
+
+# ---------------------------------------------------------------------------
+#  Основной поиск
+# ---------------------------------------------------------------------------
+def _search_comments(query: str,
+                     disciplines=(), sections=(), kits=(),
+                     statuses=(), authors=(), categories=(),
+                     complex_mask: str = "",
+                     sheet_groups=(),
+                     limit: int = 2000) -> pd.DataFrame:
+    """
+    Поиск замечаний по подстроке с фильтрами.
+    Возвращает DataFrame с полной информацией.
+    """
+    q = """
+        SELECT
+            c.id AS "ID",
+            d.discipline AS discipline,
+            d.section AS section,
+            d.complex AS "Комплект",
+            REPLACE(REPLACE(d.leaf, '.pdf', ''), '.PDF', '') AS "Лист",
+            d.name AS "Название листа",
+            c.comment AS "Замечание",
+            c.status AS "Статус",
+            c.author AS "Автор",
+            strftime('%d.%m.%Y %H:%M:%S', c.created) AS "Создано",
+            c.category AS "Категория",
+            d.vitro_guid AS vitro_guid,
+            d.vitro_version AS vitro_version
+        FROM comments c
+        JOIN documents d ON c.doc_id = d.id
+        WHERE 1=1
+    """
+    params: list = []
+
+    if query and query.strip():
+        q += " AND LOWER(c.comment) LIKE LOWER(?)"
+        params.append(f"%{query.strip()}%")
+
+    if disciplines:
+        q += f" AND d.discipline IN ({','.join('?' * len(disciplines))})"
+        params += list(disciplines)
+    if sections:
+        q += f" AND d.section IN ({','.join('?' * len(sections))})"
+        params += list(sections)
+    if kits:
+        q += f" AND d.complex IN ({','.join('?' * len(kits))})"
+        params += list(kits)
+
+    # Фильтр по маске комплекта (LIKE)
+    if complex_mask and complex_mask.strip():
+        q += " AND LOWER(d.complex) LIKE LOWER(?)"
+        params.append(f"%{complex_mask.strip()}%")
+    if statuses:
+        q += f" AND c.status IN ({','.join('?' * len(statuses))})"
+        params += list(statuses)
+    if authors:
+        q += f" AND c.author IN ({','.join('?' * len(authors))})"
+        params += list(authors)
+    if categories:
+        q += f" AND c.category IN ({','.join('?' * len(categories))})"
+        params += list(categories)
+    if sheet_groups:
+        cond, extra_params = _sheet_groups_to_sql(sheet_groups, "d")
+        if cond:
+            q += cond
+            params += extra_params
+
+    q += " ORDER BY c.created DESC LIMIT ?"
+    params.append(limit)
+
+    with get_conn() as conn:
+        return pd.read_sql(q, conn, params=params)
+
+
+# ---------------------------------------------------------------------------
+#  KPI по результатам
+# ---------------------------------------------------------------------------
+def _render_kpi(df: pd.DataFrame):
+    total = len(df)
+    if total == 0:
+        return
+
+    st.markdown(f"##### 🎯 Найдено замечаний: **{total:,}**".replace(",", " "))
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    def count_by(col, val):
+        return int((df[col] == val).sum())
+
+    c1.metric("Принято/корректное",       count_by("Категория", CAT_1))
+    c2.metric("Формальное",               count_by("Категория", CAT_2))
+    c3.metric("Доп.треб.",                count_by("Категория", CAT_3))
+    c4.metric("Не принято/нарушение",     count_by("Категория", CAT_4))
+    c5.metric("Без категории",
+              int(df["Категория"].isna().sum()
+                  + (df["Категория"] == "").sum()))
+
+
+# ---------------------------------------------------------------------------
+#  Экспорт в Excel
+# ---------------------------------------------------------------------------
+def _export_to_excel(df: pd.DataFrame, query: str) -> bytes:
+    """Формирует XLSX в память и возвращает байты."""
+    buf = io.BytesIO()
+
+    drop_cols = ["discipline", "section", "vitro_guid", "vitro_version"]
+    export_df = df.drop(columns=drop_cols, errors="ignore").copy()
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False, sheet_name="Результаты поиска")
+
+        # Автоширина
+        ws = writer.sheets["Результаты поиска"]
+        for col_idx, col_name in enumerate(export_df.columns, start=1):
+            max_len = max(
+                len(str(col_name)),
+                export_df[col_name].astype(str).str.len().max() if len(export_df) else 0,
+            )
+            ws.column_dimensions[chr(64 + col_idx)].width = min(max_len + 2, 80)
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+#  Рендер
+# ---------------------------------------------------------------------------
+def render():
+    st.header("🔍 Поиск по замечаниям")
+    st.caption(
+        "Полнотекстовый поиск по тексту замечаний с фильтрами и экспортом. "
+        "Начните вводить запрос — результаты появятся ниже."
+    )
+
+    # --- Строка поиска ---
+    query = st.text_input(
+        "Поисковый запрос",
+        placeholder="например: фундаментная плита / арматура / высотная отметка",
+        key="search_query",
+    )
+
+    # --- Каскадные фильтры (единый стандарт) ---
+    author_options = _load_author_options()
+
+    def _search_extra_row():
+        c_a1, c_a2, c_a3 = st.columns(3)
+        with c_a1:
+            complex_mask = st.text_input(
+                "Маска комплекта (поиск по подстроке)",
+                placeholder="например: -С- для стилобата, КЖ для конструкций",
+                key="search_complex_mask",
+                help="Показывает только комплекты, в шифре которых есть эта "
+                     "подстрока. Регистронезависимо.",
+            )
+        with c_a2:
+            sel_author = st.multiselect(
+                "Автор", author_options,
+                placeholder="Все авторы", key="search_author")
+        with c_a3:
+            sel_category = st.multiselect(
+                "Категория", CATEGORIES,
+                placeholder="Все категории", key="search_category")
+
+        c_b1, c_b2 = st.columns(2)
+        with c_b1:
+            limit = st.number_input(
+                "Лимит результатов", min_value=100, max_value=10000,
+                value=2000, step=100, key="search_limit",
+                help="Максимум строк, которые будут загружены для отображения",
+            )
+        with c_b2:
+            show_all = st.checkbox(
+                "Показывать всё без запроса", value=False,
+                key="search_show_all",
+                help="Если выключено, результаты появятся только после "
+                     "ввода запроса",
+            )
+        return {
+            "complex_mask": complex_mask or "",
+            "author": tuple(sel_author),
+            "category": tuple(sel_category),
+            "limit": int(limit),
+            "show_all": bool(show_all),
+        }
+
+    # Поиск ищет также по «Закрыто» и «Аннулировано» — поэтому расширенный
+    # список статусов замечаний вместо стандартных пяти.
+    flt = render_standard_filters(
+        key_prefix="search_",
+        expander_label="🎛 Фильтры",
+        remark_status_options=tuple(STATUSES),
+        extra_row=_search_extra_row,
+    )
+
+    sel_disc = flt["disc"]
+    sel_section = flt["section"]
+    sel_kit = flt["kits"]
+    sel_marka = flt["marka"]
+    sel_status = flt["remark_statuses"]
+    sel_sheet_groups = flt["sheet_groups"]
+    complex_mask = flt["extra"].get("complex_mask", "")
+    sel_author = list(flt["extra"].get("author", ()))
+    sel_category = list(flt["extra"].get("category", ()))
+    limit = flt["extra"].get("limit", 2000)
+    show_all = flt["extra"].get("show_all", False)
+
+    # --- Условия запуска поиска ---
+    if not query.strip() and not show_all:
+        st.info("💡 Введите поисковый запрос — например, «фундамент» или «арматура».")
+        return
+
+    # --- Поиск ---
+    with st.spinner("Поиск..."):
+        df = _search_comments(
+            query=query,
+            disciplines=tuple(sel_disc) if sel_disc else (),
+            sections=tuple(sel_section) if sel_section else (),
+            kits=tuple(sel_kit) if sel_kit else (),
+            statuses=tuple(sel_status) if sel_status else (),
+            authors=tuple(sel_author) if sel_author else (),
+            categories=tuple(sel_category) if sel_category else (),
+            complex_mask=complex_mask,
+            sheet_groups=tuple(sel_sheet_groups) if sel_sheet_groups else (),
+            limit=int(limit),
+        )
+
+    # Фильтр по расположению (4-й блок шифра) — в Python после SQL
+    if flt["block_codes"] and not df.empty:
+        df = _filter_by_blocks(df, flt["block_codes"])
+
+    if df.empty:
+        st.warning(f"Ничего не найдено по запросу «{query}» с текущими фильтрами.")
+        return
+
+    # Фильтр по марке (блок 2 шифра) — в Python после SQL
+    marka_t = (sel_marka or "").strip()
+    if marka_t:
+        df = _filter_by_marka(df, marka_t)
+        if df.empty:
+            st.warning(
+                f"По марке «{marka_t}» ничего не найдено. "
+                f"Марка сравнивается точно по 2-му блоку шифра "
+                f"(например, КЖ1). Лимит применён до фильтра."
+            )
+            return
+
+    # --- KPI ---
+    _render_kpi(df)
+
+    st.divider()
+
+    # --- Таблица ---
+    table_df = df.drop(columns=["discipline", "section"], errors="ignore").copy()
+
+    # Собираем прямую ссылку на замечание в Витро
+    if "vitro_guid" in table_df.columns and "vitro_version" in table_df.columns:
+        table_df["_vitro_url"] = table_df.apply(
+            lambda r: build_vitro_comment_url(
+                r["vitro_guid"], r["vitro_version"], r["ID"]
+            ),
+            axis=1,
+        )
+        table_df = table_df.drop(columns=["vitro_guid", "vitro_version"])
+        table_df = table_df.rename(columns={"_vitro_url": "Витро"})
+    else:
+        table_df["Витро"] = ""
+
+    st.dataframe(
+        table_df,
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+        column_config={
+            "Замечание":     st.column_config.TextColumn(width="large"),
+            "Название листа": st.column_config.TextColumn(width="large"),
+            "Создано":       st.column_config.TextColumn(width="medium"),
+            "Витро": st.column_config.LinkColumn(
+                "Витро",
+                display_text="🔗 Открыть",
+                width="small",
+                help="Открыть замечание в Витро (подсветится на листе)",
+            ),
+        },
+    )
+
+    st.caption(
+        f"Показано **{len(table_df):,}** из **{len(df):,}** найденных строк "
+        f"(лимит {int(limit):,}).".replace(",", " ")
+    )
+
+    # --- Экспорт ---
+    st.divider()
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("📥 Подготовить выгрузку", use_container_width=True,
+                     key="search_prepare_export"):
+            xlsx_bytes = _export_to_excel(df, query)
+            st.session_state["search_export_bytes"] = xlsx_bytes
+            st.session_state["search_export_filename"] = (
+                f"Поиск_{datetime.now():%Y%m%d_%H%M}.xlsx"
+            )
+            st.success("Файл готов")
+
+    with c2:
+        if "search_export_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Скачать Excel",
+                data=st.session_state["search_export_bytes"],
+                file_name=st.session_state.get(
+                    "search_export_filename", "search.xlsx"),
+                mime=("application/vnd.openxmlformats-officedocument"
+                      ".spreadsheetml.sheet"),
+                use_container_width=True,
+                key="search_download_export",
+            )
+
+    # --- Подсказка ---
+    st.info(
+        "💡 **Совет.** Чтобы найти замечания с определённым словом "
+        "в конкретном комплекте — задайте фильтр по комплекту и введите "
+        "одно слово. Поиск регистронезависимый."
+    )
