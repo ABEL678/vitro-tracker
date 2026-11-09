@@ -3,7 +3,8 @@
 📈 Динамика — потоки замечаний по месяцам.
 
 Инструмент РП и Директора: сколько выдаётся, отвечаем, закрывается.
-Каскадные фильтры: дисциплина → раздел → расположение → комплект.
+Фильтры — единый стандарт (_filters.render_standard_filters):
+дисциплина → раздел → расположение → комплект → марка.
 Период: пресеты + календарь.
 """
 
@@ -16,100 +17,7 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
-
-
-# ---------------------------------------------------------------------------
-#  Расположение (4-й блок шифра)
-# ---------------------------------------------------------------------------
-BLOCK_OPTIONS = {
-    "Корпус 1":                    "1",
-    "Корпус 2":                    "2",
-    "Общие":                       "0",
-    "Стилобат":                    "С",
-    "Газовая котельная":           "ГК",
-    "Генплан":                     "ГП",
-    "Автомобильные дороги (УДС)":  "А",
-}
-
-
-def _extract_4th_block(complex_code) -> str:
-    if not complex_code:
-        return ""
-    parts = str(complex_code).split("-")
-    if len(parts) >= 4:
-        return parts[3].strip().upper()
-    return ""
-
-
-# ---------------------------------------------------------------------------
-#  Справочники
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_discipline_options() -> dict[str, str]:
-    with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
-            "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        if disciplines:
-            ph = ",".join("?" * len(disciplines))
-            rows = conn.execute(f"""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({ph})
-                ORDER BY section
-            """, tuple(disciplines)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                ORDER BY section
-            """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple = (),
-                       sections: tuple = (),
-                       block_codes: tuple = ()) -> dict[str, str]:
-    """Комплекты с учётом дисциплины, раздела и расположения."""
-    with get_conn() as conn:
-        where = ["c.code IS NOT NULL"]
-        params: list = []
-        if disciplines:
-            where.append(
-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-        if sections:
-            ph = ",".join("?" * len(sections))
-            where.append(f"""c.code IN (
-                SELECT DISTINCT complex FROM documents
-                WHERE section IN ({ph}) AND complex IS NOT NULL)""")
-            params += list(sections)
-        rows = conn.execute(f"""
-            SELECT c.code, c.name FROM complexes c
-            WHERE {' AND '.join(where)}
-            ORDER BY c.code
-        """, tuple(params)).fetchall()
-
-    result = {r["code"]: f"{r['code']} — {r['name']}"
-                       if r["name"] else r["code"]
-            for r in rows}
-
-    # Фильтр по расположению (в Python — 4-й блок)
-    if block_codes:
-        filtered = {}
-        for code, label in result.items():
-            block = _extract_4th_block(code)
-            if block in block_codes:
-                filtered[code] = label
-        return filtered
-    return result
+from vitro.ui._filters import render_standard_filters
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +27,8 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
                        kits: tuple, block_codes: tuple,
                        date_from: date, date_to: date,
                        date_col: str,
-                       alias: str = "d") -> tuple[str, list]:
+                       alias: str = "d",
+                       marka: str = "") -> tuple[str, list]:
     parts = []
     params: list = []
     if disciplines:
@@ -141,6 +50,12 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
             ors.append(f"{alias}.complex LIKE '%-{bc}-%'")
             ors.append(f"{alias}.complex LIKE '%-{bc.lower()}-%'")
         parts.append("(" + " OR ".join(ors) + ")")
+    if marka:
+        # Марка (2-й блок) — строгое совпадение через LIKE:
+        # '%-КЖ1-%' найдёт только КЖ1, не найдёт КЖ11 или КЖ10.
+        m = marka.strip().upper()
+        if m:
+            parts.append(f"{alias}.complex LIKE '%-{m}-%'")
     if date_from:
         parts.append(f"{date_col} >= ?")
         params.append(date_from.isoformat())
@@ -156,10 +71,11 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_issue_stats(disciplines: tuple, sections: tuple,
                        kits: tuple, block_codes: tuple,
-                       date_from: date, date_to: date) -> pd.DataFrame:
+                       date_from: date, date_to: date,
+                       marka: str = "") -> pd.DataFrame:
     where, params = _build_filter_sql(
         disciplines, sections, kits, block_codes,
-        date_from, date_to, "c.created")
+        date_from, date_to, "c.created", marka=marka)
     q = f"""
         SELECT substr(c.created, 1, 7) AS ym, COUNT(*) AS n
         FROM comments c
@@ -175,10 +91,11 @@ def _load_issue_stats(disciplines: tuple, sections: tuple,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_our_answers_stats(disciplines: tuple, sections: tuple,
                               kits: tuple, block_codes: tuple,
-                              date_from: date, date_to: date) -> pd.DataFrame:
+                              date_from: date, date_to: date,
+                              marka: str = "") -> pd.DataFrame:
     where, params = _build_filter_sql(
         disciplines, sections, kits, block_codes,
-        date_from, date_to, "c.fix_date")
+        date_from, date_to, "c.fix_date", marka=marka)
     q = f"""
         SELECT substr(c.fix_date, 1, 7) AS ym, COUNT(*) AS n
         FROM comments c
@@ -195,10 +112,11 @@ def _load_our_answers_stats(disciplines: tuple, sections: tuple,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
                                   kits: tuple, block_codes: tuple,
-                                  date_from: date, date_to: date) -> pd.DataFrame:
+                                  date_from: date, date_to: date,
+                                  marka: str = "") -> pd.DataFrame:
     where, params = _build_filter_sql(
         disciplines, sections, kits, block_codes,
-        date_from, date_to, "c.fix_date")
+        date_from, date_to, "c.fix_date", marka=marka)
     q = f"""
         SELECT substr(c.fix_date, 1, 7) AS ym, COUNT(*) AS n
         FROM comments c
@@ -218,10 +136,11 @@ def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_issue_by_discipline(disciplines: tuple, sections: tuple,
                                 kits: tuple, block_codes: tuple,
-                                date_from: date, date_to: date) -> pd.DataFrame:
+                                date_from: date, date_to: date,
+                                marka: str = "") -> pd.DataFrame:
     where, params = _build_filter_sql(
         disciplines, sections, kits, block_codes,
-        date_from, date_to, "c.created")
+        date_from, date_to, "c.created", marka=marka)
     q = f"""
         SELECT substr(c.created, 1, 7) AS ym,
                d.discipline AS discipline, COUNT(*) AS n
@@ -239,10 +158,11 @@ def _load_issue_by_discipline(disciplines: tuple, sections: tuple,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
                                       kits: tuple, block_codes: tuple,
-                                      date_from: date, date_to: date) -> pd.DataFrame:
+                                      date_from: date, date_to: date,
+                                      marka: str = "") -> pd.DataFrame:
     where, params = _build_filter_sql(
         disciplines, sections, kits, block_codes,
-        date_from, date_to, "c.fix_date")
+        date_from, date_to, "c.fix_date", marka=marka)
     q = f"""
         SELECT substr(c.fix_date, 1, 7) AS ym,
                d.discipline AS discipline, COUNT(*) AS n
@@ -261,10 +181,11 @@ def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_customer_closed_by_discipline(disciplines: tuple, sections: tuple,
                                           kits: tuple, block_codes: tuple,
-                                          date_from: date, date_to: date) -> pd.DataFrame:
+                                          date_from: date, date_to: date,
+                                          marka: str = "") -> pd.DataFrame:
     where, params = _build_filter_sql(
         disciplines, sections, kits, block_codes,
-        date_from, date_to, "c.fix_date")
+        date_from, date_to, "c.fix_date", marka=marka)
     q = f"""
         SELECT substr(c.fix_date, 1, 7) AS ym,
                d.discipline AS discipline, COUNT(*) AS n
@@ -445,7 +366,8 @@ def _render_cumulative(issue: pd.DataFrame,
 # ---------------------------------------------------------------------------
 def _render_by_discipline(disciplines: tuple, sections: tuple,
                             kits: tuple, block_codes: tuple,
-                            date_from: date, date_to: date):
+                            date_from: date, date_to: date,
+                            marka: str = ""):
     st.markdown("### 🏷 По дисциплинам")
 
     tab_issue, tab_our, tab_cust = st.tabs([
@@ -454,7 +376,8 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
 
     with tab_issue:
         df = _load_issue_by_discipline(
-            disciplines, sections, kits, block_codes, date_from, date_to)
+            disciplines, sections, kits, block_codes, date_from, date_to,
+            marka=marka)
         if df.empty:
             st.info("Нет данных.")
         else:
@@ -472,7 +395,8 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
 
     with tab_our:
         df = _load_our_answers_by_discipline(
-            disciplines, sections, kits, block_codes, date_from, date_to)
+            disciplines, sections, kits, block_codes, date_from, date_to,
+            marka=marka)
         if df.empty:
             st.info("Нет данных.")
         else:
@@ -490,7 +414,8 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
 
     with tab_cust:
         df = _load_customer_closed_by_discipline(
-            disciplines, sections, kits, block_codes, date_from, date_to)
+            disciplines, sections, kits, block_codes, date_from, date_to,
+            marka=marka)
         if df.empty:
             st.info("Нет данных.")
         else:
@@ -589,79 +514,33 @@ def render():
         "Инструмент РП и Директора: потоки замечаний по месяцам."
     )
 
-    # ===== Каскадные фильтры (как в Сроках) =====
-    disc_options = _load_discipline_options()
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        sel_disc_labels = st.multiselect(
-            "Дисциплина",
-            options=list(disc_options.values()),
-            placeholder="Все",
-            key="dyn_disc",
-        )
-        sel_disc = [code for code, label in disc_options.items()
-                    if label in sel_disc_labels]
-
-    section_options = _load_section_options(
-        tuple(sel_disc) if sel_disc else ())
-    with c2:
-        if section_options:
-            sel_section_labels = st.multiselect(
-                "Раздел",
-                options=list(section_options.values()),
-                placeholder="Все",
-                key="dyn_section",
-            )
-            sel_section = [code for code, label in section_options.items()
-                            if label in sel_section_labels]
-        else:
-            sel_section = []
-            st.multiselect("Раздел", options=[],
-                            placeholder="—",
-                            disabled=True, key="dyn_section_empty")
-
-    with c3:
-        sel_blocks = st.multiselect(
-            "Расположение",
-            options=list(BLOCK_OPTIONS.keys()),
-            placeholder="Все",
-            key="dyn_blocks",
-        )
-        block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
-
-    kit_options = _load_kit_options(
-        tuple(sel_disc) if sel_disc else (),
-        tuple(sel_section) if sel_section else (),
-        block_codes,
+    # ===== Единый стандарт фильтров (как в Сводке) =====
+    flt = render_standard_filters(
+        key_prefix="dyn_",
+        show_remark_status=False,
+        show_sheet_status=False,
     )
-    with c4:
-        sel_kit_labels = st.multiselect(
-            "Комплект",
-            options=list(kit_options.values()),
-            placeholder="Все",
-            key="dyn_kit",
-        )
-        sel_kit = [code for code, label in kit_options.items()
-                    if label in sel_kit_labels]
+    disc_t = flt["disc"]
+    sect_t = flt["section"]
+    kit_t = flt["kits"]
+    block_codes = flt["block_codes"]
+    marka_t = flt["marka"]
 
     # ===== Период =====
     date_from, date_to = _render_period_filter()
-
-    disc_t = tuple(sel_disc)
-    sect_t = tuple(sel_section)
-    kit_t = tuple(sel_kit)
 
     st.divider()
 
     with st.spinner("Загрузка..."):
         issue = _load_issue_stats(
-            disc_t, sect_t, kit_t, block_codes, date_from, date_to)
+            disc_t, sect_t, kit_t, block_codes, date_from, date_to,
+            marka=marka_t)
         our_answers = _load_our_answers_stats(
-            disc_t, sect_t, kit_t, block_codes, date_from, date_to)
+            disc_t, sect_t, kit_t, block_codes, date_from, date_to,
+            marka=marka_t)
         cust_closed = _load_customer_closed_stats(
-            disc_t, sect_t, kit_t, block_codes, date_from, date_to)
+            disc_t, sect_t, kit_t, block_codes, date_from, date_to,
+            marka=marka_t)
 
     _render_kpi(issue, our_answers, cust_closed)
 
@@ -676,4 +555,5 @@ def render():
     st.divider()
 
     _render_by_discipline(
-        disc_t, sect_t, kit_t, block_codes, date_from, date_to)
+        disc_t, sect_t, kit_t, block_codes, date_from, date_to,
+        marka=marka_t)

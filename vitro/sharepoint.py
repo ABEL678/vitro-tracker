@@ -11,7 +11,10 @@ from vitro.config import (
     VITRO_VERIFY_SSL, HEADERS,
 )
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Гасим предупреждение InsecureRequestWarning ТОЛЬКО когда проверка
+# сертификата осознанно отключена (.env: VITRO_VERIFY_SSL=false).
+if not VITRO_VERIFY_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 #  GUID-ы списков SharePoint

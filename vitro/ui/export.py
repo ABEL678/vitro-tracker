@@ -15,8 +15,8 @@ import pandas as pd
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
-from vitro.disciplines import discipline_name
 from vitro.pdf_builder import build_pdf
+from vitro.ui._filters import render_standard_filters
 
 
 # ---------------------------------------------------------------------------
@@ -47,61 +47,8 @@ def _load_active_df() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  Справочники
+#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_discipline_options() -> dict[str, str]:
-    with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
-            "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple[str, ...] = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        if disciplines:
-            placeholders = ",".join("?" * len(disciplines))
-            rows = conn.execute(f"""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({placeholders})
-                ORDER BY section
-            """, tuple(disciplines)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                ORDER BY section
-            """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple[str, ...] = (),
-                       sections: tuple[str, ...] = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        where = ["c.code IS NOT NULL"]
-        params: list = []
-        if disciplines:
-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-        if sections:
-            placeholders = ",".join("?" * len(sections))
-            where.append(f"""c.code IN (
-                SELECT DISTINCT complex FROM documents
-                WHERE section IN ({placeholders}) AND complex IS NOT NULL
-            )""")
-            params += list(sections)
-
-        rows = conn.execute(f"""
-            SELECT c.code, c.name FROM complexes c
-            WHERE {' AND '.join(where)}
-            ORDER BY c.code
-        """, tuple(params)).fetchall()
-    return {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
-            for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +331,7 @@ def _load_section_summary() -> pd.DataFrame:
 def _load_comments_filtered(query: str,
                              disciplines=(), sections=(), kits=(),
                              statuses=(), categories=(),
+                             block_codes=(), marka: str = "",
                              limit: int = 20000) -> pd.DataFrame:
     q = """
         SELECT
@@ -417,6 +365,17 @@ def _load_comments_filtered(query: str,
     if kits:
         q += f" AND d.complex IN ({','.join('?' * len(kits))})"
         params += list(kits)
+    if block_codes:
+        ors = []
+        for bc in block_codes:
+            ors.append("d.complex LIKE '%-" + str(bc) + "-%'")
+            ors.append("d.complex LIKE '%-" + str(bc).lower() + "-%'")
+        q += " AND (" + " OR ".join(ors) + ")"
+    if marka:
+        m = marka.strip().upper()
+        if m:
+            q += " AND d.complex LIKE ?"
+            params.append(f"%-{m}-%")
     if statuses:
         q += f" AND c.status IN ({','.join('?' * len(statuses))})"
         params += list(statuses)
@@ -712,62 +671,47 @@ def _render_comments_export():
         "в Excel или PDF."
     )
 
-    disc_options = _load_discipline_options()
+    # --- Единый стандарт фильтров (как в Сводке) ---
+    def _export_extra_row():
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            sel_category = st.multiselect(
+                "Категория", [CAT_1, CAT_2, CAT_3, CAT_4],
+                placeholder="Все категории", key="exp_category")
+        with c5:
+            query = st.text_input(
+                "Поиск по тексту",
+                placeholder="Оставьте пустым для всех",
+                key="exp_query")
+        with c6:
+            limit = st.number_input(
+                "Максимум строк", min_value=100, max_value=100000,
+                value=20000, step=1000, key="exp_limit",
+                help="При большом объёме выгрузка может занять время",
+            )
+        return {
+            "category": tuple(sel_category),
+            "query": query or "",
+            "limit": int(limit),
+        }
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        sel_disc_labels = st.multiselect(
-            "Дисциплина", options=list(disc_options.values()),
-            placeholder="Все дисциплины", key="exp_disc")
-        sel_disc = [code for code, label in disc_options.items()
-                    if label in sel_disc_labels]
-
-    section_options = _load_section_options(
-        tuple(sel_disc) if sel_disc else ())
-
-    with c2:
-        if section_options:
-            sel_section_labels = st.multiselect(
-                "Раздел", options=list(section_options.values()),
-                placeholder="Все разделы", key="exp_section")
-            sel_section = [code for code, label in section_options.items()
-                           if label in sel_section_labels]
-        else:
-            sel_section = []
-            st.multiselect("Раздел", options=[],
-                            placeholder="Разделы не применимы",
-                            disabled=True, key="exp_section_empty")
-
-    kit_options = _load_kit_options(
-        tuple(sel_disc) if sel_disc else (),
-        tuple(sel_section) if sel_section else ())
-
-    with c3:
-        sel_kit_labels = st.multiselect(
-            "Комплект", options=list(kit_options.values()),
-            placeholder="Все комплекты", key="exp_kit")
-        sel_kit = [code for code, label in kit_options.items()
-                    if label in sel_kit_labels]
-
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        sel_status = st.multiselect("Статус", STATUSES,
-                                     placeholder="Все статусы",
-                                     key="exp_status")
-    with c5:
-        sel_category = st.multiselect(
-            "Категория", [CAT_1, CAT_2, CAT_3, CAT_4],
-            placeholder="Все категории", key="exp_category")
-    with c6:
-        query = st.text_input("Поиск по тексту",
-                               placeholder="Оставьте пустым для всех",
-                               key="exp_query")
-
-    limit = st.number_input(
-        "Максимум строк", min_value=100, max_value=100000,
-        value=20000, step=1000, key="exp_limit",
-        help="При большом объёме выгрузка может занять время",
+    # Экспорт ищет также по «Закрыто» и «Аннулировано» — поэтому
+    # расширенный список статусов вместо стандартных пяти.
+    flt = render_standard_filters(
+        key_prefix="exp_",
+        expander_label="🎛 Фильтры",
+        remark_status_options=tuple(STATUSES),
+        extra_row=_export_extra_row,
     )
+
+    sel_disc = flt["disc"]
+    sel_section = flt["section"]
+    sel_kit = flt["kits"]
+    sel_marka = flt["marka"]
+    sel_status = flt["remark_statuses"]
+    sel_category = list(flt["extra"].get("category", ()))
+    query = flt["extra"].get("query", "")
+    limit = flt["extra"].get("limit", 20000)
 
     df = _load_comments_filtered(
         query=query,
@@ -776,6 +720,8 @@ def _render_comments_export():
         kits=tuple(sel_kit) if sel_kit else (),
         statuses=tuple(sel_status) if sel_status else (),
         categories=tuple(sel_category) if sel_category else (),
+        block_codes=flt["block_codes"],
+        marka=sel_marka,
         limit=int(limit),
     )
 

@@ -25,11 +25,11 @@ import streamlit as st
 from vitro.sqlite_db import get_conn
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
-    REMARK_STATUS_OPTIONS,
-    SHEET_GROUP_OPTIONS,
     _doc_status_group,
+    _filter_by_blocks,
     _filter_by_marka,
     _sheet_groups_to_sql,
+    render_standard_filters,
 )
 
 
@@ -40,16 +40,6 @@ CAT_1 = "Принято/корректное"
 CAT_2 = "Формальное/нет влияния на СМР"
 CAT_3 = "Доп.требование/отсутствует в ТЗ"
 CAT_4 = "Не принято/нарушение ТНПА"
-
-BLOCK_OPTIONS = {
-    "Корпус 1":                    "1",
-    "Корпус 2":                    "2",
-    "Общие":                       "0",
-    "Стилобат":                    "С",
-    "Газовая котельная":           "ГК",
-    "Генплан":                     "ГП",
-    "Автомобильные дороги (УДС)":  "А",
-}
 
 # ---------------------------------------------------------------------------
 #  Палитры
@@ -107,97 +97,10 @@ def _load_all_categorized() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  Справочники
+#  Справочники (дисциплины / разделы / комплекты) — общий модуль _filters.py
+#  Раньше здесь были собственные копии — теперь все вкладки используют
+#  load_discipline_options / load_section_options / load_kit_options.
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_discipline_options() -> dict[str, str]:
-    with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
-            "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        if disciplines:
-            ph = ",".join("?" * len(disciplines))
-            rows = conn.execute(f"""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({ph})
-                ORDER BY section
-            """, tuple(disciplines)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                ORDER BY section
-            """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple = (),
-                      sections: tuple = (),
-                      block_codes: tuple = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        where = ["c.code IS NOT NULL"]
-        params: list = []
-
-        if disciplines:
-            where.append(
-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-
-        if sections:
-            ph = ",".join("?" * len(sections))
-            where.append(f"""c.code IN (
-                SELECT DISTINCT complex FROM documents
-                WHERE section IN ({ph}) AND complex IS NOT NULL
-            )""")
-            params += list(sections)
-
-        rows = conn.execute(f"""
-            SELECT c.code, c.name FROM complexes c
-            WHERE {' AND '.join(where)}
-            ORDER BY c.code
-        """, tuple(params)).fetchall()
-
-    result = {r["code"]: f"{r['code']} — {r['name']}"
-                       if r["name"] else r["code"]
-            for r in rows}
-
-    # Фильтр по расположению (4-й блок) — в Python
-    if block_codes:
-        filtered = {}
-        for code, label in result.items():
-            block = _extract_4th_block(code)
-            if block in block_codes:
-                filtered[code] = label
-        return filtered
-    return result
-
-
-# ---------------------------------------------------------------------------
-#  4-й блок
-# ---------------------------------------------------------------------------
-def _extract_4th_block(complex_code) -> str:
-    if not complex_code:
-        return ""
-    parts = str(complex_code).split("-")
-    if len(parts) >= 4:
-        return parts[3].strip().upper()
-    return ""
-
-
-def _filter_by_blocks(df: pd.DataFrame,
-                       block_codes: tuple = ()) -> pd.DataFrame:
-    if df.empty or not block_codes:
-        return df
-    blocks = df["complex"].apply(_extract_4th_block)
-    return df[blocks.isin(block_codes)]
 
 
 # ---------------------------------------------------------------------------
@@ -1319,104 +1222,17 @@ def render():
         "разрез по дисциплинам, разделам и комплектам."
     )
 
-    disc_options = _load_discipline_options()
+    # Единый стандарт фильтров (эталон). Ключи виджетов прежние ('sum_*'),
+    # поэтому сохранённые выборки пользователей не сбрасываются.
+    flt = render_standard_filters(key_prefix="sum_")
 
-    with st.expander("Фильтры", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns(5)
-
-        # 1. Дисциплина
-        with c1:
-            sel_disc_labels = st.multiselect(
-                "Дисциплина",
-                options=list(disc_options.values()),
-                placeholder="Все",
-                key="sum_disc",
-            )
-            sel_disc = [code for code, label in disc_options.items()
-                        if label in sel_disc_labels]
-
-        # 2. Раздел
-        section_options = _load_section_options(
-            tuple(sel_disc) if sel_disc else ())
-        with c2:
-            if section_options:
-                sel_section_labels = st.multiselect(
-                    "Раздел",
-                    options=list(section_options.values()),
-                    placeholder="Все",
-                    key="sum_section",
-                )
-                sel_section = [
-                    code for code, label in section_options.items()
-                    if label in sel_section_labels
-                ]
-            else:
-                sel_section = []
-                st.multiselect(
-                    "Раздел", options=[],
-                    placeholder="—",
-                    disabled=True, key="sum_section_empty",
-                )
-
-        # 3. Расположение
-        with c3:
-            sel_blocks = st.multiselect(
-                "Расположение",
-                options=list(BLOCK_OPTIONS.keys()),
-                placeholder="Все",
-                key="sum_blocks",
-            )
-            block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
-
-        # 4. Комплект (зависит от всех трёх)
-        kit_options = _load_kit_options(
-            tuple(sel_disc) if sel_disc else (),
-            tuple(sel_section) if sel_section else (),
-            block_codes,
-        )
-        with c4:
-            sel_kit_labels = st.multiselect(
-                "Комплект",
-                options=list(kit_options.values()),
-                placeholder="Все",
-                key="sum_kit",
-            )
-            sel_kit = [code for code, label in kit_options.items()
-                        if label in sel_kit_labels]
-
-        # 5. Марка комплекта (блок 2 шифра)
-        with c5:
-            sel_marka = st.text_input(
-                "Марка комплекта",
-                placeholder="например: КЖ1",
-                key="sum_marka",
-                help="Точное совпадение 2-го блока шифра (марки). "
-                     "КЖ1 не найдёт КЖ11 или КЖ10.",
-            )
-
-        st.write("")
-        c6, c7 = st.columns(2)
-        with c6:
-            sel_remark_statuses = st.multiselect(
-                "Статус замечания",
-                options=REMARK_STATUS_OPTIONS,
-                placeholder="Все",
-                key="sum_remark_status",
-            )
-        with c7:
-            sel_sheet_groups = st.multiselect(
-                "Статус листа",
-                options=SHEET_GROUP_OPTIONS,
-                placeholder="Все",
-                key="sum_sheet_group",
-            )
-
-    disc_t = tuple(sel_disc)
-    sect_t = tuple(sel_section)
-    kit_t = tuple(sel_kit)
-    remark_statuses_t = tuple(sel_remark_statuses) if sel_remark_statuses else ()
-    sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
-    marka_t = (sel_marka or "").strip()
+    disc_t = flt["disc"]
+    sect_t = flt["section"]
+    kit_t = flt["kits"]
+    block_codes = flt["block_codes"]
+    remark_statuses_t = flt["remark_statuses"]
+    sheet_groups_t = flt["sheet_groups"]
+    marka_t = flt["marka"]
 
     _LAST_FILTERS["disc_t"] = disc_t
     _LAST_FILTERS["sect_t"] = sect_t

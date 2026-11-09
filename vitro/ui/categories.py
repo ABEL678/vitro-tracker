@@ -25,10 +25,12 @@ from vitro.sqlite_db import (
     update_category_safe,
     update_category_force,
 )
-from vitro.disciplines import discipline_name
 from vitro.time_utils import fmt_msk
 from vitro.ui._auth import ensure_user
-from vitro.ui._filters import _filter_by_marka
+from vitro.ui._filters import (
+    _filter_by_marka,
+    render_standard_filters,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,70 +102,8 @@ def _add_prefix(raw_value: str):
 
 
 # ---------------------------------------------------------------------------
-#  Справочники
+#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_discipline_options() -> dict[str, str]:
-    with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
-            "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        if disciplines:
-            ph = ",".join("?" * len(disciplines))
-            rows = conn.execute(f"""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({ph})
-                ORDER BY section
-            """, tuple(disciplines)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                ORDER BY section
-            """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple = (),
-                      sections: tuple = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        where = ["c.code IS NOT NULL"]
-        params: list = []
-
-        if disciplines:
-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-
-        if sections:
-            ph = ",".join("?" * len(sections))
-            where.append(f"""c.code IN (
-                SELECT DISTINCT complex FROM documents
-                WHERE section IN ({ph})
-                  AND complex IS NOT NULL
-            )""")
-            params += list(sections)
-
-        rows = conn.execute(f"""
-            SELECT c.code, c.name
-            FROM complexes c
-            WHERE {' AND '.join(where)}
-            ORDER BY c.code
-        """, tuple(params)).fetchall()
-
-    result = {}
-    for r in rows:
-        code = r["code"]
-        name = (r["name"] or "").strip()
-        result[code] = f"{code} — {name}" if name else code
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -542,95 +482,37 @@ def _render_editor():
             key="editor_only_uncat",
         )
 
-    disc_options = _load_discipline_options()
-
-    with st.expander("🎛 Фильтры", expanded=False):
-        c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-            sel_disc_labels = st.multiselect(
-                "Дисциплина",
-                options=list(disc_options.values()),
-                placeholder="Все дисциплины",
-                key="editor_disc",
-            )
-            sel_disc = [code for code, label in disc_options.items()
-                        if label in sel_disc_labels]
-
-        section_options = _load_section_options(
-            tuple(sel_disc) if sel_disc else ())
-
-        with c2:
-            if section_options:
-                sel_section_labels = st.multiselect(
-                    "Раздел",
-                    options=list(section_options.values()),
-                    placeholder="Все разделы",
-                    key="editor_section",
-                )
-                sel_section = [code for code, label in section_options.items()
-                               if label in sel_section_labels]
-            else:
-                sel_section = []
-                st.multiselect(
-                    "Раздел", options=[],
-                    placeholder="Разделы не применимы",
-                    disabled=True,
-                    key="editor_section_empty",
-                )
-
-        kit_options = _load_kit_options(
-            tuple(sel_disc) if sel_disc else (),
-            tuple(sel_section) if sel_section else (),
-        )
-
-        with c3:
-            sel_kit_labels = st.multiselect(
-                "Комплект",
-                options=list(kit_options.values()),
-                placeholder="Все комплекты",
-                key="editor_kit",
-            )
-            sel_kit = [code for code, label in kit_options.items()
-                       if label in sel_kit_labels]
-
-        with c4:
-            sel_marka = st.text_input(
-                "Марка комплекта",
-                placeholder="например: КЖ1",
-                key="editor_marka",
-                help="Точное совпадение 2-го блока шифра (марки). "
-                     "КЖ1 не найдёт КЖ11 или КЖ10. "
-                     "Применяется после лимита строк.",
-            )
-
-        if show_waiting:
-            status_options = [
-                "Новое", "Принято в работу", "Не принято",
-                "К обсуждению", "Выполнено",
-            ]
-        else:
-            status_options = [
-                "Новое", "Принято в работу",
-                "Не принято", "К обсуждению",
-            ]
-
-        c5, c6 = st.columns(2)
-        with c5:
-            sel_status = st.multiselect(
-                "Статус замечания",
-                options=status_options,
-                default=status_options,
-                placeholder="Все доступные статусы",
-                key="editor_status",
-            )
-
-        with c6:
+    # Единый стандарт фильтров (как в Сводке) + лимит строк в 3-м ряду.
+    def _editor_extra_row():
+        c_l1, c_l2 = st.columns(2)
+        with c_l1:
             limit = st.number_input(
                 "Лимит строк",
                 min_value=50, max_value=2000,
                 value=300, step=50, key="editor_limit",
             )
+        with c_l2:
+            st.caption(
+                "Показываются только активные статусы. «Выполнено» "
+                "учитывается, если включено выше."
+            )
+        return {"limit": int(limit)}
+
+    flt = render_standard_filters(
+        key_prefix="editor_",
+        expander_label="🎛 Фильтры",
+        expanded=False,
+        show_remark_status=True,
+        show_sheet_status=False,
+        extra_row=_editor_extra_row,
+    )
+
+    sel_disc = flt["disc"]
+    sel_section = flt["section"]
+    sel_kit = flt["kits"]
+    sel_marka = flt["marka"]
+    sel_status = flt["remark_statuses"]
+    limit = flt["extra"].get("limit", 300)
 
     df = load_remarks_for_editor(
         disciplines=tuple(sel_disc) if sel_disc else None,

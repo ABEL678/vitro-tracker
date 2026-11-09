@@ -5,8 +5,8 @@
 Фиксированный хедер с логотипом АТП ТЛП.
 Фиксированная полоса с датой последней выгрузки из Витро.
 Фиксированный футер с версией приложения.
-8 вкладок: Сводка, Динамика, Авторы, Сроки, Категории, Поиск,
-Экспорт, Управление.
+9 вкладок: Сводка, Динамика, Авторы, Сроки, План выдачи,
+Категории, Поиск, Экспорт, Управление.
 Запуск: streamlit run app.py
 """
 
@@ -26,7 +26,7 @@ from vitro.config import APP_VERSION
 from vitro.time_utils import fmt_msk
 from vitro.ui import (
     summary, dynamics, authors, deadlines,
-    categories, search, export, admin,
+    plan, categories, search, export, admin,
 )
 
 import time
@@ -265,6 +265,7 @@ _TABS = [
     "📈 Динамика",
     "👤 Авторы",
     "⏰ Сроки",
+    "📅 План выдачи",
     "🏷 Категории",
     "🔍 Поиск",
     "📄 Экспорт",
@@ -331,6 +332,8 @@ elif _active == "👤 Авторы":
     authors.render()
 elif _active == "⏰ Сроки":
     deadlines.render()
+elif _active == "📅 План выдачи":
+    plan.render()
 elif _active == "🏷 Категории":
     categories.render()
 elif _active == "🔍 Поиск":
