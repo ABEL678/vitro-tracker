@@ -1,0 +1,1904 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 4c6d86d..365c82a 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -44,7 +44,7 @@ git push origin feature/analytics-rework
+ 
+ ```
+ Vitro_tracker/
+-├── app.py                     # Главный Streamlit (8 вкладок)
++├── app.py                     # Главный Streamlit (9 вкладок)
+ ├── sync_runner.py             # Синхронизация по расписанию
+ ├── requirements.txt
+ ├── .env                       # НЕ в git
+@@ -55,7 +55,8 @@ Vitro_tracker/
+     ├── config.py              # .env + переменные (APP_VERSION)
+     ├── disciplines.py         # Справочник дисциплин
+     ├── sharepoint.py          # Загрузка из Витрокад
+-    ├── sqlite_db.py           # Работа с БД
++    ├── sqlite_db.py           # Работа с БД (+ план: plan_kits, plan_drawings)
++    ├── plan_xlsx.py           # Шаблоны/парсеры/выгрузка ведомостей плана
+     ├── sync.py                # Логика синхронизации
+     ├── workdays.py            # Производственный календарь РФ
+     ├── text_utils.py          # clean_leaf_key, normalize_homoglyphs
+@@ -64,13 +65,14 @@ Vitro_tracker/
+     ├── pdf_builder.py         # Генерация PDF
+     └── ui/
+         ├── _auth.py           # Авторизация по требованию
+-        ├── _filters.py        # Общие фильтры (статусы, марка)
++        ├── _filters.py        # ОБЩИЕ ФИЛЬТРЫ (единый стандарт + справочники)
+         ├── _urls.py           # Ссылки на Витро
+         ├── _utils.py          # download_plotly (только для Экспорта)
+         ├── summary.py         # Сводка по проекту
+         ├── dynamics.py        # Динамика (потоки по месяцам)
+         ├── authors.py         # Авторы замечаний
+         ├── deadlines.py       # Сроки + единый источник
++        ├── plan.py            # План выдачи комплектов
+         ├── categories.py      # Категории (ручная разметка)
+         ├── search.py          # Поиск по тексту
+         ├── export.py          # Экспорт
+@@ -111,27 +113,19 @@ Vitro_tracker/
+ - Каскадные фильтры: Дисциплина → Раздел → **Расположение** → Комплект.
+ - 4-й блок шифра: `complex.split("-")[3]` (`.upper()`).
+ 
+-#### Второй ряд фильтров в Сводке
++#### Единый стандарт фильтров (с версии 1.4)
+ 
+-В `vitro/ui/summary.py` (вкладка «Сводка по проекту») два ряда фильтров в expander «Фильтры»:
++**`vitro/ui/_filters.py` → `render_standard_filters(key_prefix=...)`** — единый блок фильтров, эталон — «Сводка по проекту»:
+ 
+-**1-й ряд** (каскад): Дисциплина → Раздел → Расположение → Комплект.
++- **Ряд 1 (каскад, 5 колонок):** Дисциплина → Раздел → Расположение → Комплект → Марка.
++- **Ряд 2:** Статус замечания + Статус листа (флаги `show_remark_status` / `show_sheet_status`; у Поиска и Экспорта — расширенный список статусов через `remark_status_options`).
++- **Ряд 3:** вкладко-специфичные фильтры через `extra_row()` (Автор, Категория, Лимит, период…).
++- **Ряд 1, 6-я колонка:** через `row1_extra(col, kits)` (например, «Лист» в Сроках).
++- Ключи виджетов = прежние префиксы вкладок (`sum_`, `dyn_`, `dl_`, `editor_`, `search_`, `exp_`, `authors_`, `wait_`, `ca_`, `plan_`) — выборки пользователей сохраняются.
++- Справочники каскада — общие: `load_discipline_options`, `load_section_options`, `load_kit_options`; «Расположение» — `BLOCK_OPTIONS` там же.
++- `_filter_by_blocks` / `_filter_by_marka` работают и с колонкой `complex`, и с `Комплект` (фикс бага марки в Поиске v1.3).
+ 
+-**2-й ряд**: Статус замечания (5 сырых значений) + Статус листа (8 групп).
+-
+-Принцип фильтрации по секциям:
+-- **Секция 1 (Объём замечаний)**: оба фильтра (включая бублик статусов).
+-- **Секция 2 (Листы РД)**: только статус листа. Статус замечания НЕ влияет.
+-- **Секции 3, 4, 5**: оба фильтра.
+-- **Разрез (табы)**: оба фильтра.
+-
+-Маппинг групп статусов листов: `_sheet_groups_to_sql()` в `_filters.py`.
+-Обратный маппинг групп в сырые статусы: `_SHEET_GROUP_TO_RAW`.
+-Группа «Прочее» обрабатывается через `NOT IN` (`_ALL_KNOWN_RAW_STATUSES`).
+-
+-ВАЖНО:
+-- Группа «На согласовании Заказчика» = «ДЛЯ СОГЛАСОВАНИЯ» + «НА РАССМОТРЕНИИ».
+-- Группа «Готовится к загрузке» = «НА КОРРЕКТИРОВКЕ» + «РАЗМЕЩЕНО».
++Во вкладках, где фильтры возвращают dict: `flt["disc"]`, `flt["section"]`, `flt["kits"]`, `flt["block_codes"]`, `flt["marka"]`, `flt["remark_statuses"]`, `flt["sheet_groups"]`, `flt["extra"]`.
+ 
+ #### Общие модули в vitro/ui/
+ 
+@@ -147,11 +141,19 @@ Vitro_tracker/
+ 
+ #### Фильтр «Марка комплекта» (блок 2 шифра)
+ 
+-Во всех 5 вкладках есть фильтр «Марка комплекта».
++Во всех вкладках есть фильтр «Марка комплекта».
+ - Строгое совпадение 2-го блока шифра.
+ - `КЖ1` не найдёт `КЖ11`, `КЖ10`.
+ - В SQL — `LIKE '%-{marka}-%'`.
+-- В Python — `_filter_by_marka`.
++- В Python — `_filter_by_marka` (работает с `complex` и `Комплект`).
++
++#### Вкладка «План выдачи» (с версии 1.4)
++
++- Файлы: `vitro/ui/plan.py` (вкладка), `vitro/plan_xlsx.py` (шаблоны/парсеры/выгрузка), таблицы `plan_kits` + `plan_drawings` в `sqlite_db.py`.
++- Данные общие для всех пользователей (SQLite), загрузка ведомостей — через `upsert_plan_kits` / `replace_plan_drawings_for_kits` (чертежи затронутых шифров заменяются целиком).
++- Общая таблица: статус вычисляется («Загружен в Витро» / «Загружается (частично)» / «План (не загружен)» / «Только в Витро»), срок готовности редактируется в `st.data_editor` (автосохранение; диалог имени — только при нажатии кнопки).
++- Каскад комплектов на План-вкладке объединяет справочник Витро и шифры из ведомостей (`kit_options_fn`).
++- Фильтры — единый стандарт (`render_standard_filters`), дополнительно «Статус комплекта» и «Только позиции со сроками».
+ 
+ #### Ссылки на Витро
+ 
+@@ -224,16 +226,22 @@ Vitro_tracker/
+ - **`.env`** — НЕ в git.
+ - **`data/vitro.db`** — НЕ в git.
+ - **Пароли, токены** — только в `.env`.
++- **TLS-проверка Витро** — включена по умолчанию (`VITRO_VERIFY_SSL=true`, v1.4); отключать только временно.
++- **`showErrorDetails = false`** (v1.4) — traceback не виден пользователям.
++- **`LIMIT ?`** — параметризован (admin.py, v1.4).
++- **Опасная зона «Управления»** — пишется в журнал (`admin_clear`, v1.4).
+ - **`_utils.py` → `download_plotly`** — только для будущего Экспорта.
+ 
+ ## Что можно трогать
+ 
+ - **`vitro/ui/`** — вкладки.
+ - **`vitro/ui/_filters.py`**, **`_urls.py`**, **`_auth.py`** — общие модули.
++- **`vitro/ui/plan.py`**, **`vitro/plan_xlsx.py`** — план выдачи.
+ - **`vitro/time_utils.py`** — утилиты времени.
+ - **`vitro/text_utils.py`**, **`vitro/workdays.py`** — утилиты.
+ - **`vitro/config.py`** — константы (в т.ч. `APP_VERSION`).
+ - **`scripts/`** — диагностика.
++- **`vitro/sqlite_db.py`** — только добавление таблиц/функций плана (v1.4: plan_*).
+ 
+ ## Что НЕЛЬЗЯ трогать без явной просьбы
+ 
+@@ -246,6 +254,7 @@ Vitro_tracker/
+ ## Проверка после правки
+ 
+ 1. **Приложение открывается** — `streamlit run app.py`.
+-2. **Вкладки работают** — 8 штук.
++2. **Вкладки работают** — 9 штук.
+ 3. **Никаких traceback** в терминале.
+ 4. **Цифры сходятся** — Сводка / Сроки / Авторы / Категории / Динамика.
++5. **«План выдачи»** — загрузка ведомостей, редактирование срока готовности, бублики, выгрузка Excel за период.
+diff --git a/README.md b/README.md
+index 4f22a4e..7a20948 100644
+--- a/README.md
++++ b/README.md
+@@ -10,13 +10,14 @@
+ - Синхронизирует замечания, листы и комплекты из SharePoint (Витрокад) в локальную БД SQLite (~35 МБ, ~66 000 замечаний).
+ - Позволяет специалистам категоризовать замечания (4 категории) с оптимистичной блокировкой.
+ - Даёт аналитику: Сводка по проекту (5 секций), динамика, авторы, сроки, категории, поиск, экспорт.
++- Формирует **План выдачи комплектов** (вкладка «📅 План выдачи»): ведомости Excel → комплекты и чертежи, статусы, сроки готовности, бублики «всего/план», детальная таблица с выгрузкой за период.
+ - Выгружает данные в Excel (форматированные отчёты) и PDF.
+ 
+ ## Структура проекта
+ 
+ ```
+ Vitro_tracker/
+-├── app.py                     # Главный Streamlit (8 вкладок)
++├── app.py                     # Главный Streamlit (9 вкладок)
+ ├── sync_runner.py             # Синхронизация по расписанию
+ ├── requirements.txt
+ ├── .env                       # НЕ в git (пароли, токены)
+@@ -27,7 +28,8 @@ Vitro_tracker/
+     ├── config.py              # .env + переменные
+     ├── disciplines.py         # Справочник дисциплин
+     ├── sharepoint.py          # Загрузка из Витрокад
+-    ├── sqlite_db.py           # Работа с БД
++    ├── sqlite_db.py           # Работа с БД (+ план: plan_kits, plan_drawings)
++    ├── plan_xlsx.py           # Шаблоны/парсеры/выгрузка ведомостей плана
+     ├── sync.py                # Логика синхронизации
+     ├── workdays.py            # Производственный календарь РФ
+     ├── text_utils.py          # clean_leaf_key, normalize_homoglyphs
+@@ -38,6 +40,7 @@ Vitro_tracker/
+         ├── dynamics.py        # Динамика (потоки по месяцам)
+         ├── authors.py         # Авторы замечаний
+         ├── deadlines.py       # Сроки + единый источник
++        ├── plan.py            # План выдачи комплектов
+         ├── categories.py      # Категории (ручная разметка)
+         ├── search.py          # Поиск по тексту
+         ├── export.py          # Экспорт
+@@ -107,22 +110,15 @@ streamlit run app.py
+ - Каскадные фильтры: Дисциплина → Раздел → **Расположение** → Комплект
+ - 4-й блок шифра: `complex.split("-")[3]` (`.upper()`)
+ 
+-#### Фильтры в Сводке по проекту
++#### Фильтры во всех вкладках (единый стандарт)
+ 
+-В вкладке «Сводка по проекту» (`vitro/ui/summary.py`) два ряда фильтров в expander «Фильтры»:
++С версии 1.4 единый блок фильтров живёт в **`vitro/ui/_filters.py` → `render_standard_filters()`** и используется во всех вкладках (эталон — «Сводка по проекту»):
+ 
+-1. **Каскад:** Дисциплина → Раздел → Расположение → Комплект.
+-2. **Дополнительно:** Статус замечания + Статус листа.
++1. **Каскад (ряд 1):** Дисциплина → Раздел → Расположение → Комплект → Марка комплекта.
++2. **Дополнительно (ряд 2):** Статус замечания + Статус листа (там, где применимы).
++3. **3-й ряд:** вкладко-специфичные фильтры (Лист, Автор, Категория, Лимит, период и т. п.).
+ 
+-Фильтры применяются ко всем секциям Сводки и к разрезу.
+-
+-Принцип фильтрации по секциям:
+-- **Секция 1 (Объём замечаний):** оба фильтра (включая бублик статусов).
+-- **Секция 2 (Листы РД):** только статус листа. Статус замечания НЕ влияет.
+-- **Секции 3, 4, 5:** оба фильтра.
+-- **Разрез (табы):** оба фильтра.
+-
+-Единый источник — `_load_all_categorized()` в `deadlines.py`.
++Справочники каскада — общие: `load_discipline_options`, `load_section_options`, `load_kit_options`; справочник «Расположение» — `BLOCK_OPTIONS` в `_filters.py`. Фильтрация DataFrame — `apply_df_filters()` (и `_filter_by_blocks` / `_filter_by_marka`, работающие и с колонкой `complex`, и с `Комплект`).
+ 
+ ### Терминология
+ 
+@@ -159,15 +155,27 @@ streamlit run app.py
+ - **Планировщик Windows** — возможны пропуски в логах. Проверить настройки.
+ - **Вкладки / хедер** — не прилипают вместе с полосой даты.
+ 
++## План выдачи комплектов (вкладка «📅 План выдачи»)
++
++- **Вводные данные (Excel):** «Ведомость основных комплектов» + «Ведомости чертежей каждого комплекта». Шаблоны скачиваются из вкладки; колонки распознаются по названиям заголовков.
++- **Данные хранятся в SQLite:** таблицы `plan_kits` и `plan_drawings` (`vitro/sqlite_db.py`); парсеры/шаблоны/выгрузка — `vitro/plan_xlsx.py`.
++- **Общая таблица:** шифр, наименование, дисциплина, раздел, общий статус («Загружен в Витро» / «Загружается (частично)» / «План (не загружен)» / «Только в Витро»), листов в Витро/план, **редактируемый срок готовности**.
++- **Бублики:** «Комплектов всего/план» и «Листов всего/план» (по результату фильтрации).
++- **Детальная таблица:** Дисциплина / Раздел / Комплект(ы) / Наименование / Кол-во чертежей (план) / Плановая дата / Статус комплекта — с фильтром по периоду (дата позиции = плановая дата чертежа, иначе срок готовности комплекта) и плашкой «📥 Выгрузить в Excel».
++
+ ## Безопасность
+ 
+ - **`.env`** — НЕ в git (пароли, токены)
+ - **`data/vitro.db`** — НЕ в git (~35 МБ, ~66 000 замечаний)
++- **TLS-проверка сертификата Витро** — включена по умолчанию (`VITRO_VERIFY_SSL=true`); отключать только временно во внутреннем контуре.
++- **`showErrorDetails = false`** — traceback не показывается пользователям.
++- **Опасные операции в «Управлении»** — пишутся в журнал (`admin_clear`).
+ - **`_utils.py` → `download_plotly`** — только для будущего Экспорта
+ 
+ ## Проверка после правки
+ 
+ 1. Приложение открывается — `streamlit run app.py`
+-2. Вкладки работают — 8 штук
++2. Вкладки работают — 9 штук
+ 3. Никаких traceback в терминале
+ 4. Цифры сходятся — Сводка / Сроки / Авторы / Категории / Динамика
++5. «План выдачи» — загрузка ведомостей, редактирование срока, выгрузка Excel
+diff --git a/app.py b/app.py
+index ff5a651..56b0094 100644
+--- a/app.py
++++ b/app.py
+@@ -5,8 +5,8 @@
+ Фиксированный хедер с логотипом АТП ТЛП.
+ Фиксированная полоса с датой последней выгрузки из Витро.
+ Фиксированный футер с версией приложения.
+-8 вкладок: Сводка, Динамика, Авторы, Сроки, Категории, Поиск,
+-Экспорт, Управление.
++9 вкладок: Сводка, Динамика, Авторы, Сроки, План выдачи,
++Категории, Поиск, Экспорт, Управление.
+ Запуск: streamlit run app.py
+ """
+ 
+@@ -26,7 +26,7 @@ from vitro.config import APP_VERSION
+ from vitro.time_utils import fmt_msk
+ from vitro.ui import (
+     summary, dynamics, authors, deadlines,
+-    categories, search, export, admin,
++    plan, categories, search, export, admin,
+ )
+ 
+ import time
+@@ -265,6 +265,7 @@ _TABS = [
+     "📈 Динамика",
+     "👤 Авторы",
+     "⏰ Сроки",
++    "📅 План выдачи",
+     "🏷 Категории",
+     "🔍 Поиск",
+     "📄 Экспорт",
+@@ -331,6 +332,8 @@ elif _active == "👤 Авторы":
+     authors.render()
+ elif _active == "⏰ Сроки":
+     deadlines.render()
++elif _active == "📅 План выдачи":
++    plan.render()
+ elif _active == "🏷 Категории":
+     categories.render()
+ elif _active == "🔍 Поиск":
+diff --git a/vitro/plan_xlsx.py b/vitro/plan_xlsx.py
+new file mode 100644
+index 0000000..31fc21f
+--- /dev/null
++++ b/vitro/plan_xlsx.py
+@@ -0,0 +1,550 @@
++# vitro/plan_xlsx.py
++"""
++Excel для вкладки «План выдачи комплектов».
++
++Состав:
++  - Шаблоны ведомостей (скачиваются из вкладки):
++      build_kits_template()     — «Ведомость основных комплектов»
++      build_drawings_template() — «Ведомость чертежей комплектов»
++  - Парсеры загруженных файлов (гибкое распознавание заголовков):
++      parse_kits_workbook()     — комплекты → upsert_plan_kits
++      parse_drawings_workbook() — чертежи  → replace_plan_drawings_for_kits
++  - Выгрузка результата фильтрации:
++      build_plan_export()       — 2 листа: «Комплекты» + «Чертежи (план)»
++
++Распознавание колонок — по ключевым словам в заголовках (первые 15 строк
++каждого видимого листа), поэтому формат «Ексель» может отличаться
++в порядке и названиях колонок. Минимально нужны:
++  - для ведомости комплектов: шифр комплекта;
++  - для ведомости чертежей:   шифр комплекта + наименование.
++"""
++
++import io
++from datetime import date, datetime
++
++import openpyxl
++from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
++from openpyxl.utils import get_column_letter
++
++MIME_XLSX = ("application/vnd.openxmlformats-officedocument"
++             ".spreadsheetml.sheet")
++
++# ---------------------------------------------------------------------------
++#  Стили шаблонов
++# ---------------------------------------------------------------------------
++_HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
++_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
++_THIN = Side(style="thin", color="B0B0B0")
++_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
++_NOTE_FONT = Font(size=9, color="808080", italic=True)
++_EXAMPLE_FILL = PatternFill("solid", fgColor="FFF2CC")
++_WRAP = Alignment(wrap_text=True, vertical="top")
++
++# ---------------------------------------------------------------------------
++#  Ключевые слова для распознавания колонок (нижний регистр)
++# ---------------------------------------------------------------------------
++_KIT_CODE_KEYS = ("шифр комплекта", "шифр", "код комплекта", "комплект")
++_KIT_NAME_KEYS = ("наименование комплекта", "название комплекта",
++                  "наименование", "название")
++_KIT_STATUS_KEYS = ("статус",)
++_DUE_DATE_KEYS = ("срок готовности", "дата готовности", "срок", "до даты")
++_DISC_KEYS = ("дисциплина", "раздел",)  # раздел мапим отдельно ниже
++_SECTION_KEYS = ("раздел",)
++
++_DRAW_TITLE_KEYS = ("наименование чертежа", "наименование", "чертеж",
++                    "обозначение", "название")
++_QTY_KEYS = ("кол-во", "количество", "кол во")
++_PLANNED_DATE_KEYS = ("плановая дата", "дата выдачи", "дата")
++
++# Порядок важен: «шифр комплекта» проверяется раньше «комплект»
++# и «шифр», чтобы не спутать с «наименованием комплекта».
++
++
++def _norm_header(value) -> str:
++    """Нормализация заголовка ячейки: нижний регистр, без лишних пробелов."""
++    if value is None:
++        return ""
++    s = str(value)
++    s = s.replace("\xa0", " ").replace("\u200b", "")
++    s = " ".join(s.split())
++    return s.strip().lower()
++
++
++def _match_header(header: str, keys: tuple) -> bool:
++    """True, если заголовок начинается с одного из ключевых слов."""
++    h = _norm_header(header)
++    for k in keys:
++        if h.startswith(k) or h == k:
++            return True
++    return False
++
++
++def _find_header_row(ws, required: tuple) -> tuple[int, dict] | None:
++    """
++    Ищет строку заголовков (первые 15 строк листа), содержащую все
++    обязательные ключевые слова. Возвращает (индекс, {ключ: колонка}).
++    """
++    for i, row in enumerate(ws.iter_rows(values_only=True)):
++        if i > 15:
++            break
++        headers = [_norm_header(c) for c in row]
++        if not any(headers):
++            continue
++        cols: dict[str, int] = {}
++        for key_group, name in required:
++            for j, h in enumerate(headers):
++                if h and name not in cols and _match_header(h, key_group):
++                    cols[name] = j
++        if all(name in cols for _, name in required):
++            return i, cols
++    return None
++
++
++def _parse_date_value(value) -> str | None:
++    """Дата из ячейки → ISO-строка 'YYYY-MM-DD' или None."""
++    if value is None or value == "":
++        return None
++    if isinstance(value, datetime):
++        return value.date().isoformat()
++    if isinstance(value, date):
++        return value.isoformat()
++    s = str(value).strip()
++    if not s:
++        return None
++    # ГГГГ-ММ-ДД
++    try:
++        return date.fromisoformat(s).isoformat()
++    except ValueError:
++        pass
++    # ДД.ММ.ГГГГ / ДД.ММ.ГГ
++    for sep in (".", "/", "-"):
++        parts = s.split(sep)
++        if len(parts) == 3:
++            try:
++                d, m, y = (int(p) for p in parts)
++                if y < 100:
++                    y += 2000
++                if 1 <= m <= 12 and 1 <= d <= 31:
++                    return date(y, m, d).isoformat()
++            except ValueError:
++                continue
++    return None
++
++
++def _norm_complex_code(value) -> str:
++    """Нормализация шифра: строка, trim, верхний регистр, без пробелов."""
++    if value is None:
++        return ""
++    return str(value).replace("\xa0", " ").strip().upper()
++
++
++def _clean_str(value) -> str:
++    if value is None:
++        return ""
++    return str(value).replace("\xa0", " ").strip()
++
++
++# ===========================================================================
++#  Шаблоны
++# ===========================================================================
++def _write_template(ws, title: str, headers: list[str],
++                    examples: list[list], notes: list[str]) -> None:
++    n_cols = len(headers)
++
++    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
++    c = ws.cell(row=1, column=1, value=title)
++    c.font = Font(bold=True, size=13, color="1F4E78")
++
++    for j, h in enumerate(headers, start=1):
++        cell = ws.cell(row=2, column=j, value=h)
++        cell.fill = _HEADER_FILL
++        cell.font = _HEADER_FONT
++        cell.border = _BORDER
++        cell.alignment = Alignment(wrap_text=True, vertical="center")
++
++    for i, row in enumerate(examples, start=3):
++        for j, v in enumerate(row, start=1):
++            cell = ws.cell(row=i, column=j, value=v)
++            cell.border = _BORDER
++            cell.fill = _EXAMPLE_FILL
++
++    note_row = 3 + len(examples) + 1
++    for k, note in enumerate(notes):
++        cell = ws.cell(row=note_row + k, column=1, value=note)
++        cell.font = _NOTE_FONT
++
++    for j in range(1, n_cols + 1):
++        ws.column_dimensions[get_column_letter(j)].width = 28
++    ws.column_dimensions["A"].width = 34
++
++
++def build_kits_template() -> bytes:
++    """Шаблон «Ведомость основных комплектов»."""
++    wb = openpyxl.Workbook()
++    ws = wb.active
++    ws.title = "Комплекты"
++
++    _write_template(
++        ws,
++        "Ведомость основных комплектов — План выдачи (АТП ТЛП)",
++        ["Шифр комплекта", "Наименование комплекта", "Дисциплина",
++         "Раздел", "Статус", "Срок готовности"],
++        [
++            ["АТ-РД-КЖ1-1-00", "Конструкции корпуса 1, секция 00",
++             "02_КР", "Секция 00", "В работе", "2026-12-15"],
++            ["АТ-РД-АР-2-00", "Архитектура корпуса 2",
++             "01_АР", "Корпус 2", "План", "2027-02-01"],
++        ],
++        [
++            "Заполнение: одна строка — один комплект.",
++            "Обязательные колонки: «Шифр комплекта». Остальные — по возможности.",
++            "Срок готовности: ГГГГ-ММ-ДД или ДД.ММ.ГГГГ (редактируется и во вкладке).",
++            "При повторной загрузке существующие шифры обновляются, новые — добавляются.",
++        ],
++    )
++
++    buf = io.BytesIO()
++    wb.save(buf)
++    return buf.getvalue()
++
++
++def build_drawings_template() -> bytes:
++    """Шаблон «Ведомость чертежей комплектов»."""
++    wb = openpyxl.Workbook()
++    ws = wb.active
++    ws.title = "Чертежи"
++
++    _write_template(
++        ws,
++        "Ведомость чертежей комплекта — План выдачи (АТП ТЛП)",
++        ["Шифр комплекта", "Наименование чертежа", "Дисциплина",
++         "Раздел", "Кол-во чертежей", "Плановая дата"],
++        [
++            ["АТ-РД-КЖ1-1-00", "Фундаментная плита, узел А", "02_КР",
++             "Секция 00", 3, "2026-12-15"],
++            ["АТ-РД-КЖ1-1-00", "Схема армирования перекрытия", "02_КР",
++             "Секция 00", 2, "2026-12-15"],
++        ],
++        [
++            "Заполнение: одна строка — одна позиция чертежей комплекта.",
++            "Шифр комплекта в каждой строке (или одинаковый по всему листу).",
++            "Кол-во чертежей — план по позиции (по умолчанию 1).",
++            "Плановая дата: ГГГГ-ММ-ДД или ДД.ММ.ГГГГ (необязательно).",
++            "Повторная загрузка по тому же шифру заменяет его чертежи целиком.",
++        ],
++    )
++
++    buf = io.BytesIO()
++    wb.save(buf)
++    return buf.getvalue()
++
++
++# ===========================================================================
++#  Парсеры ведомостей
++# ===========================================================================
++def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], list[str]]:
++    """
++    Разбирает «Ведомость основных комплектов».
++
++    Возвращает (rows, warnings):
++      rows — [{'code','name','discipline','section','plan_status',
++               'due_date','due_comment'}]
++      warnings — список сообщений о пропущенных строках/листах.
++    """
++    warnings: list[str] = []
++    rows: list[dict] = []
++
++    try:
++        wb = openpyxl.load_workbook(
++            io.BytesIO(data), data_only=True, read_only=True)
++    except Exception as e:
++        return [], [f"Не удалось открыть файл {filename}: {e}"]
++
++    for sheet_name in wb.sheetnames:
++        ws = wb[sheet_name]
++        if ws.sheet_state != "visible":
++            continue
++
++        found = _find_header_row(ws, required=(
++            (_KIT_CODE_KEYS, "code"),
++            (_KIT_NAME_KEYS, "name"),
++        ))
++        if not found:
++            warnings.append(
++                f"{filename} · лист «{sheet_name}»: не найдены колонки "
++                f"«Шифр комплекта» и/или «Наименование» — лист пропущен.")
++            continue
++
++        header_idx, cols = found
++        headers = [_norm_header(c) for c in
++                   next(ws.iter_rows(min_row=header_idx + 1,
++                                     max_row=header_idx + 1,
++                                     values_only=True))]
++        extra: dict[str, int | None] = {}
++        for name, keys in (
++            ("discipline", _DISC_KEYS),
++            ("section", _SECTION_KEYS),
++            ("plan_status", _KIT_STATUS_KEYS),
++            ("due_date", _DUE_DATE_KEYS),
++        ):
++            extra[name] = None
++            for j, h in enumerate(headers):
++                if h and _match_header(h, keys):
++                    extra[name] = j
++                    break
++
++        sheet_rows = 0
++        for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
++            if row is None or all(
++                    v is None or str(v).strip() == "" for v in row):
++                if sheet_rows:
++                    break  # пустая строка после данных — конец таблицы
++                continue
++            if len(row) <= cols["code"]:
++                continue
++            code = _norm_complex_code(row[cols["code"]])
++            if not code:
++                continue
++            name = _clean_str(row[cols["name"]]) \
++                if cols.get("name") is not None and \
++                len(row) > cols["name"] else ""
++            row_data = {
++                "code": code,
++                "name": name,
++                "plan_status": "",
++                "due_date": None,
++            }
++            for name in ("discipline", "section", "plan_status"):
++                j = extra.get(name)
++                if j is not None and len(row) > j:
++                    row_data[name] = _clean_str(row[j])
++            j = extra.get("due_date")
++            if j is not None and len(row) > j:
++                row_data["due_date"] = _parse_date_value(row[j])
++            rows.append(row_data)
++            sheet_rows += 1
++
++        if sheet_rows == 0:
++            warnings.append(
++                f"{filename} · лист «{sheet_name}»: заголовок найден, "
++                f"но строк данных нет.")
++    wb.close()
++
++    if not rows and not warnings:
++        warnings.append(f"{filename}: не найдено ни одной строки комплектов.")
++    return rows, warnings
++
++
++def parse_drawings_workbook(
++    data: bytes, filename: str = "", default_kit: str = "",
++) -> tuple[list[dict], list[str]]:
++    """
++    Разбирает «Ведомость чертежей комплекта(ов)».
++
++    default_kit — шифр комплекта, если в файле нет колонки с шифром
++    (файл по одному комплекту). Может быть пустым, тогда строки без
++    шифра пропускаются с предупреждением.
++
++    Возвращает (rows, warnings):
++      rows — [{'kit_code','title','discipline','section','qty',
++               'planned_date','source_file'}]
++    """
++    warnings: list[str] = []
++    rows: list[dict] = []
++    default_kit = _norm_complex_code(default_kit)
++
++    try:
++        wb = openpyxl.load_workbook(
++            io.BytesIO(data), data_only=True, read_only=True)
++    except Exception as e:
++        return [], [f"Не удалось открыть файл {filename}: {e}"]
++
++    for sheet_name in wb.sheetnames:
++        ws = wb[sheet_name]
++        if ws.sheet_state != "visible":
++            continue
++
++        found = _find_header_row(ws, required=(
++            (_DRAW_TITLE_KEYS, "title"),
++        ))
++        kit_cols: dict[str, int] = {}
++        if found:
++            header_idx, cols = found
++            # Опциональная колонка шифра
++            headers = [_norm_header(c) for c in
++                       next(ws.iter_rows(min_row=header_idx + 1,
++                                         max_row=header_idx + 1,
++                                         values_only=True))]
++            for j, h in enumerate(headers):
++                if h and _match_header(h, _KIT_CODE_KEYS) \
++                        and "kit_code" not in kit_cols \
++                        and not _match_header(h, _DRAW_TITLE_KEYS):
++                    kit_cols["kit_code"] = j
++            extra: dict[str, int | None] = {}
++            for name, keys in (
++                ("discipline", _DISC_KEYS),
++                ("section", _SECTION_KEYS),
++                ("qty", _QTY_KEYS),
++                ("planned_date", _PLANNED_DATE_KEYS),
++            ):
++                extra[name] = None
++                for j, h in enumerate(headers):
++                    if h and _match_header(h, keys) \
++                            and extra[name] is None:
++                        extra[name] = j
++        else:
++            warnings.append(
++                f"{filename} · лист «{sheet_name}»: не найдена колонка "
++                f"«Наименование чертежа» — лист пропущен.")
++            continue
++
++        sheet_rows = 0
++        for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
++            if row is None or all(
++                    v is None or str(v).strip() == "" for v in row):
++                if sheet_rows:
++                    break  # пустая строка после данных — конец таблицы
++                continue
++            title = _clean_str(row[cols["title"]]) \
++                if len(row) > cols["title"] else ""
++            if not title:
++                continue
++
++            kit_code = default_kit
++            if "kit_code" in kit_cols and len(row) > kit_cols["kit_code"]:
++                kit_code = _norm_complex_code(row[kit_cols["kit_code"]]) \
++                    or default_kit
++            if not kit_code:
++                warnings.append(
++                    f"{filename} · лист «{sheet_name}»: строка без шифра "
++                    f"комплекта пропущена (задайте шифр при загрузке).")
++                continue
++
++            row_data = {
++                "kit_code": kit_code,
++                "title": title,
++                "qty": 1,
++                "planned_date": None,
++            }
++            for name in ("discipline", "section"):
++                j = extra.get(name)
++                if j is not None and len(row) > j:
++                    row_data[name] = _clean_str(row[j])
++            j = extra.get("qty")
++            if j is not None and len(row) > j:
++                try:
++                    q = int(float(str(row[j]).replace(",", ".")))
++                    if q > 0:
++                        row_data["qty"] = q
++                except (TypeError, ValueError):
++                    pass
++            j = extra.get("planned_date")
++            if j is not None and len(row) > j:
++                row_data["planned_date"] = _parse_date_value(row[j])
++            row_data["source_file"] = filename
++            rows.append(row_data)
++            sheet_rows += 1
++
++        if sheet_rows == 0:
++            warnings.append(
++                f"{filename} · лист «{sheet_name}»: строки чертежей "
++                f"не найдены.")
++    wb.close()
++
++    if not rows and not warnings:
++        warnings.append(f"{filename}: не найдено ни одной строки чертежей.")
++    return rows, warnings
++
++
++# ===========================================================================
++#  Выгрузка результата фильтрации
++# ===========================================================================
++def _style_table(ws, headers: list[str], rows: list[list]) -> None:
++    for j, h in enumerate(headers, start=1):
++        cell = ws.cell(row=1, column=j, value=h)
++        cell.fill = _HEADER_FILL
++        cell.font = _HEADER_FONT
++        cell.border = _BORDER
++        cell.alignment = Alignment(wrap_text=True, vertical="center")
++    for i, row in enumerate(rows, start=2):
++        for j, v in enumerate(row, start=1):
++            cell = ws.cell(row=i, column=j, value=v)
++            cell.border = _BORDER
++            cell.alignment = _WRAP
++    for j in range(1, len(headers) + 1):
++        ws.column_dimensions[get_column_letter(j)].width = 26
++    ws.freeze_panes = "A2"
++
++
++def build_plan_export(kits_df, drawings_df, period_label: str = "") -> bytes:
++    """
++    Excel-файл плана выдачи: лист «Комплекты» + лист «Чертежи (план)».
++    Подаются ОТОБРАННЫЕ (по фильтрам и периоду) DataFrame.
++    """
++    wb = openpyxl.Workbook()
++
++    # ---- Лист 1: Комплекты ----
++    ws = wb.active
++    ws.title = "Комплекты"
++    kit_headers = ["Шифр комплекта", "Наименование комплекта",
++                   "Дисциплина", "Раздел", "Общий статус",
++                   "Листов в Витро", "Листов (план)",
++                   "Срок готовности", "Статус (ведомость)",
++                   "Обновлён", "Кем"]
++    kit_rows = []
++    for _, r in kits_df.iterrows():
++        kit_rows.append([
++            r.get("code", ""),
++            r.get("name", "") or "",
++            r.get("discipline", "") or "",
++            r.get("section", "") or "",
++            r.get("status", "") or "",
++            int(r.get("sheets_vitro", 0) or 0),
++            int(r.get("sheets_plan", 0) or 0),
++            _iso_to_display(r.get("due_date")),
++            r.get("plan_status", "") or "",
++            r.get("updated_at", "") or "",
++            r.get("updated_by", "") or "",
++        ])
++    _style_table(ws, kit_headers, kit_rows)
++
++    # ---- Лист 2: Чертежи (план) ----
++    ws2 = wb.create_sheet("Чертежи (план)")
++    dr_headers = ["Дисциплина", "Раздел", "Комплект(ы)", "Наименование",
++                  "Количество чертежей (план)", "Плановая дата",
++                  "Общий статус комплекта"]
++    dr_rows = []
++    for _, r in drawings_df.iterrows():
++        dr_rows.append([
++            r.get("discipline", "") or "",
++            r.get("section", "") or "",
++            r.get("kit_code", "") or "",
++            r.get("title", "") or "",
++            int(r.get("qty", 1) or 1),
++            _iso_to_display(r.get("planned_date")),
++            r.get("status", "") or "",
++        ])
++    _style_table(ws2, dr_headers, dr_rows)
++
++    if period_label:
++        ws3 = wb.create_sheet("Параметры выгрузки")
++        _style_table(ws3, ["Параметр", "Значение"], [
++            ["Период", period_label],
++            ["Дата формирования", datetime.now().strftime("%d.%m.%Y %H:%M")],
++            ["Комплектов в выгрузке", len(kit_rows)],
++            ["Позиций чертежей в выгрузке", len(dr_rows)],
++        ])
++
++    buf = io.BytesIO()
++    wb.save(buf)
++    return buf.getvalue()
++
++
++def _iso_to_display(iso) -> str:
++    """'YYYY-MM-DD' → 'ДД.ММ.ГГГГ' для Excel-выгрузки."""
++    if not iso:
++        return ""
++    try:
++        return date.fromisoformat(str(iso)[:10]).strftime("%d.%m.%Y")
++    except ValueError:
++        return str(iso)
+diff --git a/vitro/sqlite_db.py b/vitro/sqlite_db.py
+index a5bfde4..4f1f855 100644
+--- a/vitro/sqlite_db.py
++++ b/vitro/sqlite_db.py
+@@ -132,6 +132,38 @@ def init_db() -> None:
+             new_cat    TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_users_activity_user ON users_activity(user);
++
++        -- План выдачи комплектов (вкладка «План выдачи»)
++        -- Ведомость основных комплектов: одна строка = один комплект.
++        CREATE TABLE IF NOT EXISTS plan_kits (
++            code         TEXT PRIMARY KEY,   -- шифр комплекта
++            name         TEXT,               -- наименование
++            discipline   TEXT,
++            section      TEXT,
++            plan_status  TEXT,               -- ручной статус из ведомости (опц.)
++            due_date     TEXT,               -- срок готовности, ISO (редактируется в UI)
++            due_comment  TEXT,               -- пояснение (опц.)
++            updated_at   TEXT,
++            updated_by   TEXT
++        );
++        CREATE INDEX IF NOT EXISTS idx_plan_kits_disc ON plan_kits(discipline);
++
++        -- Ведомости чертежей: одна строка = один чертёж (позиция).
++        CREATE TABLE IF NOT EXISTS plan_drawings (
++            id           INTEGER PRIMARY KEY AUTOINCREMENT,
++            kit_code     TEXT NOT NULL,      -- шифр комплекта (FK → plan_kits.code)
++            title        TEXT,               -- наименование чертежа
++            discipline   TEXT,
++            section      TEXT,
++            qty          INTEGER DEFAULT 1,  -- количество чертежей (план)
++            planned_date TEXT,               -- плановая дата выдачи, ISO (опц.)
++            source       TEXT DEFAULT 'excel',
++            source_file  TEXT,
++            uploaded_at  TEXT,
++            uploaded_by  TEXT,
++            FOREIGN KEY (kit_code) REFERENCES plan_kits(code)
++        );
++        CREATE INDEX IF NOT EXISTS idx_plan_drawings_kit ON plan_drawings(kit_code);
+         """)
+ 
+         # Мягкая миграция: если БД была создана старой версией — добавим колонки
+@@ -498,4 +530,156 @@ def clear_all() -> None:
+         conn.execute("DELETE FROM history_status")
+         conn.execute("DELETE FROM history_summary")
+         conn.execute("DELETE FROM log")
+-        conn.execute("DELETE FROM users_activity")
+\ No newline at end of file
++        conn.execute("DELETE FROM users_activity")
++
++
++# ===========================================================================
++#  План выдачи комплектов (вкладка «План выдачи»)
++# ===========================================================================
++def upsert_plan_kits(rows: list[dict], user: str = "") -> int:
++    """
++    Добавляет/обновляет комплекты плана по шифру (INSERT OR REPLACE).
++    Редактированные в UI сроки готовности (due_date) при повторной
++    загрузке ведомости НЕ перезаписываются пустым значением:
++    если в новой строке дата не заполнена — остаётся прежняя.
++    Возвращает число обработанных строк.
++    """
++    if not rows:
++        return 0
++    now = msk_now_str()
++    with get_conn() as conn:
++        for r in rows:
++            code = str(r.get("code") or "").strip()
++            if not code:
++                continue
++            new_due = r.get("due_date") or None
++            conn.execute("""
++                INSERT INTO plan_kits
++                    (code, name, discipline, section, plan_status,
++                     due_date, due_comment, updated_at, updated_by)
++                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++                ON CONFLICT(code) DO UPDATE SET
++                    name        = COALESCE(excluded.name, plan_kits.name),
++                    discipline  = COALESCE(excluded.discipline,
++                                           plan_kits.discipline),
++                    section     = COALESCE(excluded.section,
++                                           plan_kits.section),
++                    plan_status = COALESCE(excluded.plan_status,
++                                           plan_kits.plan_status),
++                    due_date    = COALESCE(excluded.due_date,
++                                           plan_kits.due_date),
++                    due_comment = COALESCE(excluded.due_comment,
++                                           plan_kits.due_comment),
++                    updated_at  = excluded.updated_at,
++                    updated_by  = excluded.updated_by
++            """, (
++                code,
++                r.get("name"),
++                r.get("discipline"),
++                r.get("section"),
++                r.get("plan_status"),
++                new_due,
++                r.get("due_comment"),
++                now,
++                user,
++            ))
++    return len(rows)
++
++
++def replace_plan_drawings_for_kits(rows: list[dict], user: str = "") -> int:
++    """
++    Заменяет чертежи тех комплектов, которые присутствуют в загруженных
++    строках (DELETE по затронутым шифрам + INSERT). Комплекты, которых
++    нет в plan_kits, создаются минимальной записью (один шифр).
++    Возвращает число вставленных строк.
++    """
++    if not rows:
++        return 0
++    now = msk_now_str()
++    kit_codes = sorted({str(r["kit_code"]).strip() for r in rows
++                        if r.get("kit_code")})
++    if not kit_codes:
++        return 0
++    with get_conn() as conn:
++        # Комплекты, отсутствующие в плане, добавим заглушками,
++        # чтобы сработал внешний ключ и комплект был виден в общей таблице.
++        for code in kit_codes:
++            conn.execute("""
++                INSERT OR IGNORE INTO plan_kits (code, updated_at, updated_by)
++                VALUES (?, ?, ?)
++            """, (code, now, user))
++        ph = ",".join("?" * len(kit_codes))
++        conn.execute(
++            f"DELETE FROM plan_drawings WHERE kit_code IN ({ph})",
++            tuple(kit_codes))
++        conn.executemany("""
++            INSERT INTO plan_drawings
++                (kit_code, title, discipline, section, qty,
++                 planned_date, source, source_file, uploaded_at, uploaded_by)
++            VALUES (?, ?, ?, ?, ?, ?, 'excel', ?, ?, ?)
++        """, [(
++            str(r["kit_code"]).strip(),
++            r.get("title"),
++            r.get("discipline"),
++            r.get("section"),
++            int(r.get("qty") or 1),
++            r.get("planned_date"),
++            r.get("source_file"),
++            now,
++            user,
++        ) for r in rows])
++    return len(rows)
++
++
++def update_plan_due_dates(changes: dict[str, str], user: str = "") -> int:
++    """
++    Обновляет сроки готовности (due_date) комплектов плана.
++    changes — {шифр: ISO-дата или None}. Возвращает число обновлённых строк.
++    """
++    if not changes:
++        return 0
++    now = msk_now_str()
++    with get_conn() as conn:
++        n = 0
++        for code, iso in changes.items():
++            cur = conn.execute("""
++                UPDATE plan_kits
++                SET due_date = ?, updated_at = ?, updated_by = ?
++                WHERE code = ?
++            """, (iso, now, user, code))
++            n += cur.rowcount
++    return n
++
++
++def load_plan_kits():
++    """Все комплекты плана (без кэша — данные меняются кнопками вкладки)."""
++    import pandas as pd
++
++    with get_conn() as conn:
++        return pd.read_sql("""
++            SELECT code, name, discipline, section, plan_status,
++                   due_date, due_comment, updated_at, updated_by
++            FROM plan_kits
++            ORDER BY code
++        """, conn)
++
++
++def load_plan_drawings():
++    """Все позиции чертежей плана (без кэша)."""
++    import pandas as pd
++
++    with get_conn() as conn:
++        return pd.read_sql("""
++            SELECT id, kit_code, title, discipline, section, qty,
++                   planned_date, source, source_file,
++                   uploaded_at, uploaded_by
++            FROM plan_drawings
++            ORDER BY kit_code, id
++        """, conn)
++
++
++def clear_plan() -> None:
++    """Полностью очищает план выдачи (комплекты + чертежи)."""
++    with get_conn() as conn:
++        conn.execute("DELETE FROM plan_drawings")
++        conn.execute("DELETE FROM plan_kits")
+\ No newline at end of file
+diff --git a/vitro/ui/plan.py b/vitro/ui/plan.py
+new file mode 100644
+index 0000000..6cd8d71
+--- /dev/null
++++ b/vitro/ui/plan.py
+@@ -0,0 +1,871 @@
++# vitro/ui/plan.py
++"""
++📅 План выдачи комплектов — планирование выдачи РД Заказчику.
++
++Формирует план выдачи ВСЕХ комплектов (загруженных в Витро и планируемых
++к загрузке) на основании вводных данных:
++  - «Ведомость основных комплектов» (Excel) — шифр, наименование, статус,
++    срок готовности.
++  - «Ведомости чертежей каждого комплекта» (Excel) — наименование чертежа,
++    количество, плановая дата.
++
++Структура вкладки (сверху вниз):
++  0. 📥 Вводные данные — импорт ведомостей Excel + шаблоны (свёрнут).
++  1. Общая таблица: шифры, названия всех комплектов, общие статусы,
++     срок готовности (редактируется прямо в таблице).
++  2. Фильтры — единый стандарт (как в «Сводке по проекту»).
++  3. Бублики: «Комплектов всего/план» и «Листов всего/план».
++  4. Детальная таблица (плашка выгрузки в Excel): дисциплина / раздел /
++     комплект(ы) / наименование / количество чертежей (план) —
++     с фильтром по датам (периоду).
++
++Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
++"""
++
++from datetime import date, datetime
++
++import pandas as pd
++import plotly.express as px
++import streamlit as st
++
++from vitro.sqlite_db import (
++    get_conn,
++    load_plan_kits,
++    load_plan_drawings,
++    upsert_plan_kits,
++    replace_plan_drawings_for_kits,
++    update_plan_due_dates,
++    clear_plan,
++    log_event,
++)
++from vitro.ui._auth import ensure_user
++from vitro.ui._filters import (
++    _extract_2nd_block,
++    _extract_4th_block,
++    load_kit_options as _load_kit_options,
++    render_standard_filters,
++)
++from vitro.plan_xlsx import (
++    MIME_XLSX,
++    build_drawings_template,
++    build_kits_template,
++    build_plan_export,
++    parse_drawings_workbook,
++    parse_kits_workbook,
++)
++
++# ---------------------------------------------------------------------------
++#  Константы
++# ---------------------------------------------------------------------------
++KIT_STATUS_OPTIONS = [
++    "Загружен в Витро",
++    "Загружается (частично)",
++    "План (не загружен)",
++    "Только в Витро",
++]
++
++KIT_STATUS_COLORS = {
++    "Загружен в Витро":        "#2ca02c",
++    "Загружается (частично)":  "#ffdd57",
++    "План (не загружен)":      "#9467bd",
++    "Только в Витро":          "#1f77b4",
++}
++
++OVERVIEW_COLUMNS = [
++    "Шифр комплекта", "Наименование комплекта", "Дисциплина", "Раздел",
++    "Общий статус", "Листов в Витро", "Листов (план)",
++    "Срок готовности", "Статус (ведомость)", "Обновлён",
++]
++
++DETAIL_COLUMNS = [
++    "Дисциплина", "Раздел", "Комплект(ы)", "Наименование",
++    "Кол-во чертежей (план)", "Плановая дата", "Статус комплекта",
++]
++
++
++# ---------------------------------------------------------------------------
++#  Данные Витро
++# ---------------------------------------------------------------------------
++@st.cache_data(ttl=600, show_spinner=False)
++def _vitro_sheet_counts() -> dict[str, int]:
++    """{шифр комплекта: количество листов в Витро}."""
++    with get_conn() as conn:
++        rows = conn.execute("""
++            SELECT complex, COUNT(*) AS n
++            FROM documents
++            WHERE complex IS NOT NULL
++            GROUP BY complex
++        """).fetchall()
++    return {r["complex"]: int(r["n"]) for r in rows if r["complex"]}
++
++
++@st.cache_data(ttl=600, show_spinner=False)
++def _vitro_kit_meta() -> dict[str, dict]:
++    """{шифр: {name, discipline, section}} — справочник комплектов Витро."""
++    meta: dict[str, dict] = {}
++    with get_conn() as conn:
++        for r in conn.execute(
++            "SELECT code, name, discipline FROM complexes"
++        ).fetchall():
++            meta[r["code"]] = {
++                "name": r["name"] or "",
++                "discipline": r["discipline"] or "",
++                "section": "",
++            }
++        for r in conn.execute("""
++            SELECT complex, discipline, section
++            FROM documents WHERE complex IS NOT NULL
++        """).fetchall():
++            code = r["complex"]
++            if code not in meta:
++                meta[code] = {
++                    "name": "",
++                    "discipline": r["discipline"] or "",
++                    "section": r["section"] or "",
++                }
++            else:
++                if not meta[code]["discipline"]:
++                    meta[code]["discipline"] = r["discipline"] or ""
++                if not meta[code]["section"]:
++                    meta[code]["section"] = r["section"] or ""
++    return meta
++
++
++# ---------------------------------------------------------------------------
++#  Общая таблица
++# ---------------------------------------------------------------------------
++def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
++    """
++    Одна строка = один комплект: план (ведомости) + Витро.
++    Общий статус вычисляется: Загружен в Витро / Загружается (частично) /
++    План (не загружен) / Только в Витро.
++    """
++    plan = load_plan_kits()
++    drawings = load_plan_drawings()
++    vitro_counts = _vitro_sheet_counts()
++    plan_qty = {}
++    if not drawings.empty:
++        plan_qty = drawings.groupby("kit_code")["qty"].sum().to_dict()
++
++    rows = []
++    if not plan.empty:
++        for _, r in plan.iterrows():
++            code = r["code"]
++            in_vitro = code in vitro_counts
++            sheets_vitro = vitro_counts.get(code, 0)
++            sheets_plan = int(plan_qty.get(code, 0))
++            if in_vitro and sheets_plan > 0 and sheets_vitro < sheets_plan:
++                status = "Загружается (частично)"
++            elif in_vitro:
++                status = "Загружен в Витро"
++            else:
++                status = "План (не загружен)"
++            rows.append({
++                "code": code,
++                "name": r["name"] or "",
++                "discipline": r["discipline"] or "",
++                "section": r["section"] or "",
++                "plan_status": r["plan_status"] or "",
++                "due_date": r["due_date"] or None,
++                "sheets_vitro": sheets_vitro,
++                "sheets_plan": sheets_plan,
++                "status": status,
++                "in_vitro": in_vitro,
++                "updated_at": r["updated_at"] or "",
++                "updated_by": r["updated_by"] or "",
++            })
++
++    if include_vitro_only:
++        meta = _vitro_kit_meta()
++        for code in sorted(vitro_counts):
++            if code in set(r["code"] for r in rows):
++                continue
++            info = meta.get(code, {})
++            rows.append({
++                "code": code,
++                "name": info.get("name", ""),
++                "discipline": info.get("discipline", ""),
++                "section": info.get("section", ""),
++                "plan_status": "",
++                "due_date": None,
++                "sheets_vitro": vitro_counts[code],
++                "sheets_plan": 0,
++                "status": "Только в Витро",
++                "in_vitro": True,
++                "updated_at": "",
++                "updated_by": "",
++            })
++
++    if not rows:
++        return pd.DataFrame(columns=OVERVIEW_COLUMNS)
++
++    df = pd.DataFrame(rows).sort_values("code").reset_index(drop=True)
++    return df
++
++
++def _overview_to_display(df: pd.DataFrame) -> pd.DataFrame:
++    """Внутренний DataFrame → вид таблицы (русские колонки).
++    Срок готовности — тип date (для редактирования DateColumn)."""
++    due = pd.to_datetime(df["due_date"], format="%Y-%m-%d",
++                         errors="coerce").dt.date
++    due = due.where(pd.notna(due), None)
++    out = pd.DataFrame({
++        "Шифр комплекта": df["code"],
++        "Наименование комплекта": df["name"],
++        "Дисциплина": df["discipline"],
++        "Раздел": df["section"],
++        "Общий статус": df["status"],
++        "Листов в Витро": df["sheets_vitro"].astype(int),
++        "Листов (план)": df["sheets_plan"].astype(int),
++        "Срок готовности": due,
++        "Статус (ведомость)": df["plan_status"],
++        "Обновлён": df["updated_at"],
++    })
++    return out
++
++
++def _save_due_dates(display_before: pd.DataFrame,
++                    display_after: pd.DataFrame) -> int:
++    """Разница сроков готовности → UPDATE в БД. Возвращает число строк
++    (или -1, если требуется имя пользователя)."""
++    changes: dict[str, str] = {}
++    for i in range(len(display_before)):
++        old = display_before.iloc[i]["Срок готовности"]
++        new = display_after.iloc[i]["Срок готовности"]
++        if old != new:
++            code = display_after.iloc[i]["Шифр комплекта"]
++            if new is None or pd.isna(new):
++                changes[code] = None
++            else:
++                changes[code] = new.isoformat()
++    if not changes:
++        return 0
++    user = st.session_state.get("user", "")
++    if not user or user == "инженер":
++        return -1  # требуется имя пользователя
++    return update_plan_due_dates(changes, user)
++
++
++def _render_overview_table() -> None:
++    """Секция 1. Общая таблица комплектов с редактируемым сроком."""
++    st.markdown("##### 📋 Общая таблица комплектов")
++
++    include_vitro_only = st.checkbox(
++        "Включить комплекты, загруженные в Витро, но отсутствующие "
++        "в ведомостях",
++        value=True, key="plan_include_vitro_only",
++        help="«Только в Витро» — комплекты есть в базе Витро, но их нет "
++             "в загруженных ведомостях. Срок готовности для них можно "
++             "назначить здесь.",
++    )
++
++    overview = _build_overview(include_vitro_only)
++
++    if overview.empty:
++        st.info(
++            "План пока пуст. Разверните блок «📥 Вводные данные» и "
++            "загрузите ведомости Excel (шаблоны — в том же блоке)."
++        )
++        return
++
++    display_before = _overview_to_display(overview)
++
++    edited = st.data_editor(
++        display_before,
++        use_container_width=True,
++        hide_index=True,
++        num_rows="fixed",
++        height=min(max(len(display_before) * 42 + 40, 300), 700),
++        column_config={
++            "Шифр комплекта": st.column_config.TextColumn(width="medium"),
++            "Наименование комплекта": st.column_config.TextColumn(
++                width="large"),
++            "Дисциплина": st.column_config.TextColumn(width="small"),
++            "Раздел": st.column_config.TextColumn(width="small"),
++            "Общий статус": st.column_config.TextColumn(width="small"),
++            "Листов в Витро": st.column_config.NumberColumn(width="small"),
++            "Листов (план)": st.column_config.NumberColumn(width="small"),
++            "Срок готовности": st.column_config.DateColumn(
++                "Срок готовности",
++                format="DD.MM.YYYY",
++                width="small",
++                help="Редактируется прямо в таблице — изменения сохраняются "
++                     "автоматически.",
++            ),
++            "Статус (ведомость)": st.column_config.TextColumn(width="small"),
++            "Обновлён": st.column_config.TextColumn(width="small"),
++        },
++        disabled=[
++            "Шифр комплекта", "Наименование комплекта", "Дисциплина",
++            "Раздел", "Общий статус", "Листов в Витро", "Листов (план)",
++            "Статус (ведомость)", "Обновлён",
++        ],
++        key="plan_overview_editor",
++    )
++
++    n = _save_due_dates(display_before, edited)
++    if n > 0:
++        st.toast(f"Срок готовности обновлён: {n} компл.")
++        st.rerun()
++    elif n == -1:
++        st.warning(
++            "✏️ Изменены сроки готовности. Введите имя, чтобы сохранить: "
++            "нажмите кнопку ниже."
++        )
++        if st.button("💾 Сохранить сроки готовности", type="primary",
++                     key="plan_save_due_btn"):
++            user = ensure_user()
++            if user:
++                changed = _save_due_dates(display_before, edited)
++                if changed > 0:
++                    st.toast(f"Срок готовности сохранён: {changed} компл.")
++                st.rerun()
++
++    st.caption(
++        f"Всего комплектов: **{len(overview)}**. "
++        f"«Общий статус» вычисляется автоматически: наличие комплекта "
++        f"и листов в Витро против плана из ведомостей. "
++        f"«Срок готовности» — редактируемый."
++    )
++
++
++# ---------------------------------------------------------------------------
++#  Фильтры (единый стандарт + статус комплекта)
++# ---------------------------------------------------------------------------
++def _plan_kit_options_fn(disc, sect, block_codes) -> dict[str, str]:
++    """
++    Комплекты для каскада: справочник Витро + комплекты из плана
++    (их ещё нет в Витро, но они есть в ведомостях).
++    """
++    base = _load_kit_options(disc, sect, block_codes)
++    plan = load_plan_kits()
++    if plan.empty:
++        return base
++    for _, r in plan.iterrows():
++        code = r["code"]
++        if disc and (r["discipline"] or "") not in disc:
++            continue
++        if sect and (r["section"] or "") not in sect:
++            continue
++        if block_codes and _extract_4th_block(code) not in block_codes:
++            continue
++        if code not in base:
++            base[code] = f"{code} — {r['name']}" if r["name"] else code
++    return dict(sorted(base.items()))
++
++
++def _render_filters() -> dict:
++    """
++    Единый стандарт фильтров (как в Сводке) + фильтр «Статус комплекта»
++    и «Только с датами» в 3-м ряду.
++    """
++    def _plan_extra_row():
++        c1, c2 = st.columns(2)
++        with c1:
++            kit_status = st.multiselect(
++                "Статус комплекта",
++                options=KIT_STATUS_OPTIONS,
++                placeholder="Все",
++                key="plan_kit_status",
++                help="«План (не загружен)» — комплект ещё не загружен "
++                     "в Витро. «Только в Витро» — нет в ведомостях.",
++            )
++        with c2:
++            only_dated = st.checkbox(
++                "Только позиции со сроками",
++                value=False,
++                key="plan_only_dated",
++                help="Скрыть позиции без срока готовности и без плановой даты.",
++            )
++        return {
++            "kit_status": tuple(kit_status),
++            "only_dated": bool(only_dated),
++        }
++
++    return render_standard_filters(
++        key_prefix="plan_",
++        expander_label="Фильтры",
++        expanded=True,
++        show_remark_status=False,
++        show_sheet_status=False,
++        kit_options_fn=_plan_kit_options_fn,
++        extra_row=_plan_extra_row,
++    )
++
++
++def _apply_overview_filters(overview: pd.DataFrame, flt: dict) -> pd.DataFrame:
++    """Стандартные фильтры + статус комплекта → к общей таблице."""
++    if overview.empty:
++        return overview
++    out = overview
++    if flt["disc"]:
++        out = out[out["discipline"].isin(flt["disc"])]
++    if flt["section"]:
++        out = out[out["section"].isin(flt["section"])]
++    if flt["kits"]:
++        out = out[out["code"].isin(flt["kits"])]
++    if flt["block_codes"]:
++        blocks = out["code"].apply(_extract_4th_block)
++        out = out[blocks.isin(flt["block_codes"])]
++    if flt["marka"]:
++        m = flt["marka"].strip().upper()
++        if m:
++            out = out[out["code"].apply(_extract_2nd_block) == m]
++    kit_status = flt["extra"].get("kit_status", ())
++    if kit_status:
++        out = out[out["status"].isin(kit_status)]
++    return out
++
++
++# ---------------------------------------------------------------------------
++#  Бублики
++# ---------------------------------------------------------------------------
++def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
++           key: str, center_total: str) -> None:
++    """Бублик в стиле Сводки: без легенды, проценты внутри."""
++    if fig_data.empty or int(fig_data[values_col].sum()) == 0:
++        st.caption("Нет данных для диаграммы.")
++        return
++    fig = px.pie(
++        fig_data,
++        names=names_col,
++        values=values_col,
++        hole=0.45,
++        color=names_col,
++        color_discrete_map=KIT_STATUS_COLORS,
++    )
++    fig.update_traces(
++        textposition="inside",
++        textinfo="percent",
++        textfont_size=11,
++    )
++    fig.update_layout(
++        showlegend=True,
++        legend=dict(orientation="h", yanchor="bottom", y=-0.15,
++                    xanchor="center", x=0.5, font=dict(size=11)),
++        margin=dict(l=5, r=5, t=5, b=5),
++        height=220,
++        annotations=[dict(
++            text=center_total,
++            showarrow=False,
++            font=dict(size=16, color="#1F4E78"),
++            x=0.5, y=0.5,
++        )],
++    )
++    st.plotly_chart(fig, use_container_width=True, key=key)
++
++
++def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
++    """Секция 3. Бублики «Комплектов всего/план» и «Листов всего/план»."""
++    # В бублики включаем только комплекты плана («Только в Витро» —
++    # вне плана, их объёмы не учитываем).
++    plan_df = overview_filtered[
++        overview_filtered["status"] != "Только в Витро"
++    ] if not overview_filtered.empty else overview_filtered
++
++    st.markdown("##### 🎯 Комплектов и листов: всего / план")
++
++    if plan_df.empty:
++        st.info("Нет комплектов плана по выбранным фильтрам.")
++        return (0, 0)
++
++    n_total = len(plan_df)
++    n_loaded = int(plan_df["in_vitro"].sum())
++    n_plan = n_total - n_loaded
++
++    kits_data = pd.DataFrame([
++        {"Группа": "Загружено в Витро", "Количество": n_loaded},
++        {"Группа": "План к загрузке", "Количество": n_plan},
++    ])
++    kits_data = kits_data[kits_data["Количество"] > 0]
++
++    sheets_loaded = int(plan_df["sheets_vitro"].sum())
++    sheets_remaining = int(
++        (plan_df["sheets_plan"] - plan_df["sheets_vitro"])
++        .clip(lower=0).sum()
++    )
++    sheets_data = pd.DataFrame([
++        {"Группа": "Загружено в Витро", "Количество": sheets_loaded},
++        {"Группа": "План к загрузке", "Количество": sheets_remaining},
++    ])
++    sheets_data = sheets_data[sheets_data["Количество"] > 0]
++
++    col1, col2 = st.columns(2)
++    with col1:
++        st.caption(
++            f"Комплектов всего: **{n_total}** · "
++            f"загружено **{n_loaded}** · план **{n_plan}**"
++        )
++        _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
++               center_total=f"{n_total}")
++    with col2:
++        st.caption(
++            f"Листов всего (план): "
++            f"**{sheets_loaded + sheets_remaining}** · "
++            f"загружено **{sheets_loaded}** · план **{sheets_remaining}**"
++        )
++        _donut(sheets_data, "Группа", "Количество", "plan_pie_sheets",
++               center_total=f"{sheets_loaded + sheets_remaining}")
++
++    st.caption(
++        "Листов всего = листов в Витро + остаток плана "
++        "(плановое количество ведомостей минус уже загруженное)."
++    )
++    return (n_total, sheets_loaded + sheets_remaining)
++
++
++# ---------------------------------------------------------------------------
++#  Детальная таблица
++# ---------------------------------------------------------------------------
++def _build_detail(overview_filtered: pd.DataFrame,
++                  flt: dict,
++                  date_from, date_to) -> pd.DataFrame:
++    """
++    Детальные строки чертежей (план) по результату фильтрации
++    и выбранному периоду. Дата позиции = плановая дата чертежа,
++    а если её нет — срок готовности комплекта.
++    """
++    drawings = load_plan_drawings()
++    if drawings.empty:
++        return pd.DataFrame(columns=DETAIL_COLUMNS)
++
++    overview = overview_filtered
++    if overview.empty:
++        return pd.DataFrame(columns=DETAIL_COLUMNS)
++
++    # Допускаем чертежи и «Только в Витро» комплектов (план = фактические
++    # листы Витро в этом случае не из ведомостей, а из documents —
++    # но ведомости на них нет, поэтому строк чертежей у них нет).
++    df = drawings.merge(
++        overview[["code", "status", "due_date"]],
++        left_on="kit_code", right_on="code", how="inner",
++    )
++    df = df.rename(columns={"kit_code": "Комплект(ы)"})
++    df = df.drop(columns=["code"])
++
++    # ---- Стандартные фильтры ----
++    if flt["disc"]:
++        df = df[df["discipline"].isin(flt["disc"])]
++    if flt["section"]:
++        df = df[df["section"].isin(flt["section"])]
++    if flt["kits"]:
++        df = df[df["Комплект(ы)"].isin(flt["kits"])]
++    if flt["block_codes"]:
++        blocks = df["Комплект(ы)"].apply(_extract_4th_block)
++        df = df[blocks.isin(flt["block_codes"])]
++    if flt["marka"]:
++        m = flt["marka"].strip().upper()
++        if m:
++            df = df[df["Комплект(ы)"].apply(_extract_2nd_block) == m]
++    kit_status = flt["extra"].get("kit_status", ())
++    if kit_status:
++        df = df[df["status"].isin(kit_status)]
++
++    # ---- Дата позиции: плановая дата чертежа или срок комплекта ----
++    df["_date"] = df["planned_date"].where(
++        df["planned_date"].notna() & (df["planned_date"] != ""),
++        df["due_date"],
++    )
++
++    only_dated = flt["extra"].get("only_dated", False)
++    if only_dated:
++        df = df[df["_date"].notna()]
++
++    # ---- Период ----
++    if date_from or date_to:
++        df = df[df["_date"].notna()]
++        iso = df["_date"].astype(str).str.slice(0, 10)
++        if date_from:
++            df = df[iso >= date_from.isoformat()]
++        if date_to:
++            df = df[iso <= date_to.isoformat()]
++
++    if df.empty:
++        return pd.DataFrame(columns=DETAIL_COLUMNS)
++
++    out = pd.DataFrame({
++        "Дисциплина": df["discipline"].fillna(""),
++        "Раздел": df["section"].fillna(""),
++        "Комплект(ы)": df["Комплект(ы)"],
++        "Наименование": df["title"].fillna(""),
++        "Кол-во чертежей (план)": df["qty"].astype(int),
++        "Плановая дата": df["_date"],
++        "Статус комплекта": df["status"],
++    })
++    out = out.sort_values(
++        ["Дисциплина", "Раздел", "Комплект(ы)", "Наименование"],
++    ).reset_index(drop=True)
++    return out
++
++
++def _render_detail(overview_filtered: pd.DataFrame, flt: dict) -> None:
++    """Секция 4. Детальная таблица + период + плашка выгрузки в Excel."""
++    st.markdown("##### 🗓 Детальный план по чертежам")
++
++    c1, c2, c3 = st.columns([1, 1, 2])
++    with c1:
++        date_from = st.date_input(
++            "Период: с",
++            value=None,
++            min_value=date(2020, 1, 1),
++            max_value=date(2100, 12, 31),
++            key="plan_date_from",
++            help="Фильтр по плановой дате чертежа (или сроку готовности "
++                 "комплекта, если у чертежа даты нет).",
++        )
++    with c2:
++        date_to = st.date_input(
++            "по",
++            value=None,
++            min_value=date(2020, 1, 1),
++            max_value=date(2100, 12, 31),
++            key="plan_date_to",
++        )
++    with c3:
++        st.caption(
++            "Пустые даты — показываются все позиции. Выгрузка в Excel "
++            "делает тот же отбор, что и таблица."
++        )
++
++    detail = _build_detail(overview_filtered, flt, date_from, date_to)
++
++    if date_from or date_to:
++        period_label = (
++            f"{date_from.strftime('%d.%m.%Y') if date_from else '…'} — "
++            f"{date_to.strftime('%d.%m.%Y') if date_to else '…'}"
++        )
++    else:
++        period_label = "все даты"
++
++    # ---- Плашка выгрузки в Excel ----
++    export_bytes = build_plan_export(
++        overview_filtered, detail, period_label=period_label)
++    st.download_button(
++        "📥 Выгрузить в Excel (комплекты + чертежи выбранного периода)",
++        data=export_bytes,
++        file_name=f"План_выдачи_{datetime.now():%Y%m%d_%H%M}.xlsx",
++        mime=MIME_XLSX,
++        use_container_width=False,
++        key="plan_export_excel",
++    )
++
++    if detail.empty:
++        st.info(
++            "Нет позиций чертежей по выбранным фильтрам/периоду. "
++            "Загрузите ведомости чертежей в блоке «📥 Вводные данные»."
++        )
++        return
++
++    st.caption(
++        f"Строк: **{len(detail)}** · позиций: "
++        f"**{int(detail['Кол-во чертежей (план)'].sum())}** · "
++        f"период: **{period_label}**"
++    )
++
++    st.dataframe(
++        detail,
++        use_container_width=True,
++        hide_index=True,
++        height=min(max(len(detail) * 36 + 40, 300), 700),
++        column_config={
++            "Дисциплина": st.column_config.TextColumn(width="small"),
++            "Раздел": st.column_config.TextColumn(width="small"),
++            "Комплект(ы)": st.column_config.TextColumn(width="medium"),
++            "Наименование": st.column_config.TextColumn(width="large"),
++            "Кол-во чертежей (план)": st.column_config.NumberColumn(
++                width="small"),
++            "Плановая дата": st.column_config.DateColumn(
++                format="DD.MM.YYYY", width="small"),
++            "Статус комплекта": st.column_config.TextColumn(width="small"),
++        },
++    )
++
++
++# ---------------------------------------------------------------------------
++#  Секция 0. Импорт ведомостей
++# ---------------------------------------------------------------------------
++def _render_import_block() -> None:
++    with st.expander("📥 Вводные данные: ведомости (Excel)", expanded=False):
++        st.caption(
++            "Загрузите **Ведомость основных комплектов** и **ведомости "
++            "чертежей** в формате Excel. Колонки распознаются по названиям "
++            "(«Шифр комплекта», «Наименование», «Кол-во» и т. п.) — "
++            "порядок и лишние колонки не мешают. Повторная загрузка "
++            "ведомости комплектов обновляет шифры; повторная загрузка "
++            "ведомости чертежей **заменяет** чертежи указанных в ней "
++            "комплектов."
++        )
++
++        c1, c2 = st.columns(2)
++
++        with c1:
++            up_kits = st.file_uploader(
++                "Ведомость основных комплектов (Excel)",
++                type=["xlsx", "xlsm", "xltx"],
++                accept_multiple_files=True,
++                key="plan_up_kits",
++            )
++            st.download_button(
++                "📋 Шаблон: ведомость комплектов",
++                data=build_kits_template(),
++                file_name="Шаблон_ведомость_комплектов.xlsx",
++                mime=MIME_XLSX,
++                use_container_width=True,
++                key="plan_tpl_kits",
++            )
++
++        with c2:
++            up_drawings = st.file_uploader(
++                "Ведомости чертежей комплектов (Excel)",
++                type=["xlsx", "xlsm", "xltx"],
++                accept_multiple_files=True,
++                key="plan_up_drawings",
++            )
++            st.download_button(
++                "📋 Шаблон: ведомость чертежей",
++                data=build_drawings_template(),
++                file_name="Шаблон_ведомость_чертежей.xlsx",
++                mime=MIME_XLSX,
++                use_container_width=True,
++                key="plan_tpl_drawings",
++            )
++            default_kit = st.text_input(
++                "Шифр комплекта (если в файлах нет колонки «Шифр»)",
++                placeholder="например: АТ-РД-КЖ1-1-00",
++                key="plan_default_kit",
++                help="Если ведомость чертежей сделана для одного комплекта "
++                     "без колонки шифра — укажите его здесь. Можно вводить "
++                     "несколько через запятую (лист = шифр по порядку).",
++            )
++
++        # ---- Разбор ведомости комплектов ----
++        kits_rows: list[dict] = []
++        kits_warnings: list[str] = []
++        if up_kits:
++            for f in up_kits:
++                r, w = parse_kits_workbook(f.getvalue(), f.name)
++                kits_rows += r
++                kits_warnings += w
++            if kits_rows:
++                st.markdown(
++                    f"**Ведомость комплектов:** распознано строк — "
++                    f"**{len(kits_rows)}**")
++                st.dataframe(
++                    pd.DataFrame(kits_rows).head(300),
++                    use_container_width=True, hide_index=True, height=200)
++                if st.button("💾 Сохранить комплекты в план",
++                             type="primary", key="plan_save_kits"):
++                    user = ensure_user()
++                    if user:
++                        n = upsert_plan_kits(kits_rows, user)
++                        st.success(f"Комплекты сохранены: {n}")
++                        log_event("plan_import",
++                                  f"Ведомость комплектов: {n} строк "
++                                  f"(файлов: {len(up_kits)})", rows=n)
++                        st.rerun()
++            else:
++                st.info("Строки комплектов не распознаны.")
++
++        # ---- Разбор ведомостей чертежей ----
++        drawings_rows: list[dict] = []
++        drawings_warnings: list[str] = []
++        if up_drawings:
++            # Поддержка «один файл = один комплект»: если файлов несколько
++            # и колонки шифра нет, применяется шифр по порядку файлов.
++            default_codes = [c.strip().upper() for c in
++                             (default_kit or "").split(",") if c.strip()]
++            for idx, f in enumerate(up_drawings):
++                dk = default_codes[idx] if idx < len(default_codes) else \
++                    (default_codes[0] if len(default_codes) == 1 else "")
++                r, w = parse_drawings_workbook(f.getvalue(), f.name, dk)
++                drawings_rows += r
++                drawings_warnings += w
++            if drawings_rows:
++                st.markdown(
++                    f"**Ведомости чертежей:** распознано позиций — "
++                    f"**{len(drawings_rows)}**, суммарно чертежей — "
++                    f"**{sum(int(r['qty']) for r in drawings_rows)}**")
++                st.dataframe(
++                    pd.DataFrame(drawings_rows).head(300),
++                    use_container_width=True, hide_index=True, height=200)
++                if st.button("💾 Сохранить чертежи в план",
++                             type="primary", key="plan_save_drawings"):
++                    user = ensure_user()
++                    if user:
++                        n = replace_plan_drawings_for_kits(drawings_rows, user)
++                        st.success(
++                            f"Чертежи сохранены: {n} позиций "
++                            f"(комплектов затронуто: "
++                            f"{len({r['kit_code'] for r in drawings_rows})})")
++                        log_event("plan_import",
++                                  f"Ведомости чертежей: {n} позиций "
++                                  f"(файлов: {len(up_drawings)})", rows=n)
++                        st.rerun()
++            else:
++                st.info("Строки чертежей не распознаны.")
++
++        # ---- Предупреждения разбора ----
++        all_warnings = kits_warnings + drawings_warnings
++        if all_warnings:
++            with st.expander(
++                    f"⚠️ Замечания по файлам ({len(all_warnings)})",
++                    expanded=False):
++                for w in all_warnings[:50]:
++                    st.write(f"- {w}")
++
++        # ---- Опасная зона ----
++        st.divider()
++        confirm = st.text_input(
++            "Очистить план целиком: введите DELETE",
++            key="plan_confirm_clear",
++            help="Удалит все комплекты и чертежи плана. Данные Витро "
++                 "не затрагиваются.",
++        )
++        if st.button("🗑 Очистить план", key="plan_clear_btn",
++                     disabled=confirm != "DELETE"):
++            user = ensure_user()
++            if user:
++                clear_plan()
++                log_event("plan_clear",
++                          f"План выдачи очищен. Пользователь: {user}")
++                st.success("План очищен.")
++                st.rerun()
++
++
++# ===========================================================================
++#  Точка входа
++# ===========================================================================
++def render():
++    st.header("📅 План выдачи комплектов")
++    st.caption(
++        "План выдачи всех комплектов РД: загруженных в Витро и "
++        "планируемых к загрузке — на основании ведомостей Excel. "
++        "Данные плана общие для всех пользователей приложения."
++    )
++
++    # ---- 0. Вводные данные ----
++    _render_import_block()
++
++    st.divider()
++
++    # ---- 1. Общая таблица ----
++    _render_overview_table()
++
++    st.divider()
++
++    # ---- 2. Фильтры (единый стандарт) ----
++    flt = _render_filters()
++
++    overview_all = _build_overview(
++        st.session_state.get("plan_include_vitro_only", True))
++    overview_filtered = _apply_overview_filters(overview_all, flt)
++
++    st.divider()
++
++    # ---- 3. Бублики ----
++    _render_donuts(overview_filtered)
++
++    st.divider()
++
++    # ---- 4. Детальная таблица + период + выгрузка ----
++    _render_detail(overview_filtered, flt)

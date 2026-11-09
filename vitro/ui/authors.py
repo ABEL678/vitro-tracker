@@ -1162,6 +1162,13 @@ def _render_analytics_tab():
     df_all = _filter_by_hierarchy(df_all, disc_t, sect_t, kit_t,
                                    sheet_groups_t, remark_statuses_t,
                                    marka_t, block_codes)
+    # Пустая база → DataFrame без колонок; обращение к "holder" падало
+    if df_all.empty:
+        _render_kpi(df_all, df_all)
+        df = _load_authors(disc_t, sect_t, kit_t, sheet_groups_t,
+                           remark_statuses_t, marka_t, block_codes)
+        st.info("Нет данных по авторам с учётом фильтров.")
+        return
     df_ours = df_all[df_all["holder"] == "ours"]
 
     _render_kpi(df_all, df_ours)

@@ -148,10 +148,11 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_plan_kits_disc ON plan_kits(discipline);
 
-        -- Ведомости чертежей: одна строка = один чертёж (позиция).
+        -- Ведомости чертежей: одна строка = один лист (позиция).
         CREATE TABLE IF NOT EXISTS plan_drawings (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             kit_code     TEXT NOT NULL,      -- шифр комплекта (FK → plan_kits.code)
+            sheet_no     TEXT,               -- номер листа («10.01», «СО»…)
             title        TEXT,               -- наименование чертежа
             discipline   TEXT,
             section      TEXT,
@@ -183,6 +184,12 @@ def init_db() -> None:
         ]:
             if col not in doc_cols:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {ddl}")
+
+        # Мягкая миграция plan_drawings — колонка «номер листа»
+        # (добавлена в v1.4.1 для реальных регистров «Комплекты чертежей»)
+        dr_cols = {r["name"] for r in conn.execute("PRAGMA table_info(plan_drawings)")}
+        if "sheet_no" not in dr_cols:
+            conn.execute("ALTER TABLE plan_drawings ADD COLUMN sheet_no TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -547,51 +554,45 @@ def upsert_plan_kits(rows: list[dict], user: str = "") -> int:
     if not rows:
         return 0
     now = msk_now_str()
-    valid_rows = [r for r in rows if str(r.get("code") or "").strip()]
-    print(f"[DEBUG upsert_plan_kits] rows={len(rows)}, valid={len(valid_rows)}, now={now}")
-    try:
-        with get_conn() as conn:
-            for r in rows:
-                code = str(r.get("code") or "").strip()
-                if not code:
-                    print(f"[DEBUG upsert_plan_kits] SKIP empty code: {r}")
-                    continue
-                new_due = r.get("due_date") or None
-                print(f"[DEBUG upsert_plan_kits] INSERT code={code}, name={r.get('name')}, due={new_due}")
-                conn.execute("""
-                    INSERT INTO plan_kits
-                        (code, name, discipline, section, plan_status,
-                         due_date, due_comment, updated_at, updated_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(code) DO UPDATE SET
-                        name        = COALESCE(excluded.name, plan_kits.name),
-                        discipline  = COALESCE(excluded.discipline,
-                                               plan_kits.discipline),
-                        section     = COALESCE(excluded.section,
-                                               plan_kits.section),
-                        plan_status = COALESCE(excluded.plan_status,
-                                               plan_kits.plan_status),
-                        due_date    = COALESCE(excluded.due_date,
-                                               plan_kits.due_date),
-                        due_comment = COALESCE(excluded.due_comment,
-                                               plan_kits.due_comment),
-                        updated_at  = excluded.updated_at,
-                        updated_by  = excluded.updated_by
-                """, (
-                    code,
-                    r.get("name") or "",
-                    r.get("discipline") or "",
-                    r.get("section") or "",
-                    r.get("plan_status") or "",
-                    new_due,
-                    r.get("due_comment") or "",
-                    now,
-                    user,
-                ))
-    except Exception as e:
-        print(f"[DEBUG upsert_plan_kits] EXCEPTION: {e}")
-        raise
-    print(f"[DEBUG upsert_plan_kits] OK, returning {len(rows)}")
+    with get_conn() as conn:
+        for r in rows:
+            code = str(r.get("code") or "").strip()
+            if not code:
+                continue
+            new_due = r.get("due_date") or None
+            conn.execute("""
+                INSERT INTO plan_kits
+                    (code, name, discipline, section, plan_status,
+                     due_date, due_comment, updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    -- Пустая строка в ведомости НЕ затирает ранее
+                    -- сохранённое значение (NULLIF '' → NULL → COALESCE):
+                    name        = COALESCE(NULLIF(excluded.name, ''),
+                                           plan_kits.name, ''),
+                    discipline  = COALESCE(NULLIF(excluded.discipline, ''),
+                                           plan_kits.discipline, ''),
+                    section     = COALESCE(NULLIF(excluded.section, ''),
+                                           plan_kits.section, ''),
+                    plan_status = COALESCE(NULLIF(excluded.plan_status, ''),
+                                           plan_kits.plan_status, ''),
+                    due_date    = COALESCE(excluded.due_date,
+                                           plan_kits.due_date),
+                    due_comment = COALESCE(NULLIF(excluded.due_comment, ''),
+                                           plan_kits.due_comment, ''),
+                    updated_at  = excluded.updated_at,
+                    updated_by  = excluded.updated_by
+            """, (
+                code,
+                r.get("name") or "",
+                r.get("discipline") or "",
+                r.get("section") or "",
+                r.get("plan_status") or "",
+                new_due,
+                r.get("due_comment") or "",
+                now,
+                user,
+            ))
     return len(rows)
 
 
@@ -607,45 +608,37 @@ def replace_plan_drawings_for_kits(rows: list[dict], user: str = "") -> int:
     now = msk_now_str()
     kit_codes = sorted({str(r["kit_code"]).strip() for r in rows
                         if r.get("kit_code")})
-    print(f"[DEBUG replace_plan_drawings] rows={len(rows)}, kit_codes={kit_codes}")
     if not kit_codes:
         return 0
-    try:
-        with get_conn() as conn:
-            # Комплекты, отсутствующие в плане, добавим заглушками,
-            # чтобы сработал внешний ключ и комплект был виден в общей таблице.
-            for code in kit_codes:
-                print(f"[DEBUG replace_plan_drawings] INSERT IGNORE plan_kits code={code}")
-                conn.execute("""
-                    INSERT OR IGNORE INTO plan_kits (code, updated_at, updated_by)
-                    VALUES (?, ?, ?)
-                """, (code, now, user))
-            ph = ",".join("?" * len(kit_codes))
-            print(f"[DEBUG replace_plan_drawings] DELETE plan_drawings WHERE kit_code IN ({ph})")
-            conn.execute(
-                f"DELETE FROM plan_drawings WHERE kit_code IN ({ph})",
-                tuple(kit_codes))
-            print(f"[DEBUG replace_plan_drawings] INSERT INTO plan_drawings {len(rows)} rows")
-            conn.executemany("""
-                INSERT INTO plan_drawings
-                    (kit_code, title, discipline, section, qty,
-                     planned_date, source, source_file, uploaded_at, uploaded_by)
-                VALUES (?, ?, ?, ?, ?, ?, 'excel', ?, ?, ?)
-            """, [(
-                str(r["kit_code"]).strip(),
-                r.get("title") or "",
-                r.get("discipline") or "",
-                r.get("section") or "",
-                int(r.get("qty") or 1),
-                r.get("planned_date"),
-                r.get("source_file") or "",
-                now,
-                user,
-            ) for r in rows])
-    except Exception as e:
-        print(f"[DEBUG replace_plan_drawings] EXCEPTION: {e}")
-        raise
-    print(f"[DEBUG replace_plan_drawings] OK, returning {len(rows)}")
+    with get_conn() as conn:
+        # Комплекты, отсутствующие в плане, добавим заглушками,
+        # чтобы сработал внешний ключ и комплект был виден в общей таблице.
+        for code in kit_codes:
+            conn.execute("""
+                INSERT OR IGNORE INTO plan_kits (code, updated_at, updated_by)
+                VALUES (?, ?, ?)
+            """, (code, now, user))
+        ph = ",".join("?" * len(kit_codes))
+        conn.execute(
+            f"DELETE FROM plan_drawings WHERE kit_code IN ({ph})",
+            tuple(kit_codes))
+        conn.executemany("""
+            INSERT INTO plan_drawings
+                (kit_code, sheet_no, title, discipline, section, qty,
+                 planned_date, source, source_file, uploaded_at, uploaded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'excel', ?, ?, ?)
+        """, [(
+            str(r["kit_code"]).strip(),
+            r.get("sheet_no") or "",
+            r.get("title") or "",
+            r.get("discipline") or "",
+            r.get("section") or "",
+            int(r.get("qty") or 1),
+            r.get("planned_date"),
+            r.get("source_file") or "",
+            now,
+            user,
+        ) for r in rows])
     return len(rows)
 
 
@@ -688,7 +681,7 @@ def load_plan_drawings():
 
     with get_conn() as conn:
         return pd.read_sql("""
-            SELECT id, kit_code, title, discipline, section, qty,
+            SELECT id, kit_code, sheet_no, title, discipline, section, qty,
                    planned_date, source, source_file,
                    uploaded_at, uploaded_by
             FROM plan_drawings

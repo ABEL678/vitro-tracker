@@ -6,8 +6,11 @@
 к загрузке) на основании вводных данных:
   - «Ведомость основных комплектов» (Excel) — шифр, наименование, статус,
     срок готовности.
-  - «Ведомости чертежей каждого комплекта» (Excel) — наименование чертежа,
-    количество, плановая дата.
+  - «Ведомости чертежей каждого комплекта» (Excel) — номер листа,
+    наименование, количество, плановая дата. Поддерживаются как шаблон,
+    так и реальные регистры «Комплекты чертежей» (ШИФР / Тип чертежа /
+    Номер листа / Название листа / Шифр листа, шапки комплектов,
+    приложения без шифра, латинские двойники в шифрах).
 
 Структура вкладки (сверху вниз):
   0. 📥 Вводные данные — импорт ведомостей Excel + шаблоны (свёрнут).
@@ -78,7 +81,7 @@ OVERVIEW_COLUMNS = [
 ]
 
 DETAIL_COLUMNS = [
-    "Дисциплина", "Раздел", "Комплект(ы)", "Наименование",
+    "Дисциплина", "Раздел", "Комплект(ы)", "Номер листа", "Наименование",
     "Кол-во чертежей (план)", "Плановая дата", "Статус комплекта",
 ]
 
@@ -587,13 +590,14 @@ def _build_detail(overview_filtered: pd.DataFrame,
         "Дисциплина": df["discipline"].fillna(""),
         "Раздел": df["section"].fillna(""),
         "Комплект(ы)": df["Комплект(ы)"],
+        "Номер листа": df.get("sheet_no", ""),
         "Наименование": df["title"].fillna(""),
         "Кол-во чертежей (план)": df["qty"].astype(int),
         "Плановая дата": df["_date"],
         "Статус комплекта": df["status"],
     })
     out = out.sort_values(
-        ["Дисциплина", "Раздел", "Комплект(ы)", "Наименование"],
+        ["Дисциплина", "Раздел", "Комплект(ы)", "Номер листа"],
     ).reset_index(drop=True)
     return out
 
@@ -671,6 +675,7 @@ def _render_detail(overview_filtered: pd.DataFrame, flt: dict) -> None:
             "Дисциплина": st.column_config.TextColumn(width="small"),
             "Раздел": st.column_config.TextColumn(width="small"),
             "Комплект(ы)": st.column_config.TextColumn(width="medium"),
+            "Номер листа": st.column_config.TextColumn(width="small"),
             "Наименование": st.column_config.TextColumn(width="large"),
             "Кол-во чертежей (план)": st.column_config.NumberColumn(
                 width="small"),
@@ -689,11 +694,12 @@ def _render_import_block() -> None:
         st.caption(
             "Загрузите **Ведомость основных комплектов** и **ведомости "
             "чертежей** в формате Excel. Колонки распознаются по названиям "
-            "(«Шифр комплекта», «Наименование», «Кол-во» и т. п.) — "
-            "порядок и лишние колонки не мешают. Повторная загрузка "
-            "ведомости комплектов обновляет шифры; повторная загрузка "
-            "ведомости чертежей **заменяет** чертежи указанных в ней "
-            "комплектов."
+            "(«Шифр комплекта», «Номер листа», «Название листа», «Шифр "
+            "листа» и т. п.) — порядок и лишние колонки не мешают; подходят "
+            "и реальные регистры «Комплекты чертежей» с шапками комплектов "
+            "и приложениями (СО/ВР/П). Повторная загрузка ведомости "
+            "комплектов обновляет шифры; повторная загрузка ведомости "
+            "чертежей **заменяет** чертежи указанных в ней комплектов."
         )
 
         c1, c2 = st.columns(2)
@@ -784,6 +790,7 @@ def _render_import_block() -> None:
         # ---- Разбор ведомостей чертежей ----
         drawings_rows: list[dict] = []
         drawings_warnings: list[str] = []
+        drawings_kits: dict[str, str] = {}
         if up_drawings:
             # Поддержка «один файл = один комплект»: если файлов несколько
             # и колонки шифра нет, применяется шифр по порядку файлов.
@@ -792,19 +799,30 @@ def _render_import_block() -> None:
             for idx, f in enumerate(up_drawings):
                 dk = default_codes[idx] if idx < len(default_codes) else \
                     (default_codes[0] if len(default_codes) == 1 else "")
-                r, w = parse_drawings_workbook(f.getvalue(), f.name, dk)
+                r, w, k = parse_drawings_workbook(f.getvalue(), f.name, dk)
                 drawings_rows += r
                 drawings_warnings += w
+                for code, kname in k.items():
+                    # название берём из шапки комплекта; пустое не затираем
+                    if kname and not drawings_kits.get(code):
+                        drawings_kits[code] = kname
+                    drawings_kits.setdefault(code, drawings_kits.get(code, ""))
             if drawings_rows:
+                n_drw = sum(int(r["qty"]) for r in drawings_rows)
                 st.markdown(
-                    f"**Ведомости чертежей:** распознано позиций — "
-                    f"**{len(drawings_rows)}**, суммарно чертежей — "
-                    f"**{sum(int(r['qty']) for r in drawings_rows)}**")
+                    f"**Ведомости чертежей:** распознано листов — "
+                    f"**{len(drawings_rows)}** ({n_drw} чертежей), "
+                    f"комплектов — **{len({r['kit_code'] for r in drawings_rows})}**")
                 df_drw = pd.DataFrame(drawings_rows).head(300)
+                if "qty" in df_drw.columns:
+                    df_drw = df_drw.rename(columns={"qty": "Кол-во"})
+                if "sheet_no" in df_drw.columns:
+                    df_drw = df_drw.rename(columns={"sheet_no": "Номер листа"})
+                if "title" in df_drw.columns:
+                    df_drw = df_drw.rename(columns={"title": "Наименование чертежа"})
                 st.dataframe(
                     df_drw.rename(columns={
                         "kit_code": "Шифр комплекта",
-                        "title": "Наименование чертежа",
                         "planned_date": "Плановая дата",
                         "discipline": "Дисциплина",
                         "section": "Раздел",
@@ -816,11 +834,18 @@ def _render_import_block() -> None:
                     user = ensure_user()
                     if user:
                         try:
+                            # Названия комплектов из шапок регистров —
+                            # в план (пустые существующие поля заполняются)
+                            if drawings_kits:
+                                upsert_plan_kits(
+                                    [{"code": c, "name": n} for c, n
+                                     in drawings_kits.items()], user)
                             n = replace_plan_drawings_for_kits(drawings_rows, user)
                             n_kits = len({r["kit_code"] for r in drawings_rows})
-                            st.success(f"✅ Сохранено чертежей: {n} позиций ({n_kits} компл.)")
+                            st.success(f"✅ Сохранено листов: {n} "
+                                       f"({n_kits} компл.)")
                             log_event("plan_import",
-                                      f"Ведомости чертежей: {n} позиций "
+                                      f"Ведомости чертежей: {n} листов "
                                       f"(файлов: {len(up_drawings)})", rows=n)
                             st.rerun()
                         except Exception as e:
