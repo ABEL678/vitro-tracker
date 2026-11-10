@@ -54,7 +54,12 @@ def _render_db_stats():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Комплектов", stats["complexes"])
-    c2.metric("Листов РД", f"{stats['documents']:,}".replace(",", " "))
+    c2.metric(
+        "Листов РД", f"{stats['sheets']:,}".replace(",", " "),
+        help="Уникальные листы (патч 11): ревизии и повторные выгрузки "
+             "одного листа считаются один раз. "
+             f"Строк (файлов) в documents: {stats['documents']:,}".replace(",", " "),
+    )
     c3.metric("Замечаний", f"{stats['comments']:,}".replace(",", " "))
     c4.metric("С категорией", f"{stats['categorized']:,}".replace(",", " "))
     c5.metric("Снимков истории", stats["history_snapshots"])
@@ -94,7 +99,8 @@ def _run_sync():
 
             st.success(
                 f"✅ Синхронизация завершена\n\n"
-                f"- Листов: **{result['documents']:,}**\n"
+                f"- Файлов (строк documents): "
+                f"**{result['documents']:,}**\n".replace(",", " ") +
                 f"- Замечаний: **{result['comments']:,}**\n"
                 f"- Комплектов: **{result['complexes']:,}**\n"
                 f"- Время: **{result['elapsed']} сек**"

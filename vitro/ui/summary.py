@@ -24,6 +24,7 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
+from vitro.sheets import dedup_documents
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
     _doc_status_group,
@@ -165,12 +166,21 @@ def _filter_documents(df: pd.DataFrame,
 # ---------------------------------------------------------------------------
 @versioned_cache(3600)
 def _load_documents() -> pd.DataFrame:
+    """Листы РД — ПОСЛЕ дедупликации (патч 11).
+
+    Одна строка = один УНИКАЛЬНЫЙ лист (complex, sheet_number):
+    из ревизий/повторных выгрузок остаётся последняя (MAX(status_date)).
+    Строки с пустым sheet_number не склеиваются (fallback по id).
+    Единый стандарт с «Планом выдачи»: ревизии одного листа не удваивают
+    счётчики «Листы РД» и разрезов.
+    """
     with get_conn() as conn:
-        return pd.read_sql("""
+        df = pd.read_sql("""
             SELECT id, leaf, discipline, section, complex,
                    status, revision, name, status_date, sheet_number
             FROM documents
         """, conn)
+    return dedup_documents(df)
 
 
 
@@ -360,6 +370,10 @@ def _render_scale_section(scale: dict,
 # ===========================================================================
 def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     st.markdown("##### Листы РД")
+    st.caption(
+        "Один уникальный лист = одна строка: ревизии и повторные выгрузки "
+        "считаются один раз, берётся последняя ревизия листа."
+    )
 
     if docs_df.empty:
         st.info("Нет данных по листам.")
@@ -387,7 +401,9 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     with col_left:
         _metric(
             st, "Листов всего", total,
-            "Выгрузка из Витро: COUNT(documents).",
+            "Выгрузка из Витро: УНИКАЛЬНЫЕ листы (complex + sheet_number).\n\n"
+            "Несколько ревизий/выгрузок одного листа считаются один лист — "
+            "как в «Плане выдачи». Строки без номера листа считаются по файлам.",
         )
         sheet_dist = _sheet_distribution_from_df(docs_df)
         _pie(sheet_dist, "Статус листа", "Количество", SHEET_COLORS,
@@ -396,15 +412,18 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     with col_mid:
         _metric(
             st, f"{EMOJI['green']} Статус A — утверждён", n_a,
-            "Выгрузка из Витро: COUNT(documents WHERE status='A').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'A'.",
         )
         _metric(
             st, f"{EMOJI['yellow']} Статус B — к сдаче", n_b,
-            "Выгрузка из Витро: COUNT(documents WHERE status='B').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'B'.",
         )
         _metric(
             st, f"{EMOJI['orange']} Статус C — в работе", n_c,
-            "Выгрузка из Витро: COUNT(documents WHERE status='C').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'C'.",
         )
         _metric(
             st, " % готовых (A+B)", f"{pct_ab}%",
@@ -414,7 +433,8 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     with col_right:
         _metric(
             st, f"{EMOJI['white']} Статус И — информационный", n_i,
-            "Выгрузка из Витро: COUNT(documents WHERE status='И').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'И'.",
         )
         _metric(
             st, f"{EMOJI['globe']} На согласовании Заказчика",
@@ -427,8 +447,8 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
         )
         _metric(
             st, f"{EMOJI['black']} Аннулировано", n_annulled,
-            "Выгрузка из Витро: "
-            "COUNT(documents WHERE status='Аннулировано').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия — «Аннулировано».",
         )
 
 
@@ -781,7 +801,8 @@ def _build_summary_rows(group_col: str,
     if docs_df.empty and active_df.empty:
         return pd.DataFrame()
 
-    # --- Листы ---
+    # --- Листы (docs_df уже дедуплицирован в _load_documents, патч 11:
+    #     одна строка = один уникальный лист, статусы последней ревизии) ---
     if not docs_df.empty:
         doc_rows = []
         for grp, sub in docs_df.groupby(group_col, dropna=True):
@@ -885,6 +906,12 @@ def _build_summary_rows(group_col: str,
     elif active_grp.empty:
         result = docs_grp
     else:
+        # Патч 11: выравниваем тип ключа перед merge — groupby pandas
+        # по колонке из одних None даёт float64, а из строк — object,
+        # из-за расхождения типов merge падает с ValueError.
+        for frame in (docs_grp, active_grp):
+            if group_col in frame.columns:
+                frame[group_col] = frame[group_col].fillna("").astype(str)
         result = docs_grp.merge(active_grp, on=group_col, how="outer")
     result = result.fillna(0)
 

@@ -76,13 +76,22 @@ _FULL_CODE_KEYS = ("полный шифр листа", "шифр листа", "�
 _QTY_KEYS = ("кол-во", "количество", "кол во")
 _PLANNED_DATE_KEYS = ("плановая дата", "дата выдачи", "дата")
 
-# Шифр комплекта — строка вида АТ-РД-ОВ1-С-00: 4-5 блоков через дефис.
-# Полный шифр ЛИСТА (АТ-РД-ОВ1-С-00-10.01) имеет 6+ блоков и НЕ должен
-# совпадать, поэтому хвост ограничен двумя блоками.
+# Шифр комплекта — строка вида АТ-РД-ОВ1-С-00. Строгая регулярка (патч 10):
+#   блок 1: организация (2-4 буквы) — «АТ»;
+#   блок 2: документ (1-3 буквы) — «РД»;
+#   блок 3: дисциплина с номером — «АР1», «КЖ2.1», «ОВ10»;
+#   блоки 4-5 (1-2 шт.): марка/блок и индекс — «С-00», «1-08Т», «С-П1»
+#           (1-3 буквоцифры БЕЗ ТОЧЕК — точки бывают только в номерах
+#            листов: «1.1», «10.01», «2.1.0», «П.01»).
+# Полный шифр ЛИСТА (АТ-РД-ОВ1-С-00-10.01) имеет 6 блоков и/или точку
+# в хвосте — НЕ совпадает; строки-разделы («Подземная часть»), итоги
+# («Всего», «ИТОГО»), приложения («СО», «П.01») и даты — тоже.
+# Реальные комплекты проектов (АР/ВК/ОВ, 69 шифров) проходят все.
 # ВНИМАНИЕ: диапазоны указаны отдельно для латиницы [A-Z] и кириллицы [А-ЯЁ] —
 # смешанный диапазон «А-Z» (кириллическая А + латинская Z) невалиден в re.
 _KIT_CODE_PATTERN = re.compile(
-    r"^[A-ZА-ЯЁ]{2,4}-[A-ZА-ЯЁ]{1,3}-[A-ZА-ЯЁ0-9.]+(?:-[A-ZА-ЯЁ0-9.]+){1,2}$"
+    r"^[A-ZА-ЯЁ]{2,4}-[A-ZА-ЯЁ]{1,3}-[A-ZА-ЯЁ0-9.]+"
+    r"(?:-[A-ZА-ЯЁ0-9]{1,3}){1,2}$"
 )
 
 # Латинские двойники кириллических букв (появляются при копировании
@@ -96,6 +105,20 @@ _HOMOGLYPHS = str.maketrans({
 def _is_valid_kit_code(code: str) -> bool:
     """True, если строка похожа на шифр комплекта (АТ-РД-КЖ1-1-00)."""
     return bool(_KIT_CODE_PATTERN.match(code)) if code else False
+
+
+def _kit_code_of(value) -> str:
+    """Шифр комплекта из ячейки: нормализация + СТРОГАЯ валидация.
+
+    Возвращает '' для всего, что не похоже на комплект (патч 10):
+    строки-разделы («Подземная часть»), итоги («Всего», «ИТОГО»),
+    полные шифры листов («АТ-РД-АР1-С-00-1.1»), приложения («СО»,
+    «П.01»), даты, марки. Именно без этой проверки «Ведомость
+    комплектов» порождала фантомные комплекты (632 вместо ~479).
+    Единственная точка входа для обоих парсеров.
+    """
+    code = _norm_complex_code(value)
+    return code if _is_valid_kit_code(code) else ""
 
 
 def _norm_header(value) -> str:
@@ -333,6 +356,11 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
     """
     Разбирает «Ведомость основных комплектов».
 
+    В колонке «Шифр» принимаются ТОЛЬКО строки, похожие на шифр
+    комплекта (АТ-РД-КЖ1-1-00): строки-разделы, итоги, полные шифры
+    листов, приложения и даты отбрасываются со счётчиком в
+    предупреждении (патч 10: фантомные комплекты 632 вместо ~479).
+
     Возвращает (rows, warnings):
       rows — [{'code','name','discipline','section','plan_status',
                'due_date','due_comment'}]
@@ -340,6 +368,7 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
     """
     warnings: list[str] = []
     rows: list[dict] = []
+    skipped_total = 0   # суммарно отброшено строк с мусорным шифром
 
     try:
         wb = openpyxl.load_workbook(
@@ -374,15 +403,26 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
 
         header_idx, cols = found
         sheet_rows = 0
+        skipped = 0            # строки с мусором в колонке шифра (патч 10)
+        skipped_examples: list[str] = []
         for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
             if row is None or all(
                     v is None or str(v).strip() == "" for v in row):
                 if sheet_rows:
                     break  # пустая строка после данных — конец таблицы
                 continue
-            code = _norm_complex_code(
-                row[cols["code"]] if len(row) > cols["code"] else None)
+            raw_code = row[cols["code"]] \
+                if len(row) > cols["code"] else None
+            code = _kit_code_of(raw_code)
             if not code:
+                # Пустая ячейка — пропуск молча; НЕПУСТОЙ мусор
+                # (раздел, «Всего», шифр листа…) — со счётчиком и
+                # примерами в предупреждении (патч 10).
+                if raw_code is not None and str(raw_code).strip():
+                    skipped += 1
+                    if len(skipped_examples) < 3:
+                        skipped_examples.append(
+                            " ".join(str(raw_code).split())[:40])
                 continue
             name = _clean_str(row[cols["name"]]) \
                 if cols.get("name") is not None and \
@@ -408,8 +448,22 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
             warnings.append(
                 f"{filename} · лист «{sheet_name}»: заголовок найден, "
                 f"но строк данных нет.")
+        if skipped:
+            examples = "; ".join(f"«{e}»" for e in skipped_examples)
+            more = " …" if skipped > len(skipped_examples) else ""
+            warnings.append(
+                f"{filename} · лист «{sheet_name}»: отброшено "
+                f"{skipped} строк(и) — значение в колонке шифра не "
+                f"похоже на шифр комплекта (разделы, итоги, шифры "
+                f"листов, приложения): {examples}{more}")
+        skipped_total += skipped
     wb.close()
 
+    if skipped_total:
+        warnings.insert(0,
+            f"{filename}: всего отброшено {skipped_total} строк(и), "
+            f"не похожих на шифры комплектов — это нормально: в план "
+            f"попали только реальные комплекты.")
     if not rows and not warnings:
         warnings.append(f"{filename}: не найдено ни одной строки комплектов.")
     return rows, warnings
@@ -527,8 +581,8 @@ def parse_drawings_workbook(
                 _clean_str(_cell(row, c_kit)).split()) \
                 if c_kit is not None else ""
             code_part, _, name_part = raw_kit.partition(" ")
-            kit_norm = _norm_complex_code(code_part)
-            if kit_norm and _is_valid_kit_code(kit_norm):
+            kit_norm = _kit_code_of(code_part)
+            if kit_norm:
                 if name_part.strip():
                     # шапка комплекта: «АТ-РД-ОВ1-С-00 Система отопления…»
                     current_kit = kit_norm

@@ -16,6 +16,7 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
+from vitro.sheets import dedup_documents, sql_count_sheets
 from vitro.pdf_builder import build_pdf
 from vitro.ui._filters import render_standard_filters
 
@@ -61,7 +62,8 @@ def _load_discipline_summary() -> pd.DataFrame:
     Сводка по дисциплинам:
       - Всего / Закрыто / Аннулировано — по всей базе
       - Активных + ответственные + категории — из _load_all_categorized
-      - Листов — из documents
+      - Листов — УНИКАЛЬНЫЕ листы (патч 11): ревизии одного листа
+        считаются один раз (стандарт «Плана выдачи»)
     """
     active = _load_active_df()
 
@@ -71,7 +73,7 @@ def _load_discipline_summary() -> pd.DataFrame:
             SELECT
                 d.discipline AS discipline,
                 COUNT(DISTINCT d.complex) AS complexes,
-                COUNT(DISTINCT d.id) AS docs_total,
+                {sheets} AS docs_total,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -81,7 +83,7 @@ def _load_discipline_summary() -> pd.DataFrame:
             LEFT JOIN comments c ON c.doc_id = d.id
             WHERE d.discipline IS NOT NULL
             GROUP BY d.discipline
-        """, conn)
+        """.format(sheets=sql_count_sheets("d")), conn)
 
     # ---- Активные по дисциплинам ----
     if not active.empty:
@@ -166,19 +168,30 @@ def _load_discipline_summary() -> pd.DataFrame:
 
 @versioned_cache(3600)
 def _load_complex_summary() -> pd.DataFrame:
-    """Сводка по комплектам."""
+    """Сводка по комплектам.
+
+    Патч 11 — единый стандарт листов:
+      * Листы и статусы A/B/C/И — по УНИКАЛЬНЫМ листам (complex +
+        sheet_number), статус берётся с ПОСЛЕДНЕЙ ревизии листа.
+      * Замечания (Всего/Закрыто/Аннулировано) — по всем замечаниям
+        без дедупликации: замечание, привязанное к старой ревизии,
+        продолжает учитываться.
+    """
     active = _load_active_df()
 
     with get_conn() as conn:
-        base = pd.read_sql("""
+        # ---- Листы: дедуплицируются в pandas (нужен статус последней ревизии)
+        docs = pd.read_sql("""
+            SELECT id, discipline, complex, status, sheet_number, status_date
+            FROM documents
+            WHERE complex IS NOT NULL
+        """, conn)
+
+        # ---- Замечания: считаем по ВСЕМ строкам documents (без дедупликации)
+        remarks = pd.read_sql("""
             SELECT
                 d.discipline AS discipline,
                 d.complex AS complex,
-                COUNT(DISTINCT d.id) AS docs_total,
-                SUM(CASE WHEN UPPER(d.status) = 'A' THEN 1 ELSE 0 END) AS doc_a,
-                SUM(CASE WHEN UPPER(d.status) = 'B' THEN 1 ELSE 0 END) AS doc_b,
-                SUM(CASE WHEN UPPER(d.status) = 'C' THEN 1 ELSE 0 END) AS doc_c,
-                SUM(CASE WHEN d.status = 'И' THEN 1 ELSE 0 END) AS doc_info,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -189,6 +202,31 @@ def _load_complex_summary() -> pd.DataFrame:
             WHERE d.complex IS NOT NULL
             GROUP BY d.discipline, d.complex
         """, conn)
+
+    # Уникальные листы: одна строка = один лист (последняя ревизия)
+    docs = dedup_documents(docs)
+    if docs.empty:
+        base = remarks.iloc[0:0].copy()
+        for c in ("docs_total", "doc_a", "doc_b", "doc_c", "doc_info"):
+            base[c] = 0
+    else:
+        st_u = docs["status"].fillna("").astype(str).str.strip().str.upper()
+        docs = docs.assign(
+            _st=st_u,
+            _info=(st_u == "И").astype(int),
+        )
+        base = (
+            docs.groupby(["discipline", "complex"], dropna=False)
+            .agg(
+                docs_total=("id", "count"),
+                doc_a=("_st", lambda s: int((s == "A").sum())),
+                doc_b=("_st", lambda s: int((s == "B").sum())),
+                doc_c=("_st", lambda s: int((s == "C").sum())),
+                doc_info=("_info", "sum"),
+            )
+            .reset_index()
+        )
+        base["doc_info"] = base["doc_info"].astype(int)
 
     if not active.empty:
         rows = []
@@ -221,7 +259,17 @@ def _load_complex_summary() -> pd.DataFrame:
             "ours", "waiting", "chronic", "closed_doc",
         ])
 
-    df = base.merge(active_cx, on=["discipline", "complex"],
+    # Ключи merge: groupby pandas по колонке из одних None даёт float64,
+    # а SQL/read_sql — object → выравниваем типы перед merge (иначе ValueError).
+    def _norm_cx_keys(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["discipline"] = out["discipline"].fillna("").astype(str)
+        out["complex"] = out["complex"].fillna("").astype(str)
+        return out
+
+    df = _norm_cx_keys(base).merge(
+        _norm_cx_keys(remarks), on=["discipline", "complex"], how="outer")
+    df = df.merge(_norm_cx_keys(active_cx), on=["discipline", "complex"],
                      how="outer").fillna(0)
 
     df["pct_closed"] = df.apply(
@@ -259,7 +307,7 @@ def _load_section_summary() -> pd.DataFrame:
                 d.discipline AS discipline,
                 d.section AS section,
                 COUNT(DISTINCT d.complex) AS complexes,
-                COUNT(DISTINCT d.id) AS docs_total,
+                {sheets} AS docs_total,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -269,7 +317,7 @@ def _load_section_summary() -> pd.DataFrame:
             LEFT JOIN comments c ON c.doc_id = d.id
             WHERE d.section IS NOT NULL AND d.section <> ''
             GROUP BY d.discipline, d.section
-        """, conn)
+        """.format(sheets=sql_count_sheets("d")), conn)
 
     if not active.empty:
         rows = []

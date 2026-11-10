@@ -17,6 +17,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from vitro.sheets import sql_count_sheets
 from vitro.time_utils import msk_now_str
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -517,6 +518,12 @@ def db_stats() -> dict:
     with get_conn() as conn:
         return {
             "documents":         conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+            # Уникальные листы (патч 11): стандарт «Плана выдачи».
+            # Ревизии/повторные выгрузки одного листа считаются один раз.
+            "sheets":            conn.execute(
+                                    f"SELECT {sql_count_sheets('d')} "
+                                    "FROM documents AS d"
+                                 ).fetchone()[0],
             "comments":          conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
             "categorized":       conn.execute(
                                     "SELECT COUNT(*) FROM comments "

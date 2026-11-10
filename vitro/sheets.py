@@ -1,0 +1,137 @@
+# vitro/sheets.py
+"""
+Единый стандарт подсчёта листов РД во всём приложении (PATCH-11).
+
+Проблема: таблица documents содержит по одной строке на каждый ФАЙЛ,
+выгруженный из Витро. Повторные выгрузки и ревизии одного и того же
+листа дают несколько строк, поэтому вкладки считали «файлы», а не
+«листы»: «Сводка по проекту» показывала 52 листа там, где «План выдачи»
+(уже после патча 10) — 44 уникальных листа.
+
+ЕДИНЫЙ СТАНДАРТ (с патча 11): один уникальный лист = одна строка.
+
+  1. Ключ уникальности: (complex, sheet_number), если sheet_number
+     заполнен (тот же ключ, что в «Плане выдачи» с патча 10).
+  2. Строки с ПУСТЫМ sheet_number — самостоятельные листы (fallback
+     по id): один файл = один лист, комплект не может «исчезнуть».
+  3. Из нескольких ревизий листа остаётся ПОСЛЕДНЯЯ: MAX(status_date),
+     при равенстве дат — MAX(id) (последняя выгрузка при синке).
+  4. Замечания (comments) НЕ дедуплицируются: каждое замечание —
+     отдельная сущность со своим ID. Дедупликация применяется только
+     к подсчёту ЛИСТОВ; замечание, привязанное к старой ревизии,
+     продолжает учитываться.
+
+Инструменты модуля:
+  * sheet_key(row)          — ключ уникальности листа для строки.
+  * dedup_document_rows(rows) — список dict'ов → уникальные листы.
+  * dedup_documents(df)     — pandas DataFrame → уникальные листы.
+  * sql_count_sheets(alias) — SQL-выражение COUNT(DISTINCT ...) для
+    подсчёта уникальных листов прямо в SQL-запросе.
+
+Изменения структуры базы НЕ требуются: дедупликация выполняется на
+уровне SQL-выражений и pandas; таблицы/представления не создаются.
+"""
+
+# ---------------------------------------------------------------------------
+#  Нормализация значений
+# ---------------------------------------------------------------------------
+def _s(v) -> str:
+    """None/NaN → '', остальное → str без пробелов по краям."""
+    if v is None:
+        return ""
+    try:
+        import pandas as pd
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip()
+
+
+def _int(v) -> int:
+    """Безопасный int (None/мусор → 0)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
+#  Ключ уникальности листа
+# ---------------------------------------------------------------------------
+def sheet_key(row: dict) -> tuple:
+    """
+    Ключ уникальности листа для строки documents (dict).
+
+    sheet_number заполнен → ('sheet', complex, sheet_number);
+    sheet_number пустой   → ('row', id) — файл сам себе лист (fallback).
+    """
+    sn = _s(row.get("sheet_number"))
+    if not sn:
+        return ("row", _int(row.get("id")))
+    return ("sheet", _s(row.get("complex")), sn)
+
+
+def _rev_order(row: dict) -> tuple:
+    """Порядок ревизии: чем позже status_date / больше id, тем новее."""
+    return (_s(row.get("status_date")), _int(row.get("id")))
+
+
+# ---------------------------------------------------------------------------
+#  Дедупликация
+# ---------------------------------------------------------------------------
+def dedup_document_rows(rows) -> list:
+    """
+    Список строк documents (dict) → одна строка на уникальный лист.
+
+    Из ревизий одного листа остаётся последняя (MAX(status_date),
+    при равенстве — MAX(id)). Результат упорядочен по id.
+    Строки с пустым sheet_number не склеиваются (fallback по id).
+    """
+    best: dict[tuple, dict] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        key = sheet_key(r)
+        cur = best.get(key)
+        if cur is None or _rev_order(r) > _rev_order(cur):
+            best[key] = r
+    return sorted(best.values(), key=lambda r: _int(r.get("id")))
+
+
+def dedup_documents(df):
+    """
+    pandas-обёртка dedup_document_rows: DataFrame documents → DataFrame
+    уникальных листов. Колонки и их порядок сохраняются. Если колонки
+    sheet_number нет — DataFrame возвращается без изменений.
+    """
+    import pandas as pd
+
+    if df is None or len(df) == 0 or "sheet_number" not in df.columns:
+        return df
+    kept = dedup_document_rows(df.to_dict("records"))
+    if not kept:
+        return df.iloc[0:0]
+    return pd.DataFrame(kept).reindex(columns=df.columns)
+
+
+# ---------------------------------------------------------------------------
+#  SQL-выражение для подсчёта в запросах
+# ---------------------------------------------------------------------------
+def sql_count_sheets(alias: str = "d") -> str:
+    """
+    SQL-выражение: число УНИКАЛЬНЫХ листов в группе (стандарт патча 11).
+
+    Вставляется в запрос вместо COUNT(DISTINCT {alias}.id) / COUNT(*).
+    Ключ — (complex, sheet_number); строки с пустым sheet_number
+    считаются поодиночке (по id). COALESCE(complex,'') защищает от
+    потери строк с NULL-комплектом (NULL || x = NULL в SQLite).
+    """
+    a = alias
+    return (
+        f"COUNT(DISTINCT CASE "
+        f"WHEN TRIM(COALESCE({a}.sheet_number, '')) != '' "
+        f"THEN COALESCE({a}.complex, '') || '||' "
+        f"|| TRIM({a}.sheet_number) "
+        f"ELSE 'row:' || {a}.id END)"
+    )

@@ -20,6 +20,7 @@ from openpyxl.formatting.rule import Rule
 from openpyxl.styles.differential import DifferentialStyle
 
 from vitro.sqlite_db import get_conn
+from vitro.sheets import dedup_document_rows
 from vitro.disciplines import discipline_name
 
 
@@ -102,8 +103,10 @@ def _pct_cell(cell, value):
 # ---------------------------------------------------------------------------
 def load_all_data():
     with get_conn() as conn:
+        # sheet_number/status_date нужны для дедупликации листов (патч 11)
         documents = [dict(r) for r in conn.execute(
-            """SELECT id, leaf, discipline, section, complex, status, name
+            """SELECT id, leaf, discipline, section, complex, status, name,
+                      sheet_number, status_date
                FROM documents""")]
         comments = [dict(r) for r in conn.execute(
             """SELECT id, doc_id, comment, status, author, created,
@@ -138,8 +141,13 @@ def _cat_key(cat):
 
 
 def compute_stats(documents, comments):
+    # Патч 11: листы считаются по УНИКАЛЬНЫМ листам (complex + sheet_number,
+    # последняя ревизия). Замечания привязаны к конкретным ревизиям, поэтому
+    # маппинг doc→complex строится по ВСЕМ строкам documents.
+    unique_docs = dedup_document_rows(documents)
+
     docs_by_complex = defaultdict(list)
-    for d in documents:
+    for d in unique_docs:
         if d.get("complex"):
             docs_by_complex[d["complex"]].append(d)
 
