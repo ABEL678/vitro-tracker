@@ -31,6 +31,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from vitro._cache import versioned_cache
 from vitro.sqlite_db import (
     get_conn,
     load_plan_kits,
@@ -137,6 +138,7 @@ def _vitro_kit_meta() -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 #  Общая таблица
 # ---------------------------------------------------------------------------
+@versioned_cache(600)
 def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     """
     Одна строка = один комплект: план (ведомости) + Витро.
@@ -227,20 +229,48 @@ def _overview_to_display(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _norm_date_val(v) -> date | None:
+    """Любое представление даты → datetime.date или None.
+
+    КРИТИЧНО для _save_due_dates: пустая ячейка DateColumn приходит
+    из редактора как pd.NaT, а из БД как None. Прямое сравнение
+    `NaT != None` и даже `NaT != NaT` даёт True (NaT не равна ничему,
+    включая саму себя) — из-за этого автосохранение «находило» изменения
+    на каждом реране и вызывало st.rerun() → бесконечный цикл вкладки.
+    Нормализация сводит пустоту к None: None == None → нет изменения."""
+    if v is None or v is pd.NaT:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    ts = pd.Timestamp(v)
+    return None if pd.isna(ts) else ts.date()
+
+
 def _save_due_dates(display_before: pd.DataFrame,
                     display_after: pd.DataFrame) -> int:
     """Разница сроков готовности → UPDATE в БД. Возвращает число строк
-    (или -1, если требуется имя пользователя)."""
+    (или -1, если требуется имя пользователя).
+
+    Сравнение — только по НОРМАЛИЗОВАННЫМ датам (_norm_date_val):
+    пустая ячейка (None/NaT) равна пустой, дата равна той же дате в
+    любом типе (date/Timestamp/строка). Фантомные различия, вызывающие
+    перезапись БД и rerun-цикл, невозможны."""
+    if len(display_before) != len(display_after):
+        return 0  # редактор не соответствует данным БД — не сохраняем
     changes: dict[str, str] = {}
     for i in range(len(display_before)):
-        old = display_before.iloc[i]["Срок готовности"]
-        new = display_after.iloc[i]["Срок готовности"]
+        old = _norm_date_val(display_before.iloc[i]["Срок готовности"])
+        new = _norm_date_val(display_after.iloc[i]["Срок готовности"])
         if old != new:
             code = display_after.iloc[i]["Шифр комплекта"]
-            if new is None or pd.isna(new):
-                changes[code] = None
-            else:
-                changes[code] = new.isoformat()
+            changes[code] = new.isoformat() if new else None
     if not changes:
         return 0
     user = st.session_state.get("user", "")
@@ -306,10 +336,12 @@ def _render_overview_table() -> None:
         key="plan_overview_editor",
     )
 
+    # Автосохранение без st.rerun(): данные БД и редактора уже согласованы
+    # (сравнение нормализовано), повторный реран не нужен — он и был
+    # источником бесконечного цикла. Уведомление — только st.toast.
     n = _save_due_dates(display_before, edited)
     if n > 0:
         st.toast(f"Срок готовности обновлён: {n} компл.")
-        st.rerun()
     elif n == -1:
         st.warning(
             "✏️ Изменены сроки готовности. Введите имя, чтобы сохранить: "
@@ -322,7 +354,10 @@ def _render_overview_table() -> None:
                 changed = _save_due_dates(display_before, edited)
                 if changed > 0:
                     st.toast(f"Срок готовности сохранён: {changed} компл.")
-                st.rerun()
+                    # flash + флаг → один контролируемый реран в конце render()
+                    st.session_state["plan_flash"] = (
+                        f"✅ Срок готовности сохранён: {changed} компл.")
+                    st.session_state["plan_data_just_saved"] = True
 
     st.caption(
         f"Всего комплектов: **{len(overview)}**. "
@@ -423,6 +458,20 @@ def _apply_overview_filters(overview: pd.DataFrame, flt: dict) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Бублики
 # ---------------------------------------------------------------------------
+@versioned_cache(600)
+def _plan_qty_by_kit() -> dict[str, int]:
+    """{шифр комплекта: плановое кол-во листов} — SQL-агрегат plan_drawings.
+    Лёгкий GROUP BY вместо полной выгрузки 14k+ строк в pandas на каждом
+    реране (нужен только для бубликов)."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT kit_code, SUM(qty) AS q
+            FROM plan_drawings
+            GROUP BY kit_code
+        """).fetchall()
+    return {r["kit_code"]: int(r["q"] or 0) for r in rows}
+
+
 def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
            key: str, center_total: str) -> None:
     """Бублик в стиле Сводки: без легенды, проценты внутри."""
@@ -458,45 +507,88 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
     st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
-    """Секция 3. Бублики «Комплектов всего/план» и «Листов всего/план»."""
-    # В бублики включаем только комплекты плана («Только в Витро» —
-    # вне плана, их объёмы не учитываем).
-    plan_df = overview_filtered[
-        overview_filtered["status"] != "Только в Витро"
-    ] if not overview_filtered.empty else overview_filtered
+def _donut_numbers() -> dict:
+    """Чистая математика бубликов (без UI) — удобно тестировать.
 
+      kits_total    — уникальные шифры plan_kits («Ведомость комплектов»);
+      kits_loaded   — сколько из них есть в documents (Витро);
+      kits_plan     — разница;
+      sheets_total  — сумма всех строк plan_drawings;
+      sheets_loaded — Σ min(план, Витро) по комплектам ведомости;
+      sheets_plan   — разница (не сумма);
+      sheets_excess — листы Витро сверх плана (в бублик не входят);
+      kits_missing_drawings — шифры plan_kits без ведомости чертежей.
+    """
+    plan = load_plan_kits()
+    plan_qty = _plan_qty_by_kit()      # {шифр: план листов} из plan_drawings
+    vitro = _vitro_sheet_counts()      # {шифр: листов в Витро} из documents
+
+    kit_codes = [] if plan.empty else sorted(plan["code"].astype(str).unique())
+    n_total = len(kit_codes)
+    n_loaded = sum(1 for c in kit_codes if c in vitro)
+
+    sheets_total = int(sum(plan_qty.values()))
+    sheets_loaded = int(sum(min(q, vitro.get(k, 0))
+                            for k, q in plan_qty.items()))
+    sheets_excess = int(sum(max(vitro.get(k, 0) - q, 0)
+                            for k, q in plan_qty.items()))
+    kits_missing_drawings = [c for c in kit_codes if c not in plan_qty]
+
+    return {
+        "kits_total": n_total,
+        "kits_loaded": n_loaded,
+        "kits_plan": n_total - n_loaded,
+        "sheets_total": sheets_total,
+        "sheets_loaded": sheets_loaded,
+        "sheets_plan": sheets_total - sheets_loaded,
+        "sheets_excess": sheets_excess,
+        "kits_missing_drawings": kits_missing_drawings,
+    }
+
+
+def _render_donuts() -> tuple[int, int]:
+    """Секция 3. Бублики «Комплектов всего/план» и «Листов всего/план».
+
+    Логика — по ВСЕМ загруженным ведомостям (без учёта фильтров,
+    фильтры работают в таблицах выше и ниже):
+      Комплекты:
+        всего     = число уникальных шифров в plan_kits
+                    («Ведомость основных комплектов»);
+        загружено = сколько из этих шифров реально есть в базе Витро
+                    (таблица documents);
+        план      = разница.
+      Листы:
+        всего     = сумма всех строк plan_drawings
+                    («Ведомости чертежей комплектов»);
+        загружено = Σ min(план, Витро) по комплектам ведомости — сколько
+                    ПЛАНОВЫХ листов уже в Витро;
+        план      = разница (не сумма).
+    """
     st.markdown("##### 🎯 Комплектов и листов: всего / план")
+    st.caption("Показатели по всем загруженным ведомостям — без учёта фильтров.")
 
-    if plan_df.empty:
-        st.info("Нет комплектов плана по выбранным фильтрам.")
+    nums = _donut_numbers()
+    n_total = nums["kits_total"]
+    n_loaded = nums["kits_loaded"]
+    n_plan = nums["kits_plan"]
+    sheets_total = nums["sheets_total"]
+    sheets_loaded = nums["sheets_loaded"]
+    sheets_remaining = nums["sheets_plan"]
+    sheets_excess = nums["sheets_excess"]
+    kits_missing_drawings = nums["kits_missing_drawings"]
+
+    if n_total == 0 and sheets_total == 0:
+        st.info(
+            "План пуст. Разверните блок «📥 Вводные данные» и загрузите "
+            "ведомости Excel."
+        )
         return (0, 0)
-
-    n_total = len(plan_df)
-    n_loaded = int(plan_df["in_vitro"].sum())
-    n_plan = n_total - n_loaded
 
     kits_data = pd.DataFrame([
         {"Группа": "Загружено в Витро", "Количество": n_loaded},
         {"Группа": "План к загрузке", "Количество": n_plan},
     ])
     kits_data = kits_data[kits_data["Количество"] > 0]
-
-    # ---- ЛИСТЫ: «всего» = плановое количество из ведомостей ----
-    # По каждому комплекту:
-    #   загружено = min(листов в Витро, план) — сколько ПЛАНОВЫХ листов
-    #               уже в Витро;
-    #   остаток   = план − загружено (разница, а не сумма).
-    # Листы Витро сверх плана (повторы, извещения, комплекты без
-    # ведомости чертежей) в бублик не включаются — иначе «всего»
-    # раздувается выше суммы строк ведомости.
-    plan_sheets = plan_df["sheets_plan"].astype(int)
-    vitro_sheets = plan_df["sheets_vitro"].astype(int)
-    sheets_total = int(plan_sheets.sum())
-    sheets_loaded = int(
-        pd.concat([vitro_sheets, plan_sheets], axis=1).min(axis=1).sum())
-    sheets_remaining = sheets_total - sheets_loaded
-    sheets_excess = int((vitro_sheets - plan_sheets).clip(lower=0).sum())
 
     sheets_data = pd.DataFrame([
         {"Группа": "Загружено в Витро", "Количество": sheets_loaded},
@@ -512,6 +604,12 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
         )
         _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
                center_total=f"{n_total}")
+        if kits_missing_drawings:
+            st.caption(
+                f"⚠️ Для {len(kits_missing_drawings)} комплектов отсутствует "
+                "Ведомость чертежей — плановое количество листов по ним "
+                "неизвестно и в бублик листов не включено."
+            )
     with col2:
         st.caption(
             f"Листов всего (план): **{sheets_total}** · "
@@ -603,7 +701,8 @@ def _build_detail(overview_filtered: pd.DataFrame,
         "Дисциплина": df["discipline"].fillna(""),
         "Раздел": df["section"].fillna(""),
         "Комплект(ы)": df["Комплект(ы)"],
-        "Номер листа": df.get("sheet_no", ""),
+        "Номер листа": (df["sheet_no"].fillna("").astype(str)
+                        if "sheet_no" in df.columns else ""),
         "Наименование": df["title"].fillna(""),
         "Кол-во чертежей (план)": df["qty"].astype(int),
         "Плановая дата": df["_date"],
@@ -702,6 +801,19 @@ def _render_detail(overview_filtered: pd.DataFrame, flt: dict) -> None:
 # ---------------------------------------------------------------------------
 #  Секция 0. Импорт ведомостей
 # ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _parse_kits_cached(data: bytes, filename: str):
+    """parse_kits_workbook с кэшем по содержимому файла: без кэша каждый
+    реран вкладки (любой клик!) заново парсил загруженные Excel."""
+    return parse_kits_workbook(data, filename)
+
+
+@st.cache_data(show_spinner=False)
+def _parse_drawings_cached(data: bytes, filename: str, default_kit: str):
+    """parse_drawings_workbook с кэшем по (байты файла, имя, шифр по умолчанию)."""
+    return parse_drawings_workbook(data, filename, default_kit)
+
+
 def _render_import_block() -> None:
     with st.expander("📥 Вводные данные: ведомости (Excel)", expanded=False):
         st.caption(
@@ -762,7 +874,7 @@ def _render_import_block() -> None:
         kits_warnings: list[str] = []
         if up_kits:
             for f in up_kits:
-                r, w = parse_kits_workbook(f.getvalue(), f.name)
+                r, w = _parse_kits_cached(f.getvalue(), f.name)
                 kits_rows += r
                 kits_warnings += w
             if kits_rows:
@@ -789,11 +901,18 @@ def _render_import_block() -> None:
                     if user:
                         try:
                             n = upsert_plan_kits(kits_rows, user)
-                            st.success(f"✅ Сохранено комплектов: {n}")
                             log_event("plan_import",
                                       f"Ведомость комплектов: {n} строк "
                                       f"(файлов: {len(up_kits)})", rows=n)
-                            st.rerun()
+                            # Без st.rerun() в блоке сохранения: он вызывал
+                            # цепочку реранов (морание и зависание).
+                            # flash + флаг → один контролируемый реран
+                            # в конце render(), данные перечитаются из БД.
+                            st.toast(f"Сохранено комплектов: {n}")
+                            st.session_state["plan_flash"] = (
+                                f"✅ Сохранено комплектов: {n}. "
+                                "Таблицы ниже обновлены.")
+                            st.session_state["plan_data_just_saved"] = True
                         except Exception as e:
                             st.error(f"ОШИБКА БД при сохранении комплектов: {e}")
                             st.stop()
@@ -812,7 +931,7 @@ def _render_import_block() -> None:
             for idx, f in enumerate(up_drawings):
                 dk = default_codes[idx] if idx < len(default_codes) else \
                     (default_codes[0] if len(default_codes) == 1 else "")
-                r, w, k = parse_drawings_workbook(f.getvalue(), f.name, dk)
+                r, w, k = _parse_drawings_cached(f.getvalue(), f.name, dk)
                 drawings_rows += r
                 drawings_warnings += w
                 for code, kname in k.items():
@@ -855,12 +974,15 @@ def _render_import_block() -> None:
                                      in drawings_kits.items()], user)
                             n = replace_plan_drawings_for_kits(drawings_rows, user)
                             n_kits = len({r["kit_code"] for r in drawings_rows})
-                            st.success(f"✅ Сохранено листов: {n} "
-                                       f"({n_kits} компл.)")
                             log_event("plan_import",
                                       f"Ведомости чертежей: {n} листов "
                                       f"(файлов: {len(up_drawings)})", rows=n)
-                            st.rerun()
+                            # Без st.rerun() в блоке сохранения — см. выше.
+                            st.toast(f"Сохранено листов: {n}")
+                            st.session_state["plan_flash"] = (
+                                f"✅ Сохранено листов: {n} ({n_kits} компл.). "
+                                "Таблицы ниже обновлены.")
+                            st.session_state["plan_data_just_saved"] = True
                         except Exception as e:
                             st.error(f"ОШИБКА БД при сохранении чертежей: {e}")
                             st.stop()
@@ -891,8 +1013,10 @@ def _render_import_block() -> None:
                 clear_plan()
                 log_event("plan_clear",
                           f"План выдачи очищен. Пользователь: {user}")
-                st.success("План очищен.")
-                st.rerun()
+                # Без st.rerun() — flash + один контролируемый реран (см. выше).
+                st.toast("План очищен")
+                st.session_state["plan_flash"] = "✅ План очищен."
+                st.session_state["plan_data_just_saved"] = True
 
 
 # ===========================================================================
@@ -900,6 +1024,14 @@ def _render_import_block() -> None:
 # ===========================================================================
 def render():
     st.header("📅 План выдачи комплектов")
+
+    # Flash-сообщение: показывается ПОСЛЕ контролируемого рерана,
+    # поэтому не пропадает при обновлении данных (в отличие от
+    # st.success внутри блока сохранения).
+    flash = st.session_state.pop("plan_flash", "")
+    if flash:
+        st.success(flash)
+
     st.caption(
         "План выдачи всех комплектов РД: загруженных в Витро и "
         "планируемых к загрузке — на основании ведомостей Excel. "
@@ -925,10 +1057,18 @@ def render():
 
     st.divider()
 
-    # ---- 3. Бублики ----
-    _render_donuts(overview_filtered)
+    # ---- 3. Бублики (по всем ведомостям, без учёта фильтров) ----
+    _render_donuts()
 
     st.divider()
 
     # ---- 4. Детальная таблица + период + выгрузка ----
     _render_detail(overview_filtered, flt)
+
+    # ---- Один контролируемый реран после сохранения ----
+    # st.rerun() убран из всех блоков сохранения. Вместо них — флаг:
+    # блок сохранения ставит plan_data_just_saved=True, здесь флаг
+    # СНИМАЕТСЯ до вызова rerun, поэтому цепочка реранов всегда ровно 1 —
+    # цикл «сохранил → рендер → снова сохранил» невозможен по построению.
+    if st.session_state.pop("plan_data_just_saved", False):
+        st.rerun()
