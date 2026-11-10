@@ -10,7 +10,11 @@ Excel для вкладки «План выдачи комплектов».
       parse_kits_workbook()     — комплекты → upsert_plan_kits
       parse_drawings_workbook() — чертежи  → replace_plan_drawings_for_kits
   - Выгрузка результата фильтрации:
-      build_plan_export()       — 2 листа: «Комплекты» + «Чертежи (план)»
+      build_plan_export()       — 2 листа: «Комплекты» (таблица А) +
+                                  «Листы» (таблица Б); подаются
+                                  ОТОБРАЖАЕМЫЕ DataFrame (русские
+                                  заголовки), выгрузка повторяет
+                                  таблицы на экране
 
 Распознавание колонок — по ключевым словам в заголовках (первые 15 строк
 каждого видимого листа), поэтому формат «Ексель» может отличаться
@@ -20,6 +24,7 @@ Excel для вкладки «План выдачи комплектов».
 """
 
 import io
+import math
 import re
 from datetime import date, datetime
 
@@ -61,10 +66,8 @@ _SECTION_KEYS = ("раздел",)
 # чтобы не спутать с заголовками разделов типа «Надземная часть Корпус 1».
 _DRAW_TITLE_KEYS = ("название листа", "наименование чертежа",
                     "наименование", "обозначение", "название")
-# Номер листа («10.01», «СО», «П.01»…). Порядок важен: сначала точные
-# «номер листа»/«№ листа», затем общие «номер» и «лист» (в реальных
-# регистрах встречаются усечённые варианты шапки).
-_SHEET_NO_KEYS = ("номер листа", "№ листа", "номер", "лист")
+# Номер листа («10.01», «СО», «П.01»…).
+_SHEET_NO_KEYS = ("номер листа", "номер")
 # Полный шифр листа/чертежа: «АТ-РД-ОВ1-С-00-10.01». Порядок важен:
 # более длинные ключи — первыми, чтобы «полный шифр листа» не совпал как «шифр».
 _FULL_CODE_KEYS = ("полный шифр листа", "шифр листа", "шифр чертежа")
@@ -207,39 +210,6 @@ def _clean_str(value) -> str:
     if value is None:
         return ""
     return str(value).replace("\xa0", " ").strip()
-
-
-# Служебные имена листов книги, из которых нельзя вывести раздел
-# («Лист1», «Sheet2» и т. п.).
-_GENERIC_SHEET_NAME_RE = re.compile(r"^(?:лист|sheet)\s*\d*$", re.IGNORECASE)
-
-
-def _discipline_from_code(code: str) -> str:
-    """Дисциплина из шифра комплекта — буквенная часть 3-го блока:
-    «АТ-РД-АР1-С-00» → «АР», «АТ-РД-ОВ2-С-00» → «ОВ».
-
-    В реальных регистрах «Комплекты чертежей» (АР/ОВ/ВК…) колонки
-    «Дисциплина» НЕТ — выводим её из шифра, чтобы дисциплина в плане
-    совпадала с дисциплиной в базе Витро и работали фильтры."""
-    parts = (code or "").split("-")
-    if len(parts) >= 3:
-        m = re.match(r"^[A-ZА-ЯЁ]+", parts[2].strip().upper())
-        if m:
-            return m.group(0)
-    return ""
-
-
-def _section_from_sheet_name(name) -> str:
-    """Раздел из имени листа книги: «Подземная часть»,
-    «Надземная часть Корпус 1» → сам текст (подчёркивания → пробелы).
-    Служебные имена («Лист1», «Sheet2») → пустая строка.
-
-    В реальных регистрах имена листов книги — это и есть разделы проекта;
-    колонки «Раздел» в файле нет."""
-    s = " ".join(str(name or "").replace("_", " ").split())
-    if not s or _GENERIC_SHEET_NAME_RE.match(s):
-        return ""
-    return s
 
 
 def _looks_like_section_header(title: str) -> bool:
@@ -426,11 +396,6 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
                 j = cols.get(name_key)
                 if j is not None and len(row) > j:
                     row_data[name_key] = _clean_str(row[j])
-            # Колонки «Дисциплина» в ведомости может не быть — выводим
-            # из шифра комплекта (АР1 → АР), чтобы фильтры и общая
-            # таблица работали и без этой колонки.
-            if not row_data["discipline"]:
-                row_data["discipline"] = _discipline_from_code(code)
             j = cols.get("due_date")
             if j is not None and len(row) > j:
                 row_data["due_date"] = _parse_date_value(row[j])
@@ -470,12 +435,6 @@ def parse_drawings_workbook(
       - строка чертежа БЕЗ шифра (приложения СО/ВР/П.01 и т. п.) —
         наследует текущий комплект;
       - метки «Приложение 1» в колонке шифра комплектом НЕ считаются.
-
-    Колонки, которых в реальных регистрах НЕТ, выводятся:
-      - «Дисциплина» — из шифра комплекта (буквы 3-го блока: АР1 → АР);
-      - «Раздел» — из имени листа книги («Подземная часть»,
-        «Надземная часть Корпус 1»); если в файле колонка есть —
-        она имеет приоритет.
 
     Номер листа берётся из ПОЛНОГО шифра листа (последний блок после дефиса —
     в реальных регистрах он каноничен: «АТ-РД-АР1-С-00-2.1.0»), а если той
@@ -543,9 +502,6 @@ def parse_drawings_workbook(
         # блоками: шапка комплекта → его чертежи → приложения).
         current_kit = ""
         current_kit_name = ""
-        # Раздел по умолчанию — имя листа книги (в реальных регистрах
-        # «Подземная часть», «Надземная часть Корпус 1» — это разделы).
-        default_section = _section_from_sheet_name(sheet_name)
         sheet_rows = 0
         no_kit = 0
         empty_run = 0  # подряд идущие пустые строки
@@ -617,13 +573,6 @@ def parse_drawings_workbook(
                 j = cols.get(name_key)
                 if j is not None and len(row) > j:
                     row_data[name_key] = _clean_str(row[j])
-            # Вывод дисциплины/раздела, если колонок в файле нет
-            # (реальные регистры «Комплекты чертежей»): дисциплина —
-            # из шифра комплекта (АР1 → АР), раздел — из имени листа книги.
-            if not row_data["discipline"]:
-                row_data["discipline"] = _discipline_from_code(kit)
-            if not row_data["section"]:
-                row_data["section"] = default_section
             j = cols.get("qty")
             if j is not None and len(row) > j:
                 try:
@@ -674,69 +623,76 @@ def _style_table(ws, headers: list[str], rows: list[list]) -> None:
     ws.freeze_panes = "A2"
 
 
+def _fmt_export_cell(col_name: str, value):
+    """Значение ячейки отображаемого DataFrame → значение для Excel.
+    Даты (date/datetime/ISO-строки в колонках с «дата») → ДД.ММ.ГГГГ,
+    NaN → пусто, остальное — как есть."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y %H:%M")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if "дата" in str(col_name).lower():
+        return _iso_to_display(s)  # ISO-строки → ДД.ММ.ГГГГ (иначе как есть)
+    return s
+
+
+def _write_display_df(ws, df) -> None:
+    """Записывает отображаемый DataFrame (русские заголовки) на лист
+    «как есть» — выгрузка повторяет таблицу на экране."""
+    headers = [str(c) for c in df.columns]
+    rows = []
+    for _, r in df.iterrows():
+        rows.append([_fmt_export_cell(col, r[col]) for col in df.columns])
+    _style_table(ws, headers, rows)
+    # Ширины колонок: базовые 26, наименованиям — пошире, шифрам — 30.
+    for j, h in enumerate(headers, start=1):
+        hl = h.lower()
+        if "наименование" in hl:
+            ws.column_dimensions[get_column_letter(j)].width = 46
+        elif "шифр" in hl or "комплект" in hl:
+            ws.column_dimensions[get_column_letter(j)].width = 30
+
+
 @st.cache_data(show_spinner=False)   # строится раз на набор данных,
                                      # а не на каждом реране вкладки
-def build_plan_export(kits_df, drawings_df, period_label: str = "") -> bytes:
+def build_plan_export(kits_df, sheets_df, period_label: str = "") -> bytes:
     """
-    Excel-файл плана выдачи: лист «Комплекты» + лист «Чертежи (план)».
-    Подаются ОТОБРАННЫЕ (по фильтрам и периоду) DataFrame.
-    Кэшируется по содержимому DataFrame — на 14 000 строк экономит
-    ~1–2 секунды на каждом реране, пока данные не изменились.
+    Excel-файл плана выдачи из ДВУХ листов:
+      «Комплекты» — таблица А (детальный план по комплектам);
+      «Листы»     — таблица Б (детальный план по листам комплекта).
+    Подаются ОТОБРАЖАЕМЫЕ DataFrame (русские заголовки, как на экране) —
+    уже отобранные по фильтрам и периоду: выгрузка повторяет таблицы
+    вкладки. Кэшируется по содержимому DataFrame — на 10 000 строк
+    экономит ~1–2 секунды на каждом реране, пока данные не изменились.
     """
     wb = openpyxl.Workbook()
 
-    # ---- Лист 1: Комплекты ----
+    # ---- Лист 1: Комплекты (таблица А) ----
     ws = wb.active
     ws.title = "Комплекты"
-    kit_headers = ["Шифр комплекта", "Наименование комплекта",
-                   "Дисциплина", "Раздел", "Общий статус",
-                   "Листов в Витро", "Листов (план)",
-                   "Срок готовности", "Статус (ведомость)",
-                   "Обновлён", "Кем"]
-    kit_rows = []
-    for _, r in kits_df.iterrows():
-        kit_rows.append([
-            r.get("code", ""),
-            r.get("name", "") or "",
-            r.get("discipline", "") or "",
-            r.get("section", "") or "",
-            r.get("status", "") or "",
-            int(r.get("sheets_vitro", 0) or 0),
-            int(r.get("sheets_plan", 0) or 0),
-            _iso_to_display(r.get("due_date")),
-            r.get("plan_status", "") or "",
-            r.get("updated_at", "") or "",
-            r.get("updated_by", "") or "",
-        ])
-    _style_table(ws, kit_headers, kit_rows)
+    _write_display_df(ws, kits_df)
 
-    # ---- Лист 2: Чертежи (план) ----
-    ws2 = wb.create_sheet("Чертежи (план)")
-    dr_headers = ["Дисциплина", "Раздел", "Комплект(ы)", "Номер листа",
-                  "Наименование", "Количество чертежей (план)",
-                  "Плановая дата", "Общий статус комплекта"]
-    dr_rows = []
-    for _, r in drawings_df.iterrows():
-        dr_rows.append([
-            r.get("discipline", "") or "",
-            r.get("section", "") or "",
-            r.get("kit_code", "") or "",
-            r.get("Номер листа", r.get("sheet_no", "")) or "",
-            r.get("title", "") or "",
-            int(r.get("qty", 1) or 1),
-            _iso_to_display(r.get("planned_date")),
-            r.get("status", "") or "",
-        ])
-    _style_table(ws2, dr_headers, dr_rows)
+    # ---- Лист 2: Листы (таблица Б) ----
+    ws2 = wb.create_sheet("Листы")
+    _write_display_df(ws2, sheets_df)
 
-    if period_label:
-        ws3 = wb.create_sheet("Параметры выгрузки")
-        _style_table(ws3, ["Параметр", "Значение"], [
-            ["Период", period_label],
-            ["Дата формирования", datetime.now().strftime("%d.%m.%Y %H:%M")],
-            ["Комплектов в выгрузке", len(kit_rows)],
-            ["Позиций чертежей в выгрузке", len(dr_rows)],
-        ])
+    # ---- Лист 3: Параметры выгрузки ----
+    ws3 = wb.create_sheet("Параметры выгрузки")
+    _style_table(ws3, ["Параметр", "Значение"], [
+        ["Период", period_label or "все даты"],
+        ["Дата формирования", datetime.now().strftime("%d.%m.%Y %H:%M")],
+        ["Комплектов в выгрузке", len(kits_df)],
+        ["Позиций листов в выгрузке", len(sheets_df)],
+    ])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -744,8 +700,14 @@ def build_plan_export(kits_df, drawings_df, period_label: str = "") -> bytes:
 
 
 def _iso_to_display(iso) -> str:
-    """'YYYY-MM-DD' → 'ДД.ММ.ГГГГ' для Excel-выгрузки."""
-    if not iso:
+    """'YYYY-MM-DD' / date / datetime → 'ДД.ММ.ГГГГ' для Excel-выгрузки."""
+    if iso is None:
+        return ""
+    if isinstance(iso, datetime):
+        return iso.date().strftime("%d.%m.%Y")
+    if isinstance(iso, date):
+        return iso.strftime("%d.%m.%Y")
+    if not str(iso).strip():
         return ""
     try:
         return date.fromisoformat(str(iso)[:10]).strftime("%d.%m.%Y")

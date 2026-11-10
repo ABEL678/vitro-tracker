@@ -1,0 +1,747 @@
+--- a/vitro/ui/plan.py
++++ b/vitro/ui/plan.py
+@@ -17,10 +17,11 @@
+   1. Общая таблица: шифры, названия всех комплектов, общие статусы,
+      срок готовности (редактируется прямо в таблице).
+   2. Фильтры — единый стандарт (как в «Сводке по проекту»).
+-  3. Бублики: «Комплектов всего/план» и «Листов всего/план».
++  3. Бублики: «Комплектов всего/план» и «Листов всего/план» —
++     с учётом применённых фильтров.
+   4. Детальная таблица (плашка выгрузки в Excel): дисциплина / раздел /
+-     комплект(ы) / наименование / количество чертежей (план) —
+-     с фильтром по датам (периоду).
++     комплект(ы) / номер листа / наименование — с фильтром по датам
++     (периоду).
+ 
+ Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
+ """
+@@ -56,6 +57,9 @@
+     build_plan_export,
+     parse_drawings_workbook,
+     parse_kits_workbook,
++    _canon_discipline,
++    _discipline_from_code,
++    _is_valid_kit_code,
+ )
+ 
+ # ---------------------------------------------------------------------------
+@@ -83,7 +87,7 @@
+ 
+ DETAIL_COLUMNS = [
+     "Дисциплина", "Раздел", "Комплект(ы)", "Номер листа", "Наименование",
+-    "Кол-во чертежей (план)", "Плановая дата", "Статус комплекта",
++    "Плановая дата", "Статус комплекта",
+ ]
+ 
+ 
+@@ -135,6 +139,14 @@
+     return meta
+ 
+ 
++@versioned_cache(300)
++def _load_drawings_cached() -> pd.DataFrame:
++    """load_plan_drawings с кэшем по версии данных БД: 14k+ строк читаются
++    один раз на изменение данных, а не на каждом реране — общая таблица,
++    бублики и детальный план используют один и тот же DataFrame."""
++    return load_plan_drawings()
++
++
+ # ---------------------------------------------------------------------------
+ #  Общая таблица
+ # ---------------------------------------------------------------------------
+@@ -144,18 +156,38 @@
+     Одна строка = один комплект: план (ведомости) + Витро.
+     Общий статус вычисляется: Загружен в Витро / Загружается (частично) /
+     План (не загружен) / Только в Витро.
++
++    Для ВСЕХ комплектов плана гарантируется заполненность дисциплины и
++    раздела (для фильтров и отображения):
++      - дисциплина: ведомость → Витро → вывод из шифра (АР1 → 01_АР);
++      - раздел: ведомость → самый частый раздел его чертежей
++        (имена листов регистров) → Витро.
++    Шифры, не похожие на комплект (полные шифры листов «…-10.01»,
++    попавшие в plan_kits старыми версиями парсера), скрываются:
++    «Комплектов всего» — это только настоящие комплекты ведомости.
+     """
+     plan = load_plan_kits()
+-    drawings = load_plan_drawings()
++    drawings = _load_drawings_cached()
+     vitro_counts = _vitro_sheet_counts()
+     plan_qty = {}
++    plan_section = {}
+     if not drawings.empty:
+         plan_qty = drawings.groupby("kit_code")["qty"].sum().to_dict()
++        sect = drawings.assign(
++            _s=drawings["section"].fillna("").astype(str).str.strip())
++        sect = sect[sect["_s"] != ""]
++        if not sect.empty:
++            plan_section = (sect.groupby("kit_code")["_s"]
++                            .agg(lambda s: sorted(set(s))[0]).to_dict())
+ 
++    meta: dict[str, dict] | None = None
+     rows = []
+     if not plan.empty:
++        meta = _vitro_kit_meta()
+         for _, r in plan.iterrows():
+             code = r["code"]
++            if not _is_valid_kit_code(code):
++                continue  # фиктивный «комплект» — полный шифр листа и т. п.
+             in_vitro = code in vitro_counts
+             sheets_vitro = vitro_counts.get(code, 0)
+             sheets_plan = int(plan_qty.get(code, 0))
+@@ -165,11 +197,22 @@
+                 status = "Загружен в Витро"
+             else:
+                 status = "План (не загружен)"
++            # Дисциплина: ведомость → Витро → из шифра (канон 01_АР…)
++            discipline = _canon_discipline((r["discipline"] or "").strip())
++            if not discipline:
++                discipline = _canon_discipline(
++                    (meta.get(code, {}).get("discipline") or "").strip())
++            if not discipline:
++                discipline = _canon_discipline(_discipline_from_code(code))
++            # Раздел: ведомость → разделы чертежей → Витро
++            section = (r["section"] or "").strip() \
++                or plan_section.get(code, "") \
++                or (meta.get(code, {}).get("section") or "").strip()
+             rows.append({
+                 "code": code,
+                 "name": r["name"] or "",
+-                "discipline": r["discipline"] or "",
+-                "section": r["section"] or "",
++                "discipline": discipline,
++                "section": section,
+                 "plan_status": r["plan_status"] or "",
+                 "due_date": r["due_date"] or None,
+                 "sheets_vitro": sheets_vitro,
+@@ -181,7 +224,8 @@
+             })
+ 
+     if include_vitro_only:
+-        meta = _vitro_kit_meta()
++        if meta is None:
++            meta = _vitro_kit_meta()
+         for code in sorted(vitro_counts):
+             if code in set(r["code"] for r in rows):
+                 continue
+@@ -381,6 +425,8 @@
+         return base
+     for _, r in plan.iterrows():
+         code = r["code"]
++        if not _is_valid_kit_code(code):
++            continue  # фиктивный «комплект» — полный шифр листа и т. п.
+         if disc and (r["discipline"] or "") not in disc:
+             continue
+         if sect and (r["section"] or "") not in sect:
+@@ -431,15 +477,26 @@
+     )
+ 
+ 
+-def _apply_overview_filters(overview: pd.DataFrame, flt: dict) -> pd.DataFrame:
+-    """Стандартные фильтры + статус комплекта → к общей таблице."""
++def _apply_overview_filters(overview: pd.DataFrame, flt: dict,
++                            kit_sections: dict | None = None) -> pd.DataFrame:
++    """Стандартные фильтры + статус комплекта → к общей таблице.
++
++    kit_sections — {шифр: {разделы его чертежей}}: комплект проходит
++    фильтр раздела, если раздел указан у него в ведомости ИЛИ есть
++    хотя бы у одного его чертежа (в реальных регистрах раздел живёт
++    в ведомости чертежей, а не комплектов)."""
+     if overview.empty:
+         return overview
+     out = overview
+     if flt["disc"]:
+         out = out[out["discipline"].isin(flt["disc"])]
+     if flt["section"]:
+-        out = out[out["section"].isin(flt["section"])]
++        mask = out["section"].isin(flt["section"])
++        if kit_sections:
++            matching = {c for c, sects in kit_sections.items()
++                        if set(sects) & set(flt["section"])}
++            mask = mask | out["code"].isin(matching)
++        out = out[mask]
+     if flt["kits"]:
+         out = out[out["code"].isin(flt["kits"])]
+     if flt["block_codes"]:
+@@ -458,18 +515,109 @@
+ # ---------------------------------------------------------------------------
+ #  Бублики
+ # ---------------------------------------------------------------------------
+-@versioned_cache(600)
+-def _plan_qty_by_kit() -> dict[str, int]:
+-    """{шифр комплекта: плановое кол-во листов} — SQL-агрегат plan_drawings.
+-    Лёгкий GROUP BY вместо полной выгрузки 14k+ строк в pandas на каждом
+-    реране (нужен только для бубликов)."""
+-    with get_conn() as conn:
+-        rows = conn.execute("""
+-            SELECT kit_code, SUM(qty) AS q
+-            FROM plan_drawings
+-            GROUP BY kit_code
+-        """).fetchall()
+-    return {r["kit_code"]: int(r["q"] or 0) for r in rows}
++def _fill_drawing_row_meta(drawings: pd.DataFrame,
++                           kits_df: pd.DataFrame) -> pd.DataFrame:
++    """Заполняет пустые дисциплину/раздел строк plan_drawings — записи
++    старых версий парсера (до 07) чинятся на лету, без перезагрузки
++    файлов: дисциплина — из комплекта общей таблицы (уже каноничен),
++    затем из шифра; раздел — из комплекта, затем пусто. Новые загрузки
++    и так полные (plan_xlsx.py)."""
++    if drawings.empty:
++        return drawings
++    kit_disc: dict[str, str] = {}
++    kit_sect: dict[str, str] = {}
++    if kits_df is not None and not kits_df.empty:
++        kit_disc = dict(zip(kits_df["code"].astype(str),
++                            kits_df["discipline"].fillna("").astype(str)))
++        kit_sect = dict(zip(kits_df["code"].astype(str),
++                            kits_df["section"].fillna("").astype(str)))
++    out = drawings.copy()
++    codes = out["kit_code"].astype(str)
++    disc = out["discipline"].fillna("").astype(str).str.strip()
++    sect = out["section"].fillna("").astype(str).str.strip()
++    out["discipline"] = [
++        d or kit_disc.get(k, "")
++        or _canon_discipline(_discipline_from_code(k))
++        for k, d in zip(codes, disc)
++    ]
++    out["section"] = [s or kit_sect.get(k, "") for k, s in zip(codes, sect)]
++    return out
++
++
++def _donut_numbers(overview_filtered: pd.DataFrame, flt: dict) -> dict:
++    """Чистая математика бубликов (без UI) — С УЧЁТОМ ФИЛЬТРОВ.
++
++      overview_filtered — результат _apply_overview_filters (фильтры на
++                          уровне комплектов); строки «Только в Витро»
++                          исключаются: «Комплектов всего» — это всегда
++                          ведомость комплектов;
++      flt               — фильтры вкладки: к ЛИСТАМ дополнительно
++                          применяются дисциплина/раздел на уровне строк
++                          чертежей и «Только позиции со сроками».
++
++      kits_total    — комплектов в ведомости (после фильтров);
++      kits_loaded   — сколько из них есть в documents (Витро);
++      kits_plan     — разница;
++      sheets_total  — Σ листов отфильтрованных строк plan_drawings;
++      sheets_loaded — Σ min(план, Витро) по затронутым комплектам
++                      (загруженные листы Витро не привязаны к разделам,
++                      поэтому min — принятая оценка);
++      sheets_plan   — разница (не сумма);
++      sheets_excess — листы Витро сверх плана (в бублик не входят);
++      kits_missing_drawings — комплекты без листов в ведомостях
++                              чертежей (по текущим фильтрам).
++    """
++    kits = overview_filtered
++    if kits is not None and not kits.empty:
++        kits = kits[kits["status"] != "Только в Витро"]
++    else:
++        kits = pd.DataFrame()
++    kit_codes = (set(kits["code"].astype(str))
++                 if not kits.empty else set())
++    n_total = len(kit_codes)
++    n_loaded = (int(kits["in_vitro"].astype(bool).sum())
++                if not kits.empty else 0)
++
++    drw = _load_drawings_cached()
++    if not drw.empty and kit_codes:
++        drw = drw[drw["kit_code"].astype(str).isin(kit_codes)].copy()
++    else:
++        drw = drw.iloc[0:0]
++    if not drw.empty:
++        drw = _fill_drawing_row_meta(drw, kits)
++        if flt["disc"]:
++            drw = drw[drw["discipline"].isin(flt["disc"])]
++        if flt["section"]:
++            drw = drw[drw["section"].isin(flt["section"])]
++        if flt["extra"].get("only_dated"):
++            due_by_kit = (dict(zip(kits["code"].astype(str), kits["due_date"]))
++                          if not kits.empty else {})
++            has_date = (drw["planned_date"].notna()
++                        & (drw["planned_date"].astype(str) != ""))
++            kit_dated = drw["kit_code"].astype(str).map(
++                lambda k: bool(due_by_kit.get(k)))
++            drw = drw[has_date | kit_dated]
++
++    plan_qty = (drw.groupby("kit_code")["qty"].sum().to_dict()
++                if not drw.empty else {})
++    vitro = _vitro_sheet_counts()
++    sheets_total = int(sum(plan_qty.values()))
++    sheets_loaded = int(sum(min(q, vitro.get(k, 0))
++                            for k, q in plan_qty.items()))
++    sheets_excess = int(sum(max(vitro.get(k, 0) - q, 0)
++                            for k, q in plan_qty.items()))
++    kits_missing_drawings = sorted(kit_codes - set(plan_qty))
++
++    return {
++        "kits_total": n_total,
++        "kits_loaded": n_loaded,
++        "kits_plan": n_total - n_loaded,
++        "sheets_total": sheets_total,
++        "sheets_loaded": sheets_loaded,
++        "sheets_plan": sheets_total - sheets_loaded,
++        "sheets_excess": sheets_excess,
++        "kits_missing_drawings": kits_missing_drawings,
++    }
+ 
+ 
+ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
+@@ -507,67 +655,25 @@
+     st.plotly_chart(fig, use_container_width=True, key=key)
+ 
+ 
+-def _donut_numbers() -> dict:
+-    """Чистая математика бубликов (без UI) — удобно тестировать.
+-
+-      kits_total    — уникальные шифры plan_kits («Ведомость комплектов»);
+-      kits_loaded   — сколько из них есть в documents (Витро);
+-      kits_plan     — разница;
+-      sheets_total  — сумма всех строк plan_drawings;
+-      sheets_loaded — Σ min(план, Витро) по комплектам ведомости;
+-      sheets_plan   — разница (не сумма);
+-      sheets_excess — листы Витро сверх плана (в бублик не входят);
+-      kits_missing_drawings — шифры plan_kits без ведомости чертежей.
+-    """
+-    plan = load_plan_kits()
+-    plan_qty = _plan_qty_by_kit()      # {шифр: план листов} из plan_drawings
+-    vitro = _vitro_sheet_counts()      # {шифр: листов в Витро} из documents
+-
+-    kit_codes = [] if plan.empty else sorted(plan["code"].astype(str).unique())
+-    n_total = len(kit_codes)
+-    n_loaded = sum(1 for c in kit_codes if c in vitro)
+-
+-    sheets_total = int(sum(plan_qty.values()))
+-    sheets_loaded = int(sum(min(q, vitro.get(k, 0))
+-                            for k, q in plan_qty.items()))
+-    sheets_excess = int(sum(max(vitro.get(k, 0) - q, 0)
+-                            for k, q in plan_qty.items()))
+-    kits_missing_drawings = [c for c in kit_codes if c not in plan_qty]
+-
+-    return {
+-        "kits_total": n_total,
+-        "kits_loaded": n_loaded,
+-        "kits_plan": n_total - n_loaded,
+-        "sheets_total": sheets_total,
+-        "sheets_loaded": sheets_loaded,
+-        "sheets_plan": sheets_total - sheets_loaded,
+-        "sheets_excess": sheets_excess,
+-        "kits_missing_drawings": kits_missing_drawings,
+-    }
+-
+-
+-def _render_donuts() -> tuple[int, int]:
++def _render_donuts(overview_filtered: pd.DataFrame, flt: dict) -> tuple[int, int]:
+     """Секция 3. Бублики «Комплектов всего/план» и «Листов всего/план».
+ 
+-    Логика — по ВСЕМ загруженным ведомостям (без учёта фильтров,
+-    фильтры работают в таблицах выше и ниже):
++    Логика — С УЧЁТОМ ПРИМЕНЁННЫХ ФИЛЬТРОВ (как в таблицах выше):
+       Комплекты:
+-        всего     = число уникальных шифров в plan_kits
+-                    («Ведомость основных комплектов»);
+-        загружено = сколько из этих шифров реально есть в базе Витро
+-                    (таблица documents);
++        всего     = комплекты ведомости (plan_kits), прошедшие фильтры;
++        загружено = сколько из них реально есть в базе Витро (documents);
+         план      = разница.
+       Листы:
+-        всего     = сумма всех строк plan_drawings
+-                    («Ведомости чертежей комплектов»);
+-        загружено = Σ min(план, Витро) по комплектам ведомости — сколько
+-                    ПЛАНОВЫХ листов уже в Витро;
++        всего     = Σ строк plan_drawings, прошедших фильтры
++                    (дисциплина/раздел — на уровне строк чертежей);
++        загружено = Σ min(план, Витро) — сколько ПЛАНОВЫХ листов
++                    уже в Витро;
+         план      = разница (не сумма).
+     """
+     st.markdown("##### 🎯 Комплектов и листов: всего / план")
+-    st.caption("Показатели по всем загруженным ведомостям — без учёта фильтров.")
++    st.caption("Показатели с учётом применённых фильтров.")
+ 
+-    nums = _donut_numbers()
++    nums = _donut_numbers(overview_filtered, flt)
+     n_total = nums["kits_total"]
+     n_loaded = nums["kits_loaded"]
+     n_plan = nums["kits_plan"]
+@@ -579,8 +685,8 @@
+ 
+     if n_total == 0 and sheets_total == 0:
+         st.info(
+-            "План пуст. Разверните блок «📥 Вводные данные» и загрузите "
+-            "ведомости Excel."
++            "Нет данных по выбранным фильтрам. Очистите фильтры или "
++            "разверните блок «📥 Вводные данные» и загрузите ведомости Excel."
+         )
+         return (0, 0)
+ 
+@@ -606,9 +712,10 @@
+                center_total=f"{n_total}")
+         if kits_missing_drawings:
+             st.caption(
+-                f"⚠️ Для {len(kits_missing_drawings)} комплектов отсутствует "
+-                "Ведомость чертежей — плановое количество листов по ним "
+-                "неизвестно и в бублик листов не включено."
++                f"⚠️ Для {len(kits_missing_drawings)} комплектов нет листов "
++                "в ведомостях чертежей (по текущим фильтрам) — плановое "
++                "количество листов по ним неизвестно и в бублик листов "
++                "не включено."
+             )
+     with col2:
+         st.caption(
+@@ -621,8 +728,8 @@
+     if sheets_excess > 0:
+         st.caption(
+             f"ℹ️ В Витро есть ещё {sheets_excess} лист(ов) сверх "
+-            "планового количества (повторы, извещения, комплекты без "
+-            "ведомости чертежей) — в бублик не включены: «всего» "
++            "планового количества по этим комплектам (повторы, извещения, "
++            "листы вне фильтров) — в бублик не включены: «всего» "
+             "никогда не превышает ведомость."
+         )
+     return (n_total, sheets_total)
+@@ -638,8 +745,14 @@
+     Детальные строки чертежей (план) по результату фильтрации
+     и выбранному периоду. Дата позиции = плановая дата чертежа,
+     а если её нет — срок готовности комплекта.
++
++    Дисциплина/раздел гарантированно заполнены (_fill_drawing_row_meta);
++    служебная колонка "qty" (кол-во чертежей в позиции) сохраняется
++    для Excel-выгрузки, но в таблицу не выводится — одна строка
++    таблицы и так соответствует одной позиции.
+     """
+-    drawings = load_plan_drawings()
++    drawings = _fill_drawing_row_meta(_load_drawings_cached(),
++                                      overview_filtered)
+     if drawings.empty:
+         return pd.DataFrame(columns=DETAIL_COLUMNS)
+ 
+@@ -704,9 +817,10 @@
+         "Номер листа": (df["sheet_no"].fillna("").astype(str)
+                         if "sheet_no" in df.columns else ""),
+         "Наименование": df["title"].fillna(""),
+-        "Кол-во чертежей (план)": df["qty"].astype(int),
+         "Плановая дата": df["_date"],
+         "Статус комплекта": df["status"],
++        # служебная колонка для Excel-выгрузки (в таблице не показывается)
++        "qty": df["qty"].astype(int),
+     })
+     out = out.sort_values(
+         ["Дисциплина", "Раздел", "Комплект(ы)", "Номер листа"],
+@@ -773,15 +887,13 @@
+         return
+ 
+     st.caption(
+-        f"Строк: **{len(detail)}** · позиций: "
+-        f"**{int(detail['Кол-во чертежей (план)'].sum())}** · "
+-        f"период: **{period_label}**"
++        f"Строк: **{len(detail)}** · период: **{period_label}**"
+     )
+ 
+     # На больших проектах (10k+ позиций) показываем первые
+     # MAX_DETAIL_ROWS строк — полный объём всегда в Excel-выгрузке выше.
+     MAX_DETAIL_ROWS = 2000
+-    shown = detail.head(MAX_DETAIL_ROWS)
++    shown = detail[DETAIL_COLUMNS].head(MAX_DETAIL_ROWS)
+     if len(detail) > MAX_DETAIL_ROWS:
+         st.caption(
+             f"Показаны первые **{MAX_DETAIL_ROWS}** строк из "
+@@ -799,8 +911,6 @@
+             "Комплект(ы)": st.column_config.TextColumn(width="medium"),
+             "Номер листа": st.column_config.TextColumn(width="small"),
+             "Наименование": st.column_config.TextColumn(width="large"),
+-            "Кол-во чертежей (план)": st.column_config.NumberColumn(
+-                width="small"),
+             "Плановая дата": st.column_config.DateColumn(
+                 format="DD.MM.YYYY", width="small"),
+             "Статус комплекта": st.column_config.TextColumn(width="small"),
+@@ -1063,12 +1173,23 @@
+ 
+     overview_all = _build_overview(
+         st.session_state.get("plan_include_vitro_only", True))
+-    overview_filtered = _apply_overview_filters(overview_all, flt)
++    # Разделы комплектов по их чертежам — для фильтра «Раздел»:
++    # комплект проходит, если раздел есть хоть у одного его листа.
++    drawings_all = _load_drawings_cached()
++    kit_sections: dict[str, set] = {}
++    if not drawings_all.empty:
++        s = drawings_all.assign(
++            _s=drawings_all["section"].fillna("").astype(str).str.strip())
++        s = s[s["_s"] != ""]
++        if not s.empty:
++            kit_sections = s.groupby("kit_code")["_s"].agg(set).to_dict()
++    overview_filtered = _apply_overview_filters(overview_all, flt,
++                                                kit_sections)
+ 
+     st.divider()
+ 
+-    # ---- 3. Бублики (по всем ведомостям, без учёта фильтров) ----
+-    _render_donuts()
++    # ---- 3. Бублики (с учётом применённых фильтров) ----
++    _render_donuts(overview_filtered, flt)
+ 
+     st.divider()
+ 
+--- a/vitro/plan_xlsx.py
++++ b/vitro/plan_xlsx.py
+@@ -29,6 +29,8 @@
+ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+ from openpyxl.utils import get_column_letter
+ 
++from vitro.disciplines import DISCIPLINE_NAMES
++
+ MIME_XLSX = ("application/vnd.openxmlformats-officedocument"
+              ".spreadsheetml.sheet")
+ 
+@@ -80,6 +82,11 @@
+     r"^[A-ZА-ЯЁ]{2,4}-[A-ZА-ЯЁ]{1,3}-[A-ZА-ЯЁ0-9.]+(?:-[A-ZА-ЯЁ0-9.]+){1,2}$"
+ )
+ 
++# Сильные маркеры строк-разделов внутри листа (в отличие от
++# _looks_like_section_header, сюда НЕ входят «Приложение», «Корпус» и
++# т. п. — пометки в колонке шифра не должны становиться разделом).
++_STRONG_SECTION_KEYS = ("надземная часть", "подземная часть")
++
+ # Латинские двойники кириллических букв (появляются при копировании
+ # шифров из CAD/Word): «АТ-РД-ОВ2-C-00» и «АТ-РД-ОВ2-С-00» — один комплект.
+ _HOMOGLYPHS = str.maketrans({
+@@ -93,6 +100,32 @@
+     return bool(_KIT_CODE_PATTERN.match(code)) if code else False
+ 
+ 
++def _kit_code_of(value) -> str:
++    """Шифр КОМПЛЕКТА из произвольного значения колонки «Шифр».
++
++    «АТ-РД-АР1-С-00» → как есть; «АТ-РД-АР1-С-00-10.01» (полный шифр
++    листа, 6+ блоков) → «АТ-РД-АР1-С-00» — хвост листа отсекается;
++    «АТ-РД-АР1-С-00 МАРКИРОВОЧНЫЕ» → текст после шифра отбрасывается;
++    «ПРИЛОЖЕНИЕ 1», числа и прочий мусор → "".
++
++    В реальной «Ведомости комплектов» в колонке «Шифр» встречаются
++    полные шифры листов — без отсечения они плодят фиктивные комплекты
++    (584 вместо 479 на живых данных)."""
++    code = _norm_complex_code(value)
++    if not code:
++        return ""
++    head = code.split()[0] if " " in code else code
++    if _is_valid_kit_code(head):
++        return head
++    parts = head.split("-")
++    while len(parts) > 3:
++        parts = parts[:-1]
++        candidate = "-".join(parts)
++        if _is_valid_kit_code(candidate):
++            return candidate
++    return ""
++
++
+ def _norm_header(value) -> str:
+     """Нормализация заголовка ячейки: нижний регистр, без лишних пробелов."""
+     if value is None:
+@@ -214,9 +247,26 @@
+ _GENERIC_SHEET_NAME_RE = re.compile(r"^(?:лист|sheet)\s*\d*$", re.IGNORECASE)
+ 
+ 
++def _canon_discipline(value) -> str:
++    """Краткая метка из шифра → канонический код дисциплины Витро.
++
++    «АР» → «01_АР» (по справочнику DISCIPLINE_NAMES); уже каноничные
++    коды («01_АР») и неизвестные метки («АПТ») возвращаются как есть.
++    Нужна, чтобы дисциплина в плане совпадала с вариантами фильтра
++    (они берутся из таблицы documents: 01_АР, 02_КР…), иначе фильтр
++    «Дисциплина: 01_АР» не ловит строки плана с «АР»."""
++    s = (value or "").strip().upper()
++    if not s or "_" in s or s in DISCIPLINE_NAMES:
++        return s
++    for full in DISCIPLINE_NAMES:
++        if full.split("_", 1)[1] == s:
++            return full
++    return s
++
++
+ def _discipline_from_code(code: str) -> str:
+     """Дисциплина из шифра комплекта — буквенная часть 3-го блока:
+-    «АТ-РД-АР1-С-00» → «АР», «АТ-РД-ОВ2-С-00» → «ОВ».
++    «АТ-РД-АР1-С-00» → «01_АР», «АТ-РД-ОВ2-С-00» → «ОВ».
+ 
+     В реальных регистрах «Комплекты чертежей» (АР/ОВ/ВК…) колонки
+     «Дисциплина» НЕТ — выводим её из шифра, чтобы дисциплина в плане
+@@ -225,7 +275,7 @@
+     if len(parts) >= 3:
+         m = re.match(r"^[A-ZА-ЯЁ]+", parts[2].strip().upper())
+         if m:
+-            return m.group(0)
++            return _canon_discipline(m.group(0))
+     return ""
+ 
+ 
+@@ -365,6 +415,10 @@
+       rows — [{'code','name','discipline','section','plan_status',
+                'due_date','due_comment'}]
+       warnings — список сообщений о пропущенных строках/листах.
++
++    Шифры нормализуются с отсечением хвостов листов (_kit_code_of):
++    «АТ-РД-АР1-С-00-10.01» — это комплект «АТ-РД-АР1-С-00», а не новый
++    комплект; повторы одного шифра схлопываются в одну строку.
+     """
+     warnings: list[str] = []
+     rows: list[dict] = []
+@@ -402,15 +456,23 @@
+ 
+         header_idx, cols = found
+         sheet_rows = 0
++        skipped = 0
++        seen: dict[str, dict] = {}   # дедупликация по шифру комплекта
++        order: list[str] = []
+         for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
+             if row is None or all(
+                     v is None or str(v).strip() == "" for v in row):
+                 if sheet_rows:
+                     break  # пустая строка после данных — конец таблицы
+                 continue
+-            code = _norm_complex_code(
+-                row[cols["code"]] if len(row) > cols["code"] else None)
++            raw_code = row[cols["code"]] if len(row) > cols["code"] else None
++            # Нормализация шифра с отсечением хвостов листов:
++            # «АТ-РД-АР1-С-00-10.01» → «АТ-РД-АР1-С-00» (тот же комплект,
++            # строка не плодит фиктивный комплект), «Приложение 1» → "".
++            code = _kit_code_of(raw_code)
+             if not code:
++                if raw_code is not None and str(raw_code).strip():
++                    skipped += 1
+                 continue
+             name = _clean_str(row[cols["name"]]) \
+                 if cols.get("name") is not None and \
+@@ -426,17 +488,36 @@
+                 j = cols.get(name_key)
+                 if j is not None and len(row) > j:
+                     row_data[name_key] = _clean_str(row[j])
+-            # Колонки «Дисциплина» в ведомости может не быть — выводим
+-            # из шифра комплекта (АР1 → АР), чтобы фильтры и общая
++            # Дисциплина — в канонический формат Витро (01_АР, 02_КР…);
++            # колонки «Дисциплина» в ведомости может не быть — выводим
++            # из шифра комплекта (АР1 → 01_АР), чтобы фильтры и общая
+             # таблица работали и без этой колонки.
++            row_data["discipline"] = _canon_discipline(
++                row_data.get("discipline", ""))
+             if not row_data["discipline"]:
+                 row_data["discipline"] = _discipline_from_code(code)
+             j = cols.get("due_date")
+             if j is not None and len(row) > j:
+                 row_data["due_date"] = _parse_date_value(row[j])
+-            rows.append(row_data)
++            if code in seen:
++                # Повтор шифра (например, строка с полным шифром листа
++                # того же комплекта) — дозаполняем пустые поля, строку
++                # НЕ дублируем.
++                prev = seen[code]
++                for k, v in row_data.items():
++                    if not prev.get(k) and v:
++                        prev[k] = v
++                continue
++            seen[code] = row_data
++            order.append(code)
+             sheet_rows += 1
++        rows.extend(seen[c] for c in order)
+ 
++        if skipped:
++            warnings.append(
++                f"{filename} · лист «{sheet_name}»: {skipped} строк пропущено — "
++                f"значение в колонке «Шифр» не похоже на шифр комплекта "
++                f"(пометки, приложения, пустые строки).")
+         if sheet_rows == 0:
+             warnings.append(
+                 f"{filename} · лист «{sheet_name}»: заголовок найден, "
+@@ -472,14 +553,19 @@
+       - метки «Приложение 1» в колонке шифра комплектом НЕ считаются.
+ 
+     Колонки, которых в реальных регистрах НЕТ, выводятся:
+-      - «Дисциплина» — из шифра комплекта (буквы 3-го блока: АР1 → АР);
++      - «Дисциплина» — из шифра комплекта (буквы 3-го блока: АР1 → 01_АР
++        по справочнику дисциплин Витро);
+       - «Раздел» — из имени листа книги («Подземная часть»,
+         «Надземная часть Корпус 1»); если в файле колонка есть —
+-        она имеет приоритет.
++        она имеет приоритет; если имя листа служебное («Лист1») —
++        из последней строки-раздела в данных.
+ 
+     Номер листа берётся из ПОЛНОГО шифра листа (последний блок после дефиса —
+     в реальных регистрах он каноничен: «АТ-РД-АР1-С-00-2.1.0»), а если той
+-    колонки нет — из колонки «Номер листа».
++    колонки нет — из колонки «Номер листа»; если не распознана ни одна
++    из этих колонок (в реальных файлах бывает пустая шапка над колонкой) —
++    номер ищется сканированием строки: ячейка, начинающаяся с шифра
++    комплекта, — это полный шифр листа.
+ 
+     default_kit — шифр комплекта, если в файле нет колонки с шифром
+     (файл по одному комплекту).
+@@ -543,6 +629,9 @@
+         # блоками: шапка комплекта → его чертежи → приложения).
+         current_kit = ""
+         current_kit_name = ""
++        # Резервный раздел из строки-раздела в данных («Подземная часть»)
++        # — работает, когда имя листа книги служебное («Лист1»).
++        current_section_row = ""
+         # Раздел по умолчанию — имя листа книги (в реальных регистрах
+         # «Подземная часть», «Надземная часть Корпус 1» — это разделы).
+         default_section = _section_from_sheet_name(sheet_name)
+@@ -595,8 +684,20 @@
+             if not sheet_no and c_no is not None:
+                 sheet_no = _fmt_sheet_no(_cell(row, c_no))
+             if not title and not sheet_no:
+-                continue  # служебная строка (раздел/метка) без данных
++                # Служебная строка (раздел/метка) без данных. Если это
++                # строка-раздел («Подземная часть», «Надземная часть
++                # Корпус 1») — запоминаем её как РЕЗЕРВНЫЙ раздел для
++                # строк этого листа: пригодится, когда имя листа книги
++                # служебное («Лист1») и default_section пуст.
++                probe = _norm_header(raw_kit or "")
++                if any(probe.startswith(m) for m in _STRONG_SECTION_KEYS):
++                    current_section_row = " ".join(raw_kit.split())
++                continue
+             if _looks_like_section_header(title) and not sheet_no:
++                # «Подземная часть» в колонке названия — та же логика.
++                t = _norm_header(title)
++                if any(t.startswith(m) for m in _STRONG_SECTION_KEYS):
++                    current_section_row = title
+                 continue  # «Подземная часть» в колонке названия
+ 
+             kit = current_kit or default_kit
+@@ -604,6 +705,22 @@
+                 no_kit += 1
+                 continue
+ 
++            if not sheet_no:
++                # Эвристика: колонки «Полный шифр листа»/«Номер листа»
++                # не распознаны (в реальных файлах бывает ПУСТАЯ шапка
++                # над колонкой) — ищем в строке ячейку, начинающуюся с
++                # шифра комплекта: «АТ-РД-АР1-С-00-2.1.0» → «2.1.0»
++                # (последний блок после дефиса).
++                scan_kit = kit
++                pref = scan_kit + "-"
++                for v in row:
++                    sv = _norm_complex_code(v)
++                    if sv.startswith(pref) and len(sv) > len(pref):
++                        tail = sv[len(pref):].split()
++                        if tail:
++                            sheet_no = tail[0]
++                            break
++
+             row_data = {
+                 "kit_code": kit,
+                 "sheet_no": sheet_no,
+@@ -619,11 +736,13 @@
+                     row_data[name_key] = _clean_str(row[j])
+             # Вывод дисциплины/раздела, если колонок в файле нет
+             # (реальные регистры «Комплекты чертежей»): дисциплина —
+-            # из шифра комплекта (АР1 → АР), раздел — из имени листа книги.
++            # из шифра комплекта (АР1 → 01_АР), раздел — из имени листа
++            # книги, а если оно служебное — из строки-раздела в данных.
++            row_data["discipline"] = _canon_discipline(row_data["discipline"])
+             if not row_data["discipline"]:
+                 row_data["discipline"] = _discipline_from_code(kit)
+             if not row_data["section"]:
+-                row_data["section"] = default_section
++                row_data["section"] = default_section or current_section_row
+             j = cols.get("qty")
+             if j is not None and len(row) > j:
+                 try:
