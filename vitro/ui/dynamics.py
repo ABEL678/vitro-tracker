@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
+from vitro._cache import versioned_cache
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import render_standard_filters
 
@@ -68,7 +69,7 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
 # ---------------------------------------------------------------------------
 #  Потоки по месяцам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_issue_stats(disciplines: tuple, sections: tuple,
                        kits: tuple, block_codes: tuple,
                        date_from: date, date_to: date,
@@ -88,7 +89,7 @@ def _load_issue_stats(disciplines: tuple, sections: tuple,
         return pd.read_sql(q, conn, params=params)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_our_answers_stats(disciplines: tuple, sections: tuple,
                               kits: tuple, block_codes: tuple,
                               date_from: date, date_to: date,
@@ -109,7 +110,7 @@ def _load_our_answers_stats(disciplines: tuple, sections: tuple,
         return pd.read_sql(q, conn, params=params)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
                                   kits: tuple, block_codes: tuple,
                                   date_from: date, date_to: date,
@@ -133,7 +134,7 @@ def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
 # ---------------------------------------------------------------------------
 #  По дисциплинам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_issue_by_discipline(disciplines: tuple, sections: tuple,
                                 kits: tuple, block_codes: tuple,
                                 date_from: date, date_to: date,
@@ -155,7 +156,7 @@ def _load_issue_by_discipline(disciplines: tuple, sections: tuple,
         return pd.read_sql(q, conn, params=params)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
                                       kits: tuple, block_codes: tuple,
                                       date_from: date, date_to: date,
@@ -178,7 +179,7 @@ def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
         return pd.read_sql(q, conn, params=params)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_customer_closed_by_discipline(disciplines: tuple, sections: tuple,
                                           kits: tuple, block_codes: tuple,
                                           date_from: date, date_to: date,

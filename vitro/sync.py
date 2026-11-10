@@ -95,6 +95,17 @@ def refresh_data(verbose: bool = True) -> dict:
     log_event("refresh", f"Загружено {len(comments)} замечаний", rows=len(comments))
     log(f"\n✅ Готово за {elapsed} сек")
 
+    # PATCH-06: сброс кэшей Streamlit, если синк вызван из приложения
+    # (кнопка в «Управлении») — данные на вкладках обновятся мгновенно.
+    # Для синка из отдельного процесса (sync_runner.py) кэши приложения
+    # сбрасывает версионный штамп vitro/_cache.py (см. versioned_cache).
+    try:
+        import streamlit as st
+        st.cache_data.clear()
+        log("   Кэши Streamlit сброшены")
+    except Exception:
+        pass  # bare-режим (запуск вне Streamlit) — не критично
+
     return {
         "documents": n_docs,
         "comments":  n_comments,

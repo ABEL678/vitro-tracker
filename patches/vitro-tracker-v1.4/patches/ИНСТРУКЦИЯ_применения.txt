@@ -57,6 +57,40 @@ Total...», ветка main/release-1.3). Применяются по поряд
 03-plan-tab.patch — вкладка «План выдачи комплектов»:
    app.py, vitro/sqlite_db.py, vitro/plan_xlsx.py (новый),
    vitro/ui/plan.py (новый), README.md, AGENTS.md
+04-plan-real-registers.patch — поддержка реальных регистров
+   «Комплекты чертежей» (шифры из шапок, «Номер листа», try/except
+   при сохранении): vitro/plan_xlsx.py, vitro/sqlite_db.py,
+   vitro/ui/plan.py, vitro/ui/authors.py
+05-donut-count-fix.patch — исправление двойного подсчёта в бублике
+   «Листов всего/план» (vitro/ui/plan.py, только _render_donuts):
+   «всего» = сумма плановых листов из ведомостей (никогда не больше);
+   «загружено» = min(в Витро, план); «план» = разница.
+   Листы Витро сверх плана показываются отдельной подписью.
+
+   Применение: git apply patches/05-donut-count-fix.patch
+   (на состояние после патча 04). Либо заменить целиком файлом
+   files-05/vitro/ui/plan.py.
+06-performance.patch — производительность на больших проектах
+   (70 000+ замечаний, 480+ комплектов, 14 000+ чертежей):
+   • vitro/_cache.py (НОВЫЙ) — версионный кэш: загрузчики автоматически
+     сбрасываются при любом изменении БД (синк из другого процесса,
+     правки замечаний) вместо устаревания раз в час;
+   • vitro/workdays.py — мемоизация рабочих дней: холодный старт
+     Сводки/Авторов/Динамики на 70k строк: 47.6 с → 1.2 с (×41);
+   • 6 вкладок (summary/dynamics/authors/categories/export/search) —
+     32 загрузчика переведены на версионный кэш; тёплый клик ≈ 0 мс;
+   • vitro/ui/search.py — кэш результатов поиска (300 с);
+   • vitro/ui/plan.py — детальная таблица: показ первых 2000 строк
+     (полный объём в Excel);
+   • vitro/plan_xlsx.py — Excel-выгрузка строится один раз на набор
+     данных, а не на каждом реране;
+   • vitro/sync.py — сброс кэшей после синка из приложения.
+   Файлы: vitro/_cache.py, vitro/workdays.py, vitro/sync.py,
+   vitro/plan_xlsx.py, vitro/ui/{plan,summary,dynamics,authors,
+   categories,export,search}.py
+   Применение: git apply patches/06-performance.patch
+   (на состояние после патчей 04 и 05). Либо скопировать файлы из
+   files-06/ (plan.py там уже включает и патч 05).
 
 ПАТЧ 04 — поверх ветки release/1.4-plan c коммитом Гигакода 94456dc
 --------------------------------------------------------------------

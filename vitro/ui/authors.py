@@ -20,6 +20,7 @@ import plotly.express as px
 import streamlit as st
 
 from vitro.sqlite_db import update_category_safe
+from vitro._cache import versioned_cache
 from vitro.disciplines import discipline_name
 from vitro.ui._auth import ensure_user
 from vitro.ui._filters import (
@@ -94,7 +95,7 @@ def _collapse_repeats(df: pd.DataFrame,
 # ---------------------------------------------------------------------------
 #  Единый источник
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_all_categorized() -> pd.DataFrame:
     from vitro.ui.deadlines import _load_all_categorized as _src
     return _src()
@@ -196,7 +197,7 @@ def _render_kpi(df_all: pd.DataFrame, df_ours: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Агрегация по авторам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_authors(disciplines: tuple = (), sections: tuple = (),
                    kits: tuple = (),
                    sheet_groups: tuple = (),
@@ -314,7 +315,7 @@ def _render_authors_table(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Детали автора
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_author_by_discipline(author: str,
                                 sheet_groups: tuple = (),
                                 remark_statuses: tuple = (),
@@ -358,7 +359,7 @@ def _load_author_by_discipline(author: str,
     return pd.DataFrame(rows).sort_values("n", ascending=False)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_author_comments(author: str,
                           sheet_groups: tuple = (),
                           remark_statuses: tuple = (),
@@ -613,7 +614,7 @@ def _render_drilldown(df: pd.DataFrame, df_ours: pd.DataFrame):
 # ---------------------------------------------------------------------------
 #  Ждут заказчика — редактор категорий
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_waiting_review(disciplines=None, kits=None,
                           sections=None, authors=None,
                           block_codes=None, marka: str = "") -> pd.DataFrame:
@@ -857,7 +858,7 @@ def _render_waiting_review():
 # ---------------------------------------------------------------------------
 #  К листам A и аннулированным
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_customer_a_annulled(disciplines=None, kits=None,
                                 sections=None,
                                 block_codes=None,

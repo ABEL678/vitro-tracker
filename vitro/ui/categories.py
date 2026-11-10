@@ -25,6 +25,7 @@ from vitro.sqlite_db import (
     update_category_safe,
     update_category_force,
 )
+from vitro._cache import versioned_cache
 from vitro.time_utils import fmt_msk
 from vitro.ui._auth import ensure_user
 from vitro.ui._filters import (
@@ -109,7 +110,7 @@ def _add_prefix(raw_value: str):
 # ---------------------------------------------------------------------------
 #  Единый срез наших замечаний
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_active_df() -> pd.DataFrame:
     """Замечания на нашей стороне (holder == "ours")."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -122,7 +123,7 @@ def _load_active_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Прогресс категоризации
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_categorization_progress() -> dict:
     active = _load_active_df()
     total = len(active)
@@ -157,7 +158,7 @@ def _load_categorization_progress() -> dict:
 # ---------------------------------------------------------------------------
 #  Распределение по 4 категориям
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_overall_distribution() -> pd.DataFrame:
     active = _load_active_df()
     if active.empty:
@@ -184,7 +185,7 @@ def _load_overall_distribution() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Кросс-таблица
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_category_by_status() -> pd.DataFrame:
     active = _load_active_df()
     if active.empty:
@@ -221,7 +222,7 @@ def _load_category_by_status() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  По дисциплинам
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_by_discipline() -> pd.DataFrame:
     active = _load_active_df()
     if active.empty:
@@ -240,7 +241,7 @@ def _load_by_discipline() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Активность специалистов
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_user_activity() -> pd.DataFrame:
     with get_conn() as conn:
         df = pd.read_sql("""

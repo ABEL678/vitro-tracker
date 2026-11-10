@@ -10,6 +10,7 @@
 """
 
 from datetime import date, timedelta
+from functools import lru_cache  # PATCH-06: мемоизация чистых функций дат
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,7 @@ WORKING_SATURDAYS = {
 # ---------------------------------------------------------------------------
 #  Публичные функции
 # ---------------------------------------------------------------------------
+@lru_cache(maxsize=65536)   # PATCH-06: 70k строк × циклы по дням → O(1)
 def is_workday(d: date) -> bool:
     """
     Является ли дата рабочим днём по пятидневной неделе РФ.
@@ -113,6 +115,8 @@ def is_workday(d: date) -> bool:
     return iso not in holidays
 
 
+@lru_cache(maxsize=65536)   # PATCH-06: у 70k строк даты повторяются —
+                            # считаем каждую пару (start, n) один раз
 def add_workdays(start: date, n: int) -> date:
     """
     Прибавляет N рабочих дней к дате (отсчёт со следующего дня).
@@ -131,6 +135,8 @@ def add_workdays(start: date, n: int) -> date:
     return d
 
 
+@lru_cache(maxsize=65536)   # PATCH-06: пары (due, today) повторяются
+                            # тысячами — без кэша 47 с на 70k строк
 def workdays_between(start: date, end: date) -> int:
     """
     Количество рабочих дней между двумя датами (не включая start).
@@ -147,6 +153,7 @@ def workdays_between(start: date, end: date) -> int:
     return count
 
 
+@lru_cache(maxsize=65536)   # PATCH-06: даты в БД повторяются тысячами
 def parse_date(s: str) -> date | None:
     """
     Парсит дату из строки ISO-формата (2026-09-25T16:50:24Z или 2026-09-25).

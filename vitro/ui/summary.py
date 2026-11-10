@@ -23,6 +23,7 @@ import plotly.express as px
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
+from vitro._cache import versioned_cache
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
     _doc_status_group,
@@ -90,7 +91,7 @@ EMOJI = {
 # ---------------------------------------------------------------------------
 #  Источник
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_all_categorized() -> pd.DataFrame:
     from vitro.ui.deadlines import _load_all_categorized as _src
     return _src()
@@ -162,7 +163,7 @@ def _filter_documents(df: pd.DataFrame,
 # ---------------------------------------------------------------------------
 #  Документы
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_documents() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql("""
@@ -178,7 +179,7 @@ def _load_documents() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Общий объём
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_scale(disciplines: tuple = (),
                  sections: tuple = (),
                  kits: tuple = (),
@@ -696,7 +697,7 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
 # ===========================================================================
 #  Бублик статусов замечаний
 # ===========================================================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
     (disciplines, sections, kits, block_codes,
      remark_statuses, sheet_groups, marka) = filter_key
@@ -896,7 +897,7 @@ def _build_summary_rows(group_col: str,
     return result
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_summary_by_discipline(
     disciplines: tuple = (),
     sections: tuple = (),
@@ -916,7 +917,7 @@ def _load_summary_by_discipline(
     return _build_summary_rows("discipline", active, docs)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_summary_by_section(
     disciplines: tuple = (),
     sections: tuple = (),
@@ -936,7 +937,7 @@ def _load_summary_by_section(
     return _build_summary_rows("section", active, docs)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_summary_by_complex(
     disciplines: tuple = (),
     sections: tuple = (),

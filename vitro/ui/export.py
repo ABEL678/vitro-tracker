@@ -15,6 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
+from vitro._cache import versioned_cache
 from vitro.pdf_builder import build_pdf
 from vitro.ui._filters import render_standard_filters
 
@@ -36,7 +37,7 @@ STATUSES = [
 # ---------------------------------------------------------------------------
 #  Единый источник активных
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_active_df() -> pd.DataFrame:
     """Активные замечания из deadlines._load_all_categorized."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -54,7 +55,7 @@ def _load_active_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Сводки через _load_all_categorized
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_discipline_summary() -> pd.DataFrame:
     """
     Сводка по дисциплинам:
@@ -163,7 +164,7 @@ def _load_discipline_summary() -> pd.DataFrame:
     })
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_complex_summary() -> pd.DataFrame:
     """Сводка по комплектам."""
     active = _load_active_df()
@@ -247,7 +248,7 @@ def _load_complex_summary() -> pd.DataFrame:
     })
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_section_summary() -> pd.DataFrame:
     """Сводка по разделам."""
     active = _load_active_df()
@@ -393,7 +394,7 @@ def _load_comments_filtered(query: str,
 # ---------------------------------------------------------------------------
 #  Аналитика
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_authors_analytics() -> pd.DataFrame:
     """Аналитика по авторам — только активные."""
     active = _load_active_df()
@@ -462,7 +463,7 @@ def _load_authors_analytics() -> pd.DataFrame:
     }).sort_values("Активных", ascending=False)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_monthly_dynamics() -> pd.DataFrame:
     """
     Динамика по месяцам: выдача / наши ответы / закрыто заказчиком.
@@ -503,7 +504,7 @@ def _load_monthly_dynamics() -> pd.DataFrame:
     return merged
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_lagging_complexes(limit: int = 50) -> pd.DataFrame:
     """Комплекты с наибольшим числом просрочек АТП ТЛП."""
     active = _load_active_df()

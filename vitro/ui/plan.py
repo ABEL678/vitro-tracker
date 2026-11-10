@@ -482,11 +482,22 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
     ])
     kits_data = kits_data[kits_data["Количество"] > 0]
 
-    sheets_loaded = int(plan_df["sheets_vitro"].sum())
-    sheets_remaining = int(
-        (plan_df["sheets_plan"] - plan_df["sheets_vitro"])
-        .clip(lower=0).sum()
-    )
+    # ---- ЛИСТЫ: «всего» = плановое количество из ведомостей ----
+    # По каждому комплекту:
+    #   загружено = min(листов в Витро, план) — сколько ПЛАНОВЫХ листов
+    #               уже в Витро;
+    #   остаток   = план − загружено (разница, а не сумма).
+    # Листы Витро сверх плана (повторы, извещения, комплекты без
+    # ведомости чертежей) в бублик не включаются — иначе «всего»
+    # раздувается выше суммы строк ведомости.
+    plan_sheets = plan_df["sheets_plan"].astype(int)
+    vitro_sheets = plan_df["sheets_vitro"].astype(int)
+    sheets_total = int(plan_sheets.sum())
+    sheets_loaded = int(
+        pd.concat([vitro_sheets, plan_sheets], axis=1).min(axis=1).sum())
+    sheets_remaining = sheets_total - sheets_loaded
+    sheets_excess = int((vitro_sheets - plan_sheets).clip(lower=0).sum())
+
     sheets_data = pd.DataFrame([
         {"Группа": "Загружено в Витро", "Количество": sheets_loaded},
         {"Группа": "План к загрузке", "Количество": sheets_remaining},
@@ -503,18 +514,20 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
                center_total=f"{n_total}")
     with col2:
         st.caption(
-            f"Листов всего (план): "
-            f"**{sheets_loaded + sheets_remaining}** · "
+            f"Листов всего (план): **{sheets_total}** · "
             f"загружено **{sheets_loaded}** · план **{sheets_remaining}**"
         )
         _donut(sheets_data, "Группа", "Количество", "plan_pie_sheets",
-               center_total=f"{sheets_loaded + sheets_remaining}")
+               center_total=f"{sheets_total}")
 
-    st.caption(
-        "Листов всего = листов в Витро + остаток плана "
-        "(плановое количество ведомостей минус уже загруженное)."
-    )
-    return (n_total, sheets_loaded + sheets_remaining)
+    if sheets_excess > 0:
+        st.caption(
+            f"ℹ️ В Витро есть ещё {sheets_excess} лист(ов) сверх "
+            "планового количества (повторы, извещения, комплекты без "
+            "ведомости чертежей) — в бублик не включены: «всего» "
+            "никогда не превышает ведомость."
+        )
+    return (n_total, sheets_total)
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
+from vitro._cache import versioned_cache
 from vitro.ui._filters import (
     _filter_by_blocks,
     _filter_by_marka,
@@ -46,7 +47,7 @@ STATUSES = [
 #  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты),
 #  авторы — локальный справочник поиска
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
+@versioned_cache(600)
 def _load_author_options() -> list[str]:
     with get_conn() as conn:
         return [r["author"] for r in conn.execute("""
@@ -59,6 +60,7 @@ def _load_author_options() -> list[str]:
 # ---------------------------------------------------------------------------
 #  Основной поиск
 # ---------------------------------------------------------------------------
+@versioned_cache(300)   # повторный тот же запрос — мгновенно
 def _search_comments(query: str,
                      disciplines=(), sections=(), kits=(),
                      statuses=(), authors=(), categories=(),
