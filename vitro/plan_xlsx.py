@@ -109,9 +109,19 @@ _HOMOGLYPHS = str.maketrans({
 })
 
 
-def _is_valid_kit_code(code: str) -> bool:
-    """True, если строка похожа на шифр комплекта (АТ-РД-КЖ1-1-00)."""
+def is_valid_kit_code(code: str) -> bool:
+    """True, если строка похожа на шифр комплекта (АТ-РД-КЖ1-1-00).
+
+    Публичная точка проверки для фильтрации мусорных шифров (патч 13):
+    фильтр применяется и к комплектам из ведомостей, и к комплектам
+    из Витро (в т. ч. исторический мусор в plan_kits — шифры
+    с запятыми/точками вида «АТ-РД-КЖ1,2-С-П2.3.ВР»).
+    """
     return bool(_KIT_CODE_PATTERN.match(code)) if code else False
+
+
+# Обратная совместимость (патчи 10–12 использовали приватное имя):
+_is_valid_kit_code = is_valid_kit_code
 
 
 def _kit_code_of(value) -> str:
@@ -125,7 +135,71 @@ def _kit_code_of(value) -> str:
     Единственная точка входа для обоих парсеров.
     """
     code = _norm_complex_code(value)
-    return code if _is_valid_kit_code(code) else ""
+    return code if is_valid_kit_code(code) else ""
+
+
+def _kit_from_row_cells(row, skip_cols: set = frozenset()
+                        ) -> tuple[str, str, int]:
+    """Поиск шифра комплекта ПО ВСЕЙ строке (патч 13).
+
+    Реестры ТХ/ЭС/АК оформлены иначе, чем ОВ/АР/ВК: шапка комплекта
+    может стоять не в колонке «Шифр», а в колонке «Название листа»
+    («АТ-РД-ТХ1-С-00 Система ТХ…»), а шифр — в отдельной колонке без
+    распознанного заголовка. Парсер не находил такие шапки, и все
+    строки до первой узнанной шапки отбрасывались («не найден шифр
+    комплекта»).
+
+    Сканирует ячейки слева направо (пропуская skip_cols — колонку
+    шифра уже проверил вызывающий): каждая ячейка делится на первое
+    слово и остаток; если первое слово — валидный шифр комплекта,
+    возвращает (шифр, остаток-название, индекс колонки). Иначе
+    ('', '', -1).
+
+    Ложные срабатывания практически исключены: полный шифр листа
+    («АТ-РД-ОВ1-С-00-10») и марки («ВР», «СО») строгую регулярку
+    не проходят, названия чертежей не начинаются с трёх-четырёх
+    блоков через дефис.
+    """
+    for j, v in enumerate(row):
+        if j in skip_cols or v is None:
+            continue
+        s = " ".join(str(v).split())
+        if not s:
+            continue
+        first, _, rest = s.partition(" ")
+        code = _kit_code_of(first)
+        if code:
+            return code, rest.strip(), j
+    return "", "", -1
+
+
+def _looks_like_drawing_row(row, cols: dict, c_full, c_no,
+                            found_col: int) -> bool:
+    """Строка с найденным шифром — чертёж или шапка комплекта (патч 13)?
+
+    Чертёж: есть собственный номер листа (полный шифр или колонка
+    «Номер») ЛИБО непустое название в СВОЕЙ колонке (не в той ячейке,
+    из которой мы забрали шапку), не похожее на строку-раздел.
+    Иначе это шапка комплекта — данные листа у неё свои.
+    """
+    full = _norm_complex_code(_cell_local(row, c_full)) \
+        if c_full is not None else ""
+    if full and "-" in full and full.rsplit("-", 1)[-1]:
+        return True
+    if c_no is not None and _fmt_sheet_no(_cell_local(row, c_no)):
+        return True
+    t = " ".join(_clean_str(_cell_local(row, cols.get("title"))).split())
+    if t and found_col != cols.get("title") \
+            and not _looks_like_section_header(t):
+        return True
+    return False
+
+
+def _cell_local(row, j):
+    """Ячейка строки по индексу (None за границей) — хелпер патча 13."""
+    if j is None or j < 0 or len(row) <= j:
+        return None
+    return row[j]
 
 
 def _norm_header(value) -> str:
@@ -499,6 +573,13 @@ def parse_drawings_workbook(
         наследует текущий комплект;
       - метки «Приложение 1» в колонке шифра комплектом НЕ считаются.
 
+    Патч 13 (реестры ТХ/ЭС/АК): если в колонке шифра комплекта шапки
+    нет, строка-шапка ищется по ВСЕЙ строке — в колонке «Название
+    листа» («АТ-РД-ТХ1-С-00 Система ТХ…») или в отдельной колонке без
+    распознанного заголовка (шифр отдельной ячейкой = смена комплекта).
+    Это убирает «N строк пропущено — не найден шифр комплекта» в
+    начале листов ТХ/ЭС/АК.
+
     Номер листа берётся из ПОЛНОГО шифра листа (последний блок после дефиса —
     в реальных регистрах он каноничен: «АТ-РД-АР1-С-00-2.1.0»), а если той
     колонки нет — из колонки «Номер листа».
@@ -601,6 +682,26 @@ def parse_drawings_workbook(
                 # строка ниже всё ещё может быть чертежом
                 current_kit = kit_norm
                 kits.setdefault(current_kit, "")
+            else:
+                # ---- патч 13: шапки ТХ/ЭС/АК ----
+                # В колонке шифра комплекта нет. Ищем шапку/шифр
+                # по всей строке (в названии листа или отдельной
+                # колонке без распознанного заголовка).
+                f_code, f_name, f_col = _kit_from_row_cells(
+                    row, skip_cols={c_kit} if c_kit is not None else set())
+                if f_code:
+                    current_kit = f_code
+                    if f_name:
+                        # «АТ-РД-ТХ1-С-00 Система ТХ…» в другой колонке
+                        current_kit_name = f_name
+                        if not kits.get(current_kit):
+                            kits[current_kit] = current_kit_name
+                    else:
+                        # шифр отдельной ячейкой — смена комплекта
+                        kits.setdefault(current_kit, "")
+                    if not _looks_like_drawing_row(
+                            row, cols, c_full, c_no, f_col):
+                        continue  # это шапка комплекта, не чертёж
             # иначе в колонке шифра метка («Приложение 1», «Подземная
             # часть», «Прилагаемые документы») — комплект НЕ сменяем.
 

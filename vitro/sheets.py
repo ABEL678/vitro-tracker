@@ -28,6 +28,14 @@
      отдельная сущность со своим ID. Дедупликация применяется только
      к подсчёту ЛИСТОВ; замечание, привязанное к старой ревизии,
      продолжает учитываться.
+  6. ШИФР КОМПЛЕКТА НОРМАЛИЗУЕТСЯ (патч 13): trim + верхний регистр +
+     латинские двойники → кириллица. Синк пишет complex как есть
+     (из имён папок SharePoint), поэтому один комплект мог храниться
+     под несколькими написаниями («АТ-РД-ОВ2-C-00» латиницей и
+     «АТ-РД-ОВ2-С-00» кириллицей, хвостовой пробел) — группировка
+     делила его листы: СМИК показывал 33 вместо 44, а фантомные
+     варианты раздували «Комплектов всего». После нормализации
+     варианты склеиваются и в Сводке, и в Плане выдачи.
 
 Инструменты модуля:
   * sheet_key(row)          — ключ уникальности листа для строки.
@@ -43,6 +51,27 @@
 # ---------------------------------------------------------------------------
 #  Нормализация значений
 # ---------------------------------------------------------------------------
+# Латинские двойники кириллицы (появляются при копировании шифров
+# из CAD/Word и в именах папок SharePoint). Тот же набор, что в
+# plan_xlsx._HOMOGLYPHS; дублируется намеренно: sheets.py — базовый
+# модуль (его импортирует sqlite_db), тянуть туда plan_xlsx со
+# Streamlit нельзя.
+_LAT2CYR = str.maketrans({
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К",
+    "M": "М", "O": "О", "P": "Р", "T": "Т", "X": "Х",
+})
+
+
+def _norm_complex(v) -> str:
+    """Нормализация шифра комплекта (патч 13): строка, trim (включая
+    неразрывный пробел \xa0), верхний регистр, латинские двойники →
+    кириллица. None/NaN → ''."""
+    s = _s(v)
+    if not s:
+        return ""
+    return s.upper().translate(_LAT2CYR)
+
+
 def _s(v) -> str:
     """None/NaN → '', остальное → str без пробелов по краям."""
     if v is None:
@@ -73,11 +102,15 @@ def sheet_key(row: dict) -> tuple:
 
     sheet_number заполнен → ('sheet', complex, sheet_number);
     sheet_number пустой   → ('row', id) — файл сам себе лист (fallback).
+
+    Патч 13: complex нормализуется (_norm_complex) — варианты написания
+    шифра (латиница, пробелы) дают ОДИН ключ, листы комплекта
+    не делятся между фантомными написаниями.
     """
     sn = _s(row.get("sheet_number"))
     if not sn:
         return ("row", _int(row.get("id")))
-    return ("sheet", _s(row.get("complex")), sn)
+    return ("sheet", _norm_complex(row.get("complex")), sn)
 
 
 def _rev_order(row: dict) -> tuple:
@@ -102,6 +135,12 @@ def dedup_document_rows(rows) -> list:
     Без этого аннулированная ревизия проигрывала последней живой
     по (status_date, id) и лист «переставал быть аннулированным»:
     в Сводке «Аннулировано» падало в 0 вместо реальных значений.
+
+    Патч 13: у оставленных строк нормализуется complex (_norm_complex):
+    группировки дальше по сырым значениям (разрез «По комплектам»
+    в Сводке, GROUP BY в Плане выдачи) больше не делят комплект
+    между вариантами написания шифра (латиница/пробелы).
+    Входные dict'ы не мутируются.
     """
     best: dict[tuple, dict] = {}
     annulled_keys: set[tuple] = set()
@@ -121,7 +160,17 @@ def dedup_document_rows(rows) -> list:
             row = dict(row)
             row["status"] = "АННУЛИРОВАНО"
             best[key] = row
-    return sorted(best.values(), key=lambda r: _int(r.get("id")))
+    kept = []
+    for r in best.values():
+        raw_cx = r.get("complex")
+        cx_norm = _norm_complex(raw_cx)
+        # копия — если сырое значение отличается от нормализованного
+        # (пробелы, регистр, латиница); входные dict'ы не мутируем
+        if cx_norm and (raw_cx is None or str(raw_cx) != cx_norm):
+            r = dict(r)
+            r["complex"] = cx_norm
+        kept.append(r)
+    return sorted(kept, key=lambda r: _int(r.get("id")))
 
 
 def dedup_documents(df):
@@ -151,12 +200,21 @@ def sql_count_sheets(alias: str = "d") -> str:
     Ключ — (complex, sheet_number); строки с пустым sheet_number
     считаются поодиночке (по id). COALESCE(complex,'') защищает от
     потери строк с NULL-комплектом (NULL || x = NULL в SQLite).
+
+    Патч 13: перед TRIM табуляция (CHAR 9) и неразрывный пробел
+    (CHAR 160) заменяются обычным пробелом — иначе SQL TRIM (он
+    снимает только пробел 0x20) расходился с pandas-дедупликацией
+    (_s снимает \xa0): номер «10\xa0» в SQL считался отдельным листом,
+    а в Сводке приклеивался к «10».
     """
     a = alias
     return (
         f"COUNT(DISTINCT CASE "
-        f"WHEN TRIM(COALESCE({a}.sheet_number, '')) != '' "
-        f"THEN COALESCE({a}.complex, '') || '||' "
-        f"|| TRIM({a}.sheet_number) "
+        f"WHEN TRIM(REPLACE(REPLACE(COALESCE({a}.sheet_number, ''), "
+        f"CHAR(9), ' '), CHAR(160), ' ')) != '' "
+        f"THEN TRIM(REPLACE(REPLACE(COALESCE({a}.complex, ''), "
+        f"CHAR(9), ' '), CHAR(160), ' ')) || '||' "
+        f"|| TRIM(REPLACE(REPLACE({a}.sheet_number, "
+        f"CHAR(9), ' '), CHAR(160), ' ')) "
         f"ELSE 'row:' || {a}.id END)"
     )

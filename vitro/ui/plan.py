@@ -45,9 +45,26 @@
 план» удаляет комплекты (и их чертежи), которых нет в загружаемой
 ведомости, — старые записи не смешиваются с новыми (бублик
 «Комплектов всего» больше не раздувается 541 вместо 471).
-Бублик «Листов» считает «в Витро» тем же выражением, что и Сводка
-(sheets.sql_count_sheets): файлы с пустым sheet_number — отдельные
-листы (пример СМИК: 44, а не 33).
+Бублик «Листов» считает «в Витро» тем же кодом дедупликации, что
+и Сводка (с патча 13 — sheets.dedup_document_rows): файлы с пустым
+sheet_number — отдельные листы (пример СМИК: 44, а не 33).
+
+Патч 13:
+  1. МУСОРНЫЕ КОМПЛЕКТЫ отсекаются и со стороны Витро: _build_overview
+     пропускает шифры, не проходящие is_valid_kit_code («АТ-РД-КЖ1,2-С-П2.3.ВР»
+     с запятыми/точками больше не попадают в таблицу и бублик как
+     «Только в Витро»); _prune_plan_kits удаляет такой исторический
+     мусор из plan_kits даже без «Заменить план».
+  2. СЧЁТ ЛИСТОВ ОДИН НА ВСЮ ВКЛАДКУ: _vitro_sheet_counts считает
+     через sheets.dedup_document_rows (тот же код, что и Сводка) —
+     варианты написания шифра из Витро (латиница/пробелы) склеиваются,
+     СМИК = 44, а не 33; _vitro_sheet_dates нормализует ключи.
+  3. ЗАМЕЧАНИЯ ПАРСЕРА не пропадают: список хранится в
+     st.session_state (блок «⚠️ Замечания последней загрузки» над
+     вкладкой) и пишется в журнал (log) при сохранении.
+  4. ШАПКИ ТХ/ЭС/АК: см. plan_xlsx.parse_drawings_workbook.
+  5. «📜 ЖУРНАЛ ЗАГРУЗОК»: последние события plan_import/plan_clear
+     из таблицы log (дата, строки, сообщение) — переживает F5.
 
 Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
 """
@@ -68,7 +85,7 @@ from vitro.sqlite_db import (
     clear_plan,
     log_event,
 )
-from vitro.sheets import sql_count_sheets
+from vitro.sheets import dedup_document_rows
 from vitro._cache import versioned_cache
 from vitro.ui._auth import ensure_user
 from vitro.ui._filters import (
@@ -80,9 +97,11 @@ from vitro.ui._filters import (
 from vitro.plan_xlsx import (
     MIME_XLSX,
     build_plan_export,
+    is_valid_kit_code,
     parse_drawings_workbook,
     parse_kits_workbook,
     _kit_code_of,
+    _norm_complex_code,
 )
 
 # ---------------------------------------------------------------------------
@@ -137,29 +156,30 @@ MAX_DETAIL_ROWS = 2000  # строки детальных таблиц свер�
 def _vitro_sheet_counts() -> dict[str, int]:
     """{шифр комплекта: количество УНИКАЛЬНЫХ листов в Витро}.
 
-    Патч 12: тем же выражением, что во всём приложении
-    (sheets.sql_count_sheets — стандарт патчей 11–12):
+    Патч 13: тот же код, что и в Сводке — sheets.dedup_document_rows
+    (единый стандарт патчей 11–13):
       * ревизии/повторы листа с номером считаются ОДИН раз
         (ключ complex + sheet_number);
       * файлы с ПУСТЫМ sheet_number — самостоятельные листы
-        (fallback по id).
-    Раньше здесь был COUNT(DISTINCT sheet_number) без учёта пустых:
-    комплект, у которого 33 файла с номерами и 11 файлов без номера,
-    получал 33 вместо 44 — бублик «Листов» расходился со Сводкой
-    (пример СМИК: «в Витро: 33» при реальных 44).
+        (fallback по id);
+      * complex НОРМАЛИЗУЕТСЯ (trim, регистр, латинские двойники):
+        синк пишет complex как есть из папок SharePoint, поэтому
+        один комплект мог храниться под несколькими написаниями —
+        группировка делила его листы (пример СМИК: 33 вместо 44,
+        фантомный дубль в «Только в Витро» раздувал бублик).
     """
     with get_conn() as conn:
-        rows = conn.execute(f"""
-            SELECT complex,
-                   {sql_count_sheets('documents')} AS n_sheets
+        rows = conn.execute("""
+            SELECT id, complex, sheet_number, status, status_date
             FROM documents
             WHERE complex IS NOT NULL
-            GROUP BY complex
         """).fetchall()
-    return {
-        r["complex"]: int(r["n_sheets"])
-        for r in rows if r["complex"]
-    }
+    counts: dict[str, int] = {}
+    for r in dedup_document_rows([dict(x) for x in rows]):
+        code = str(r.get("complex") or "").strip()
+        if code:
+            counts[code] = counts.get(code, 0) + 1
+    return counts
 
 
 @versioned_cache(600)
@@ -200,6 +220,10 @@ def _vitro_sheet_dates() -> dict[tuple[str, str], str]:
     {(шифр комплекта, номер листа): дата статуса в Витро} — фактическая
     дата загрузки листа (MAX по ревизиям). Для колонки «Фактическая дата»
     таблицы Б.
+    Патч 13: ключ шифра НОРМАЛИЗУЕТСЯ — план_drawings хранит уже
+    нормализованные шифры, а documents.complex мог быть с пробелами/
+    латиницей; без нормализации «Фактическая дата» не находилась и
+    лист ошибочно считался «Планируется».
     """
     with get_conn() as conn:
         rows = conn.execute("""
@@ -212,7 +236,8 @@ def _vitro_sheet_dates() -> dict[tuple[str, str], str]:
             GROUP BY complex, sheet_number
         """).fetchall()
     return {
-        (r["complex"], str(r["sheet_number"]).strip()): str(r["d"])
+        (_norm_complex_code(r["complex"]),
+         str(r["sheet_number"]).strip()): str(r["d"])
         for r in rows if r["d"]
     }
 
@@ -244,6 +269,13 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     Одна строка = один комплект: план (ведомости) + Витро.
     Общий статус вычисляется: Загружен в Витро / Загружается (частично) /
     План (не загружен) / Только в Витро.
+
+    Патч 13: комплекты с шифрами, не проходящими is_valid_kit_code
+    (мусор с запятыми/точками вида «АТ-РД-КЖ1,2-С-П2.3.ВР» и прочие
+    не-шифры), НЕ попадают в таблицу и бублик, даже если пришли
+    из Витро (статус «Только в Витро») или лежат в plan_kits с
+    старых загрузок. Без фильтра «Комплектов всего» оставалось 541
+    вместо реальных 421.
     """
     plan = load_plan_kits()
     drawings = load_plan_drawings()
@@ -256,6 +288,8 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     if not plan.empty:
         for _, r in plan.iterrows():
             code = r["code"]
+            if not is_valid_kit_code(code):
+                continue  # исторический мусор в plan_kits (патч 13)
             in_vitro = code in vitro_counts
             sheets_vitro = vitro_counts.get(code, 0)
             sheets_plan = int(plan_qty.get(code, 0))
@@ -282,9 +316,12 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
 
     if include_vitro_only:
         meta = _vitro_kit_meta()
+        known = set(r["code"] for r in rows)
         for code in sorted(vitro_counts):
-            if code in set(r["code"] for r in rows):
+            if code in known:
                 continue
+            if not is_valid_kit_code(code):
+                continue  # мусорный шифр из папок Витро (патч 13)
             info = meta.get(code, {})
             rows.append({
                 "code": code,
@@ -1047,12 +1084,18 @@ def _prune_plan_kits(keep_codes: set[str]) -> int:
     и бублик «Комплектов всего» показывал 541 вместо 471.
     Сначала удаляются чертежи (FK plan_drawings.kit_code), затем сами
     комплекты. Возвращает число удалённых комплектов.
+
+    Патч 13: шифры, не проходящие is_valid_kit_code, удаляются
+    ВСЕГДА (даже если вдруг попали в keep) — исторический мусор
+    («АТ-РД-КЖ1,2-С-П2.3.ВР») не должен переживать пересохранение.
     """
-    keep = {c for c in (keep_codes or set()) if c}
+    keep = {c for c in (keep_codes or set())
+            if c and is_valid_kit_code(c)}
     with get_conn() as conn:
         existing = [r["code"] for r in
                     conn.execute("SELECT code FROM plan_kits")]
-        stale = [c for c in existing if c not in keep]
+        stale = [c for c in existing
+                 if c not in keep or not is_valid_kit_code(c)]
         if not stale:
             return 0
         ph = ",".join("?" * len(stale))
@@ -1183,9 +1226,17 @@ def _render_import_block() -> None:
                             if removed:
                                 msg += f" · удалено устаревших: {removed}"
                             st.success(msg)
+                            files_str = ", ".join(f.name for f in up_kits)
                             log_event("plan_import",
-                                      f"Ведомость комплектов: {n} строк "
-                                      f"(файлов: {len(up_kits)})", rows=n)
+                                      f"Ведомость комплектов: {n} строк; "
+                                      f"файлы: {files_str}", rows=n)
+                            save_warns = kits_warnings + norm_warns
+                            if save_warns:
+                                log_event(
+                                    "plan_import",
+                                    "Замечания разбора (комплекты):\n• "
+                                    + "\n• ".join(save_warns),
+                                    rows=n, status="WARN")
                             st.rerun()
                         except Exception as e:
                             st.error(f"ОШИБКА БД при сохранении комплектов: {e}")
@@ -1260,9 +1311,17 @@ def _render_import_block() -> None:
                             n_kits = len({r["kit_code"] for r in drawings_rows})
                             st.success(f"✅ Сохранено листов: {n} "
                                        f"({n_kits} компл.)")
+                            files_str = ", ".join(f.name for f in up_drawings)
                             log_event("plan_import",
-                                      f"Ведомости чертежей: {n} листов "
-                                      f"(файлов: {len(up_drawings)})", rows=n)
+                                      f"Ведомости чертежей: {n} листов; "
+                                      f"файлы: {files_str}", rows=n)
+                            save_warns = drawings_warnings + stub_warns
+                            if save_warns:
+                                log_event(
+                                    "plan_import",
+                                    "Замечания разбора (чертежи):\n• "
+                                    + "\n• ".join(save_warns),
+                                    rows=n, status="WARN")
                             st.rerun()
                         except Exception as e:
                             st.error(f"ОШИБКА БД при сохранении чертежей: {e}")
@@ -1270,14 +1329,20 @@ def _render_import_block() -> None:
             else:
                 st.info("Строки чертежей не распознаны.")
 
-        # ---- Предупреждения разбора ----
+        # ---- Предупреждения разбора (патч 13) ----
+        # Сохраняем в session_state: блок «⚠️ Замечания последней
+        # загрузки» отображается СНАРУЖИ экспандера «Вводные данные»
+        # и переживает любые рераны вкладки. Полная история — в журнале.
         all_warnings = kits_warnings + drawings_warnings
         if all_warnings:
-            with st.expander(
-                    f"⚠️ Замечания по файлам ({len(all_warnings)})",
-                    expanded=False):
-                for w in all_warnings[:50]:
-                    st.write(f"- {w}")
+            st.session_state["plan_import_warnings"] = {
+                "time": datetime.now().strftime("%d.%m.%Y %H:%M"),
+                "items": all_warnings,
+            }
+            st.caption(
+                f"⚠️ Замечаний разбора: {len(all_warnings)} — см. блок "
+                "«⚠️ Замечания последней загрузки» под панелью вводных."
+            )
 
         # ---- Опасная зона ----
         st.divider()
@@ -1298,6 +1363,88 @@ def _render_import_block() -> None:
                 st.rerun()
 
 
+# ---------------------------------------------------------------------------
+#  Патч 13: замечания последней загрузки + журнал загрузок
+# ---------------------------------------------------------------------------
+def _render_last_warnings() -> None:
+    """Блок «⚠️ Замечания последней загрузки» (патч 13).
+
+    Раньше st.warning от парсера жил только до следующего рерана,
+    а при F5 исчезал вместе с загруженными файлами — пользователь
+    не мог прочитать, ЧТО было отброшено. Список предупреждений
+    теперь хранится в st.session_state (переживает рераны) и
+    отображается отдельным блоком вне экспандера «Вводные данные».
+    После F5 (новая сессия) историю можно посмотреть в «📜 Журнал
+    загрузок» — предупреждения пишутся в таблицу log при сохранении.
+    """
+    w = st.session_state.get("plan_import_warnings") or {}
+    items = w.get("items") or []
+    if not items:
+        return
+    with st.expander(
+            f"⚠️ Замечания последней загрузки ({len(items)})",
+            expanded=True):
+        st.caption(
+            f"Загрузка от {w.get('time', '—')}. Блок остаётся до "
+            "следующей загрузки; полная история — в «📜 Журнал загрузок»."
+        )
+        for x in items[:50]:
+            st.write(f"- {x}")
+
+
+def _render_import_log() -> None:
+    """Блок «📜 Журнал загрузок» (патч 13): последние события
+    plan_import / plan_clear из таблицы log.
+
+    Показывает: дату (МСК), имя файла/сообщение, число распознанных
+    строк и предупреждения (отдельные записи со статусом WARN).
+    В отличие от st.warning и session_state журнал хранится в БД
+    и переживает перезагрузку страницы (F5) и перезапуск приложения.
+    """
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT timestamp, event, message, rows, status
+                FROM log
+                WHERE event IN ('plan_import', 'plan_clear')
+                ORDER BY rowid DESC
+                LIMIT 30
+            """).fetchall()
+    except Exception:
+        return  # таблицы log ещё нет (старая БД без init_db) — молча
+    data = [{
+        "Дата (МСК)": r["timestamp"] or "",
+        "Событие": ("Очистка плана" if r["event"] == "plan_clear"
+                    else "Загрузка ведомости"),
+        "Строк": r["rows"] if r["rows"] else "",
+        "Статус": r["status"] or "OK",
+        "Сообщение": str(r["message"] or "").replace("\n", " · "),
+    } for r in rows]
+    with st.expander(
+            f"📜 Журнал загрузок (последние {len(data) or 0} записей)",
+            expanded=False):
+        if not data:
+            st.caption("Записей ещё нет — загрузите ведомости.")
+            return
+        st.dataframe(
+            pd.DataFrame(data),
+            use_container_width=True, hide_index=True,
+            height=min(max(len(data) * 36 + 40, 200), 420),
+            column_config={
+                "Дата (МСК)": st.column_config.TextColumn(width="medium"),
+                "Событие": st.column_config.TextColumn(width="small"),
+                "Строк": st.column_config.NumberColumn(width="small"),
+                "Статус": st.column_config.TextColumn(width="small"),
+                "Сообщение": st.column_config.TextColumn(width="large"),
+            },
+        )
+        st.caption(
+            "Записи создаются при сохранении ведомостей и очистке плана; "
+            "предупреждения парсера пишутся отдельными строками "
+            "(Статус = WARN). Переживает F5 и перезапуск приложения."
+        )
+
+
 # ===========================================================================
 #  Точка входа
 # ===========================================================================
@@ -1311,6 +1458,12 @@ def render():
 
     # ---- 0. Вводные данные ----
     _render_import_block()
+
+    # ---- Патч 13: замечания последней загрузки (переживают рераны) ----
+    _render_last_warnings()
+
+    # ---- Патч 13: журнал загрузок (переживает F5, данные из БД) ----
+    _render_import_log()
 
     st.divider()
 
