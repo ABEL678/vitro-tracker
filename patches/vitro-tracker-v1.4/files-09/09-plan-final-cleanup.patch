@@ -1,0 +1,608 @@
+--- a/vitro/ui/plan.py
++++ b/vitro/ui/plan.py
+@@ -15,21 +15,26 @@
+ Структура вкладки (сверху вниз):
+   0. 📥 Вводные данные — импорт ведомостей Excel (свёрнут, без шаблонов).
+   1. Фильтры — единый стандарт (как в «Сводке по проекту»).
+-  2. 📆 Период «с / по» — сразу под фильтрами; применяется к обеим
+-     детальным таблицам (А и Б).
++  2. 📆 Период «с / по» — сразу под фильтрами; применяется к сводной
++     таблице (по «Сроку готовности» комплекта) и к детальному плану
++     по листам (по «Плановой дате» листа).
+   3. 📋 Общая таблица (сводная): группировка «Дисциплина → Раздел»
+      строками-заголовками (как в Сводке), внутри групп — комплекты;
+      колонки: шифр, наименование, общий статус, листов в Витро,
+      листов (план), срок готовности (редактируемый); внизу — строка
+-     «ИТОГО» с суммами.
+-  4. Бублики: «Комплектов всего/план» и «Листов всего/план»
+-     (по отфильтрованным данным).
+-  5. Детальный план:
+-     А) «Детальный план по комплектам» — комплекты, прошедшие фильтры;
+-     Б) «Детальный план по листам комплекта» — позиции plan_drawings
+-        с плановой датой и фактической датой из Витро (если лист загружен).
+-  6. 📥 Выгрузка в Excel — файл из двух листов: «Комплекты» (таблица А)
+-     и «Листы» (таблица Б), с учётом фильтров и выбранного периода.
++     «ИТОГО» с суммами. Единственная таблица комплектов: детальная
++     таблица по комплектам удалена как дублирующая сводную (патч 09).
++  4. Бублики: «Комплектов всего/план» и «Листов всего/план» — по всему
++     отфильтрованному отбору (без периода). «Листов всего» =
++     max(листов по плану, листов в Витро) — листы комплектов, которых
++     нет в ведомостях чертежей, и превышения плана не теряются
++     (патч 09); при превышении показывается «сверх плана».
++  5. Детальный план по листам комплекта — позиции plan_drawings:
++     дисциплина, раздел, комплект, номер и наименование листа,
++     плановая дата, фактическая дата (из Витро) и статус выдачи
++     («Выдан» — есть фактическая дата, «Планируется» — нет).
++  6. 📥 Выгрузка в Excel — лист «Листы» (таблица выше) + «Параметры
++     выгрузки», с учётом фильтров и выбранного периода.
+ 
+ Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
+ """
+@@ -89,18 +94,18 @@
+     "Листов в Витро", "Листов (план)", "Срок готовности",
+ ]
+ 
+-# Таблица А — детальный план по комплектам.
+-KIT_PLAN_COLUMNS = [
+-    "Комплект(ы)", "Наименование комплекта",
+-    "Плановая дата (срок готовности)", "Статус комплекта",
+-]
+-
+-# Таблица Б — детальный план по листам комплекта.
++# Детальный план по листам комплекта — единственная детальная таблица
++# (таблица А по комплектам удалена в патче 09: дублировала сводную).
+ SHEET_PLAN_COLUMNS = [
+     "Дисциплина", "Раздел", "Комплект(ы)", "Номер листа",
+     "Наименование листа", "Плановая дата", "Фактическая дата",
++    "Статус выдачи",
+ ]
+ 
++# Значения колонки «Статус выдачи» (таблица Б).
++STATUS_ISSUED = "Выдан"          # фактическая дата в Витро есть
++STATUS_PLANNED = "Планируется"   # фактической даты нет
++
+ # Служебные префиксы строк сводной таблицы (не комплекты — не сохраняются).
+ _GROUP_MARK = "📁"
+ _TOTAL_MARK = "ИТОГО"
+@@ -387,20 +392,33 @@
+     return update_plan_due_dates(changes, user)
+ 
+ 
+-def _render_overview_table(overview_filtered: pd.DataFrame) -> None:
++def _render_overview_table(overview_filtered: pd.DataFrame,
++                           date_from=None, date_to=None) -> None:
+     """Секция 3. Сводная таблица комплектов: группировка по
+-    «Дисциплина → Раздел», строка «ИТОГО», редактируемый срок."""
++    «Дисциплина → Раздел», строка «ИТОГО», редактируемый срок.
++    Период «с/по» фильтрует комплекты по «Сроку готовности»
++    (патч 09)."""
+     st.markdown("##### 📋 Общая таблица комплектов (сводная)")
+ 
+-    if overview_filtered.empty:
+-        st.info(
+-            "Нет комплектов по выбранным фильтрам. Разверните блок "
+-            "«📥 Вводные данные» и загрузите ведомости Excel."
+-        )
++    overview_period = _apply_period_to_overview(
++        overview_filtered, date_from, date_to)
++
++    if overview_period.empty:
++        if overview_filtered.empty:
++            st.info(
++                "Нет комплектов по выбранным фильтрам. Разверните блок "
++                "«📥 Вводные данные» и загрузите ведомости Excel."
++            )
++        else:
++            st.info(
++                "Нет комплектов со сроком готовности в выбранном периоде "
++                f"({_period_label(date_from, date_to)}). Комплекты без "
++                "срока при активном периоде скрываются."
++            )
+         return
+ 
+     display_before, valid_codes = _overview_to_grouped_display(
+-        overview_filtered)
++        overview_period)
+ 
+     edited = st.data_editor(
+         display_before,
+@@ -452,13 +470,18 @@
+                 st.rerun()
+ 
+     st.caption(
+-        f"Комплектов: **{len(overview_filtered)}** · "
+-        f"листов в Витро: **{int(overview_filtered['sheets_vitro'].sum())}** · "
+-        f"листов (план): **{int(overview_filtered['sheets_plan'].sum())}**. "
++        f"Комплектов: **{len(overview_period)}** · "
++        f"листов в Витро: **{int(overview_period['sheets_vitro'].sum())}** · "
++        f"листов (план): **{int(overview_period['sheets_plan'].sum())}**. "
+         "Группировка: Дисциплина → Раздел (строки «📁…» — заголовки групп, "
+         "«ИТОГО» — суммы по отбору). Срок готовности редактируется "
+         "в строках комплектов."
+     )
++    if date_from or date_to:
++        st.caption(
++            f"Учтён период: **{_period_label(date_from, date_to)}** "
++            "(по «Сроку готовности»)."
++        )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -528,7 +551,8 @@
+ def _render_period_block() -> tuple[date | None, date | None]:
+     """
+     Секция 2. Период «с / по» — сразу под блоком фильтров, до общей
+-    таблицы. Применяется к ОБЕИМ детальным таблицам (А и Б).
++    таблицы. Применяется к сводной таблице (по «Сроку готовности»)
++    и к детальному плану по листам (по «Плановой дате»).
+     """
+     c1, c2, c3 = st.columns([1, 1, 2])
+     with c1:
+@@ -538,9 +562,10 @@
+             min_value=date(2020, 1, 1),
+             max_value=date(2100, 12, 31),
+             key="plan_date_from",
+-            help="Фильтр по датам применяется к обеим детальным таблицам: "
+-                 "у комплекта — срок готовности, у листа — плановая дата "
+-                 "(или срок комплекта, если у листа даты нет).",
++            help="Период применяется к сводной таблице и к плану по "
++                 "листам: у комплекта — срок готовности, у листа — "
++                 "плановая дата (или срок комплекта, если у листа даты "
++                 "нет). Бублики от периода не зависят.",
+         )
+     with c2:
+         date_to = st.date_input(
+@@ -552,8 +577,9 @@
+         )
+     with c3:
+         st.caption(
+-            "Применяется к детальным таблицам ниже. Пустые даты — "
+-            "показываются все позиции. Сводная таблица и бублики "
++            "Применяется к сводной таблице (по «Сроку готовности» "
++            "комплекта) и к плану по листам (по «Плановой дате» листа). "
++            "Пустые даты при активном периоде скрываются. Бублики "
+             "от периода не зависят."
+         )
+     return date_from, date_to
+@@ -583,6 +609,71 @@
+     return out
+ 
+ 
++def _apply_period_to_overview(df: pd.DataFrame,
++                              date_from, date_to) -> pd.DataFrame:
++    """Период «с/по» → фильтр сводной таблицы по «Сроку готовности».
++
++    При активном периоде остаются только комплекты, чей срок попадает
++    в диапазон (границы включительно); комплекты без срока скрываются —
++    иначе «ИТОГО» считал бы позиции вне периода (патч 09).
++    """
++    if df.empty or not (date_from or date_to):
++        return df
++    out = df[df["due_date"].notna()]
++    if out.empty:
++        return out
++    iso = out["due_date"].astype(str).str.slice(0, 10)
++    if date_from:
++        out = out[iso >= date_from.isoformat()]
++    if date_to:
++        out = out[iso <= date_to.isoformat()]
++    return out
++
++
++def _plan_totals(overview_filtered: pd.DataFrame) -> dict:
++    """Сводные числа для бубликов — по всему отфильтрованному отбору
++    (без учёта периода).
++
++    Листов всего = max(сумма листов по плану, сумма листов в Витро):
++    листы комплектов, которых нет в ведомостях чертежей («Только в
++    Витро»), и листы сверх плана (повторы, извещения) не теряются —
++    иначе бублик показывал меньше, чем Сводка по проекту (патч 09:
++    было 9 142 вместо 12 880).
++
++    Возвращает словарь:
++      kits_total / kits_loaded / kits_plan — комплектов всего, в Витро,
++                                             план к загрузке;
++      sheets_total / sheets_vitro / sheets_plan — листов всего (max),
++                                             в Витро, по плану;
++      sheets_excess — листов сверх плана (Витро − план, ≥ 0);
++      sheets_remaining — осталось по плану (план − Витро, ≥ 0);
++      sheets_done — выдано (total − remaining; при преимуществе плана
++                    совпадает с «в Витро»)."""
++    if overview_filtered.empty:
++        return {k: 0 for k in (
++            "kits_total", "kits_loaded", "kits_plan", "sheets_total",
++            "sheets_vitro", "sheets_plan", "sheets_excess",
++            "sheets_remaining", "sheets_done")}
++    n_total = len(overview_filtered)
++    n_loaded = int(overview_filtered["in_vitro"].astype(bool).sum())
++    sheets_vitro = int(overview_filtered["sheets_vitro"].astype(int).sum())
++    sheets_plan = int(overview_filtered["sheets_plan"].astype(int).sum())
++    sheets_total = max(sheets_vitro, sheets_plan)
++    sheets_excess = max(0, sheets_vitro - sheets_plan)
++    sheets_remaining = max(0, sheets_plan - sheets_vitro)
++    return {
++        "kits_total": n_total,
++        "kits_loaded": n_loaded,
++        "kits_plan": n_total - n_loaded,
++        "sheets_total": sheets_total,
++        "sheets_vitro": sheets_vitro,
++        "sheets_plan": sheets_plan,
++        "sheets_excess": sheets_excess,
++        "sheets_remaining": sheets_remaining,
++        "sheets_done": sheets_total - sheets_remaining,
++    }
++
++
+ # ---------------------------------------------------------------------------
+ #  Бублики
+ # ---------------------------------------------------------------------------
+@@ -622,22 +713,23 @@
+ 
+ 
+ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
+-    """Секция 4. Бублики «Комплектов всего/план» и «Листов всего/план»."""
+-    # В бублики включаем только комплекты плана («Только в Витро» —
+-    # вне плана, их объёмы не учитываем).
+-    plan_df = overview_filtered[
+-        overview_filtered["status"] != "Только в Витро"
+-    ] if not overview_filtered.empty else overview_filtered
++    """Секция 4. Бублики «Комплектов всего/план» и «Листов всего/план».
+ 
++    Числа — из _plan_totals: по всему отфильтрованному отбору
++    (без периода), включая комплекты «Только в Витро». «Листов всего»
++    = max(план, Витро) — см. патч 09.
++    """
+     st.markdown("##### 🎯 Комплектов и листов: всего / план")
+ 
+-    if plan_df.empty:
+-        st.info("Нет комплектов плана по выбранным фильтрам.")
++    totals = _plan_totals(overview_filtered)
++    if totals["kits_total"] == 0:
++        st.info("Нет комплектов по выбранным фильтрам.")
+         return (0, 0)
+ 
+-    n_total = len(plan_df)
+-    n_loaded = int(plan_df["in_vitro"].sum())
+-    n_plan = n_total - n_loaded
++    # ---- КОМПЛЕКТЫ: все отфильтрованные, включая «Только в Витро» ----
++    n_total = totals["kits_total"]
++    n_loaded = totals["kits_loaded"]
++    n_plan = totals["kits_plan"]
+ 
+     kits_data = pd.DataFrame([
+         {"Группа": "Загружено в Витро", "Количество": n_loaded},
+@@ -645,25 +737,18 @@
+     ])
+     kits_data = kits_data[kits_data["Количество"] > 0]
+ 
+-    # ---- ЛИСТЫ: «всего» = плановое количество из ведомостей ----
+-    # По каждому комплекту:
+-    #   загружено = min(листов в Витро, план) — сколько ПЛАНОВЫХ листов
+-    #               уже в Витро;
+-    #   остаток   = план − загружено (разница, а не сумма).
+-    # Листы Витро сверх плана (повторы, извещения, комплекты без
+-    # ведомости чертежей) в бублик не включаются — иначе «всего»
+-    # раздувается выше суммы строк ведомости.
+-    plan_sheets = plan_df["sheets_plan"].astype(int)
+-    vitro_sheets = plan_df["sheets_vitro"].astype(int)
+-    sheets_total = int(plan_sheets.sum())
+-    sheets_loaded = int(
+-        pd.concat([vitro_sheets, plan_sheets], axis=1).min(axis=1).sum())
+-    sheets_remaining = sheets_total - sheets_loaded
+-    sheets_excess = int((vitro_sheets - plan_sheets).clip(lower=0).sum())
++    # ---- ЛИСТЫ: «всего» = max(план ведомостей, фактически в Витро) ----
++    # Листы комплектов без ведомостей чертежей и превышения плана
++    # (повторы, извещения) не теряются: при преимуществе Витро показываем
++    # «сверх плана», при преимуществе плана — «осталось по плану».
++    sheets_total = totals["sheets_total"]
++    sheets_done = totals["sheets_done"]
++    sheets_remaining = totals["sheets_remaining"]
++    sheets_excess = totals["sheets_excess"]
+ 
+     sheets_data = pd.DataFrame([
+-        {"Группа": "Загружено в Витро", "Количество": sheets_loaded},
+-        {"Группа": "План к загрузке", "Количество": sheets_remaining},
++        {"Группа": "Выдано (в Витро)", "Количество": sheets_done},
++        {"Группа": "Осталось по плану", "Количество": sheets_remaining},
+     ])
+     sheets_data = sheets_data[sheets_data["Количество"] > 0]
+ 
+@@ -676,69 +761,26 @@
+         _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
+                center_total=f"{n_total}")
+     with col2:
+-        st.caption(
+-            f"Листов всего (план): **{sheets_total}** · "
+-            f"загружено **{sheets_loaded}** · план **{sheets_remaining}**"
+-        )
++        cap = (f"Листов всего: **{sheets_total}** · "
++               f"в Витро: **{totals['sheets_vitro']}** · "
++               f"в плане: **{totals['sheets_plan']}**")
++        if sheets_excess:
++            cap += f" · сверх плана: **{sheets_excess}**"
++        st.caption(cap)
+         _donut(sheets_data, "Группа", "Количество", "plan_pie_sheets",
+                center_total=f"{sheets_total}")
+ 
+-    if sheets_excess > 0:
++    if sheets_excess:
+         st.caption(
+-            f"ℹ️ В Витро есть ещё {sheets_excess} лист(ов) сверх "
+-            "планового количества (повторы, извещения, комплекты без "
+-            "ведомости чертежей) — в бублик не включены: «всего» "
+-            "никогда не превышает ведомость."
++            f"ℹ️ В Витро на **{sheets_excess}** лист(ов) больше планового "
++            "количества (комплекты без ведомостей чертежей, повторы, "
++            "извещения, приложения) — они включены в «Листов всего», "
++            "чтобы сумма совпадала с Сводкой по проекту."
+         )
+     return (n_total, sheets_total)
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Таблица А. Детальный план по комплектам
+-# ---------------------------------------------------------------------------
+-def _build_kit_plan_table(overview_filtered: pd.DataFrame,
+-                          flt: dict,
+-                          date_from, date_to) -> pd.DataFrame:
+-    """
+-    Таблица А: комплекты, прошедшие фильтры. При заданном периоде
+-    остаются комплекты, чей срок готовности попадает в период
+-    (позиции без срока при активном периоде скрываются).
+-    """
+-    if overview_filtered.empty:
+-        return pd.DataFrame(columns=KIT_PLAN_COLUMNS)
+-
+-    df = overview_filtered.copy()
+-
+-    only_dated = flt["extra"].get("only_dated", False)
+-    if only_dated:
+-        df = df[df["due_date"].notna()]
+-
+-    if date_from or date_to:
+-        df = df[df["due_date"].notna()]
+-        if date_from:
+-            iso = df["due_date"].astype(str).str.slice(0, 10)
+-            df = df[iso >= date_from.isoformat()]
+-        if date_to:
+-            iso = df["due_date"].astype(str).str.slice(0, 10)
+-            df = df[iso <= date_to.isoformat()]
+-
+-    if df.empty:
+-        return pd.DataFrame(columns=KIT_PLAN_COLUMNS)
+-
+-    out = pd.DataFrame({
+-        "Комплект(ы)": df["code"],
+-        "Наименование комплекта": df["name"].fillna(""),
+-        "Плановая дата (срок готовности)": df["due_date"].apply(_iso_to_date),
+-        "Статус комплекта": df["status"],
+-    })
+-    out = out.sort_values(
+-        ["Плановая дата (срок готовности)", "Комплект(ы)"],
+-        na_position="last",
+-    ).reset_index(drop=True)
+-    return out
+-
+-
+-# ---------------------------------------------------------------------------
+ #  Таблица Б. Детальный план по листам комплекта
+ # ---------------------------------------------------------------------------
+ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
+@@ -826,6 +868,20 @@
+             (row["Комплект(ы)"], str(row["sheet_no"]).strip()))
+         return _iso_to_date(d) if d else None
+ 
++    fact = df.apply(_fact_date, axis=1)
++
++    def _issue_status(d) -> str:
++        """«Выдан», если лист загружен в Витро (есть фактическая дата),
++        иначе «Планируется» (патч 09)."""
++        if d is None:
++            return STATUS_PLANNED
++        try:
++            if pd.isna(d):
++                return STATUS_PLANNED
++        except (TypeError, ValueError):
++            pass
++        return STATUS_ISSUED
++
+     out = pd.DataFrame({
+         "Дисциплина": df["Дисциплина"],
+         "Раздел": df["Раздел"],
+@@ -833,7 +889,8 @@
+         "Номер листа": df["sheet_no"].fillna(""),
+         "Наименование листа": df["Наименование листа"].fillna(""),
+         "Плановая дата": df["_date"].apply(_iso_to_date),
+-        "Фактическая дата": df.apply(_fact_date, axis=1),
++        "Фактическая дата": fact,
++        "Статус выдачи": fact.map(_issue_status),
+     })
+     out = out.sort_values(
+         ["Дисциплина", "Раздел", "Комплект(ы)", "Номер листа"],
+@@ -852,58 +909,32 @@
+     return "все даты"
+ 
+ 
+-def _render_export_button(kits_table: pd.DataFrame,
+-                          sheets_table: pd.DataFrame,
++def _render_export_button(sheets_table: pd.DataFrame,
+                           period_label: str) -> None:
+-    """Плашка выгрузки: Excel из двух листов — «Комплекты» (таблица А)
+-    и «Листы» (таблица Б), с учётом фильтров и периода."""
++    """Плашка выгрузки: Excel с листом «Листы» (таблица Б) и служебным
++    листом «Параметры выгрузки», с учётом фильтров и периода
++    (патч 09: лист «Комплекты» удалён вместе с таблицей А)."""
+     export_bytes = build_plan_export(
+-        kits_table, sheets_table, period_label=period_label)
++        sheets_table, period_label=period_label)
+     st.download_button(
+-        "📥 Выгрузить в Excel: листы «Комплекты» и «Листы»",
++        "📥 Выгрузить в Excel: лист «Листы»",
+         data=export_bytes,
+-        file_name=f"План_выдачи_{datetime.now():%Y%m%d_%H%M}.xlsx",
++        file_name=f"План_выдачи_листы_{datetime.now():%Y%m%d_%H%M}.xlsx",
+         mime=MIME_XLSX,
+         use_container_width=False,
+         key="plan_export_excel",
+-        help="Файл повторяет таблицы ниже (с учётом фильтров и периода): "
+-             "лист «Комплекты» — таблица А, лист «Листы» — таблица Б.",
++        help="Файл повторяет таблицу «Детальный план по листам "
++             "комплекта» с учётом фильтров и периода; второй лист — "
++             "параметры формирования.",
+     )
+     st.caption(f"Период выгрузки: **{period_label}**.")
+ 
+ 
+-def _render_kit_plan_table(kits_table: pd.DataFrame) -> None:
+-    """Таблица А. Детальный план по комплектам (после фильтров и периода)."""
+-    st.markdown("##### 🗓 Детальный план по комплектам (таблица А)")
+-
+-    if kits_table.empty:
+-        st.info(
+-            "Нет комплектов по выбранным фильтрам и периоду. "
+-            "Срок готовности задаётся в сводной таблице выше."
+-        )
+-        return
+-
+-    st.dataframe(
+-        kits_table,
+-        use_container_width=True,
+-        hide_index=True,
+-        height=min(max(len(kits_table) * 36 + 40, 300), 700),
+-        column_config={
+-            "Комплект(ы)": st.column_config.TextColumn(width="medium"),
+-            "Наименование комплекта": st.column_config.TextColumn(
+-                width="large"),
+-            "Плановая дата (срок готовности)": st.column_config.DateColumn(
+-                "Плановая дата (срок готовности)",
+-                format="DD.MM.YYYY", width="small"),
+-            "Статус комплекта": st.column_config.TextColumn(width="small"),
+-        },
+-    )
+-
+-
+ def _render_sheet_plan_table(sheets_table: pd.DataFrame,
+                              period_label: str) -> None:
+-    """Таблица Б. Детальный план по листам комплекта (plan_drawings)."""
+-    st.markdown("##### 🗓 Детальный план по листам комплекта (таблица Б)")
++    """Детальный план по листам комплекта (plan_drawings) —
++    единственная детальная таблица (патч 09)."""
++    st.markdown("##### 🗓 Детальный план по листам комплекта")
+ 
+     if sheets_table.empty:
+         st.info(
+@@ -939,6 +970,11 @@
+                 format="DD.MM.YYYY", width="small",
+                 help="Дата статуса листа в Витро (если лист загружен).",
+             ),
++            "Статус выдачи": st.column_config.TextColumn(
++                width="small",
++                help="«Выдан» — лист загружен в Витро (есть фактическая "
++                     "дата); «Планируется» — ещё не загружен.",
++            ),
+         },
+     )
+ 
+@@ -1160,23 +1196,22 @@
+     st.divider()
+ 
+     # ---- 3. Общая таблица (сводная, с группировкой и ИТОГО) ----
+-    _render_overview_table(overview_filtered)
++    # Период применяется и к сводной таблице (по «Сроку готовности»).
++    _render_overview_table(overview_filtered, date_from, date_to)
+ 
+     st.divider()
+ 
+-    # ---- 4. Бублики ----
++    # ---- 4. Бублики (весь отбор, без периода) ----
+     _render_donuts(overview_filtered)
+ 
+     st.divider()
+ 
+-    # ---- 5–6. Детальные таблицы (А и Б) + выгрузка ----
+-    kits_table = _build_kit_plan_table(
+-        overview_filtered, flt, date_from, date_to)
++    # ---- 5–6. Детальный план по листам + выгрузка в Excel ----
++    # (Таблица А по комплектам удалена — дублировала сводную, патч 09.)
+     sheets_table = _build_sheet_plan_table(
+         overview_filtered, flt, date_from, date_to)
+ 
+     period_label = _period_label(date_from, date_to)
+ 
+-    _render_export_button(kits_table, sheets_table, period_label)
+-    _render_kit_plan_table(kits_table)
++    _render_export_button(sheets_table, period_label)
+     _render_sheet_plan_table(sheets_table, period_label)
+--- a/vitro/plan_xlsx.py
++++ b/vitro/plan_xlsx.py
+@@ -10,11 +10,13 @@
+       parse_kits_workbook()     — комплекты → upsert_plan_kits
+       parse_drawings_workbook() — чертежи  → replace_plan_drawings_for_kits
+   - Выгрузка результата фильтрации:
+-      build_plan_export()       — 2 листа: «Комплекты» (таблица А) +
+-                                  «Листы» (таблица Б); подаются
+-                                  ОТОБРАЖАЕМЫЕ DataFrame (русские
+-                                  заголовки), выгрузка повторяет
+-                                  таблицы на экране
++      build_plan_export()       — лист «Листы» (детальный план по
++                                  листам комплекта) + «Параметры
++                                  выгрузки»; подаётся ОТОБРАЖАЕМЫЙ
++                                  DataFrame (русские заголовки),
++                                  выгрузка повторяет таблицу на экране
++                                  (патч 09: лист «Комплекты» удалён
++                                  вместе с таблицей А)
+ 
+ Распознавание колонок — по ключевым словам в заголовках (первые 15 строк
+ каждого видимого листа), поэтому формат «Ексель» может отличаться
+@@ -664,34 +666,33 @@
+ 
+ @st.cache_data(show_spinner=False)   # строится раз на набор данных,
+                                      # а не на каждом реране вкладки
+-def build_plan_export(kits_df, sheets_df, period_label: str = "") -> bytes:
++def build_plan_export(sheets_df, period_label: str = "") -> bytes:
+     """
+-    Excel-файл плана выдачи из ДВУХ листов:
+-      «Комплекты» — таблица А (детальный план по комплектам);
+-      «Листы»     — таблица Б (детальный план по листам комплекта).
+-    Подаются ОТОБРАЖАЕМЫЕ DataFrame (русские заголовки, как на экране) —
+-    уже отобранные по фильтрам и периоду: выгрузка повторяет таблицы
+-    вкладки. Кэшируется по содержимому DataFrame — на 10 000 строк
++    Excel-файл плана выдачи: лист «Листы» (детальный план по листам
++    комплекта) + служебный лист «Параметры выгрузки».
++    Подаётся ОТОБРАЖАЕМЫЙ DataFrame (русские заголовки, как на экране) —
++    уже отобранный по фильтрам и периоду: выгрузка повторяет таблицу
++    вкладки. Патч 09: лист «Комплекты» удалён вместе с таблицей А —
++    сводная таблица на экране единственная и в выгрузку не дублируется.
++    Кэшируется по содержимому DataFrame — на 10 000 строк
+     экономит ~1–2 секунды на каждом реране, пока данные не изменились.
+     """
+     wb = openpyxl.Workbook()
+ 
+-    # ---- Лист 1: Комплекты (таблица А) ----
++    # ---- Лист 1: Листы (детальный план по листам комплекта) ----
+     ws = wb.active
+-    ws.title = "Комплекты"
+-    _write_display_df(ws, kits_df)
++    ws.title = "Листы"
++    _write_display_df(ws, sheets_df)
+ 
+-    # ---- Лист 2: Листы (таблица Б) ----
+-    ws2 = wb.create_sheet("Листы")
+-    _write_display_df(ws2, sheets_df)
+-
+-    # ---- Лист 3: Параметры выгрузки ----
+-    ws3 = wb.create_sheet("Параметры выгрузки")
+-    _style_table(ws3, ["Параметр", "Значение"], [
++    # ---- Лист 2: Параметры выгрузки ----
++    ws2 = wb.create_sheet("Параметры выгрузки")
++    _style_table(ws2, ["Параметр", "Значение"], [
+         ["Период", period_label or "все даты"],
+         ["Дата формирования", datetime.now().strftime("%d.%m.%Y %H:%M")],
+-        ["Комплектов в выгрузке", len(kits_df)],
+         ["Позиций листов в выгрузке", len(sheets_df)],
++        ["Статус выдачи",
++         "«Выдан» — лист загружен в Витро (есть фактическая дата); "
++         "«Планируется» — ещё не загружен"],
+     ])
+ 
+     buf = io.BytesIO()
