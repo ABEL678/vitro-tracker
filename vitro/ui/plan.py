@@ -31,12 +31,23 @@
      статус, листов в Витро, листов (план), срок готовности
      (редактируемый); внизу — строка «ИТОГО» с суммами.
   5. 🗓 Детальный план по листам комплекта — позиции plan_drawings:
-     дисциплина, раздел, комплект, номер и наименование листа,
-     плановая дата, фактическая дата (из Витро) и статус выдачи
-     («Выдан» — есть фактическая дата, «Планируется» — нет).
+     дисциплина, раздел, комплект, номер и ПОЛНЫЙ ШИФР листа (патч 12:
+     «Шифр листа» = шифр комплекта + номер, например
+     АТ-РД-СМИК-0-00-10), наименование, плановая дата, фактическая
+     дата (из Витро) и статус выдачи («Выдан» — есть фактическая
+     дата, «Планируется» — нет).
   6. 📥 Выгрузка в Excel — кнопка в самом низу: лист «Листы»
      (таблица выше) + «Параметры выгрузки», с учётом фильтров
      и выбранного периода.
+
+Импорт (с патча 12): шифры комплектов перед записью в plan_kits
+нормализуются и валидируются (_kit_code_of); чекбокс «🔄 Заменить
+план» удаляет комплекты (и их чертежи), которых нет в загружаемой
+ведомости, — старые записи не смешиваются с новыми (бублик
+«Комплектов всего» больше не раздувается 541 вместо 471).
+Бублик «Листов» считает «в Витро» тем же выражением, что и Сводка
+(sheets.sql_count_sheets): файлы с пустым sheet_number — отдельные
+листы (пример СМИК: 44, а не 33).
 
 Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
 """
@@ -57,6 +68,7 @@ from vitro.sqlite_db import (
     clear_plan,
     log_event,
 )
+from vitro.sheets import sql_count_sheets
 from vitro._cache import versioned_cache
 from vitro.ui._auth import ensure_user
 from vitro.ui._filters import (
@@ -70,6 +82,7 @@ from vitro.plan_xlsx import (
     build_plan_export,
     parse_drawings_workbook,
     parse_kits_workbook,
+    _kit_code_of,
 )
 
 # ---------------------------------------------------------------------------
@@ -98,8 +111,10 @@ OVERVIEW_COLUMNS = [
 
 # Детальный план по листам комплекта — единственная детальная таблица
 # (таблица А по комплектам удалена в патче 09: дублировала сводную).
+# «Шифр листа» (патч 12): полный шифр = шифр комплекта + номер листа
+# (например АТ-РД-СМИК-0-00 + 10 → АТ-РД-СМИК-0-00-10).
 SHEET_PLAN_COLUMNS = [
-    "Дисциплина", "Раздел", "Комплект(ы)", "Номер листа",
+    "Дисциплина", "Раздел", "Комплект(ы)", "Номер листа", "Шифр листа",
     "Наименование листа", "Плановая дата", "Фактическая дата",
     "Статус выдачи",
 ]
@@ -122,28 +137,27 @@ MAX_DETAIL_ROWS = 2000  # строки детальных таблиц свер�
 def _vitro_sheet_counts() -> dict[str, int]:
     """{шифр комплекта: количество УНИКАЛЬНЫХ листов в Витро}.
 
-    Лист = уникальный sheet_number внутри комплекта (патч 10):
-    несколько PDF-файлов одного листа (ревизии, копии, дубль-выгрузки)
-    считаются ОДИН раз — COUNT(DISTINCT sheet_number) вместо COUNT(*).
-    DWG в documents нет вообще (sharepoint.py фильтрует '.pdf'),
-    поэтому дублей «PDF+DWG» не бывает — только повторные PDF.
-    Комплекты, у всех файлов которых sheet_number пуст, считаются
-    по файлам — иначе они «исчезли» бы из Витро.
+    Патч 12: тем же выражением, что во всём приложении
+    (sheets.sql_count_sheets — стандарт патчей 11–12):
+      * ревизии/повторы листа с номером считаются ОДИН раз
+        (ключ complex + sheet_number);
+      * файлы с ПУСТЫМ sheet_number — самостоятельные листы
+        (fallback по id).
+    Раньше здесь был COUNT(DISTINCT sheet_number) без учёта пустых:
+    комплект, у которого 33 файла с номерами и 11 файлов без номера,
+    получал 33 вместо 44 — бублик «Листов» расходился со Сводкой
+    (пример СМИК: «в Витро: 33» при реальных 44).
     """
     with get_conn() as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT complex,
-                   COUNT(DISTINCT CASE
-                       WHEN TRIM(COALESCE(sheet_number, '')) != ''
-                       THEN TRIM(sheet_number) END) AS n_sheets,
-                   COUNT(*) AS n_rows
+                   {sql_count_sheets('documents')} AS n_sheets
             FROM documents
             WHERE complex IS NOT NULL
             GROUP BY complex
         """).fetchall()
     return {
-        r["complex"]: (int(r["n_sheets"]) if int(r["n_sheets"]) > 0
-                       else int(r["n_rows"]))
+        r["complex"]: int(r["n_sheets"])
         for r in rows if r["complex"]
     }
 
@@ -805,6 +819,18 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 #  Таблица Б. Детальный план по листам комплекта
 # ---------------------------------------------------------------------------
+def _full_sheet_codes(df: pd.DataFrame) -> pd.Series:
+    """Колонка «Шифр листа» (патч 12): полный шифр листа = шифр
+    комплекта + номер листа: «АТ-РД-СМИК-0-00» + «10» →
+    «АТ-РД-СМИК-0-00-10» (номер берётся из полного шифра в реальных
+    регистрах, поэтому склейка восстанавливает его точно). Если у
+    позиции номера нет — показывается шифр комплекта."""
+    kit = df["Комплект(ы)"].fillna("").astype(str).str.strip()
+    no = df["sheet_no"].fillna("").astype(str).str.strip()
+    codes = kit.where(no == "", kit + "-" + no)
+    return codes
+
+
 def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
                             flt: dict,
                             date_from, date_to) -> pd.DataFrame:
@@ -813,6 +839,8 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
     фильтры. Дата позиции = плановая дата листа, а если её нет —
     срок готовности комплекта. «Фактическая дата» — дата статуса листа
     в Витро (если лист загружен; MAX по ревизиям).
+    С патча 12 есть колонка «Шифр листа» — полный шифр листа
+    (шифр комплекта + номер листа).
     """
     if overview_filtered.empty:
         return pd.DataFrame(columns=SHEET_PLAN_COLUMNS)
@@ -909,6 +937,7 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
         "Раздел": df["Раздел"],
         "Комплект(ы)": df["Комплект(ы)"],
         "Номер листа": df["sheet_no"].fillna(""),
+        "Шифр листа": _full_sheet_codes(df),
         "Наименование листа": df["Наименование листа"].fillna(""),
         "Плановая дата": df["_date"].apply(_iso_to_date),
         "Фактическая дата": fact,
@@ -984,6 +1013,10 @@ def _render_sheet_plan_table(sheets_table: pd.DataFrame,
             "Раздел": st.column_config.TextColumn(width="small"),
             "Комплект(ы)": st.column_config.TextColumn(width="medium"),
             "Номер листа": st.column_config.TextColumn(width="small"),
+            "Шифр листа": st.column_config.TextColumn(
+                width="medium",
+                help="Полный шифр листа: шифр комплекта + номер листа.",
+            ),
             "Наименование листа": st.column_config.TextColumn(width="large"),
             "Плановая дата": st.column_config.DateColumn(
                 format="DD.MM.YYYY", width="small"),
@@ -1004,6 +1037,57 @@ def _render_sheet_plan_table(sheets_table: pd.DataFrame,
 # ---------------------------------------------------------------------------
 #  Секция 0. Импорт ведомостей
 # ---------------------------------------------------------------------------
+def _prune_plan_kits(keep_codes: set[str]) -> int:
+    """Удаляет из plan_kits комплекты, которых НЕТ в keep_codes,
+    вместе с их чертежами (патч 12 — режим «Заменить план»).
+
+    Зачем: upsert_plan_kits только добавляет/обновляет записи, поэтому
+    комплекты из старых загрузок (в т. ч. мусорные шифры с запятыми/
+    точками и дубль-написания латиницей) оставались в базе навсегда,
+    и бублик «Комплектов всего» показывал 541 вместо 471.
+    Сначала удаляются чертежи (FK plan_drawings.kit_code), затем сами
+    комплекты. Возвращает число удалённых комплектов.
+    """
+    keep = {c for c in (keep_codes or set()) if c}
+    with get_conn() as conn:
+        existing = [r["code"] for r in
+                    conn.execute("SELECT code FROM plan_kits")]
+        stale = [c for c in existing if c not in keep]
+        if not stale:
+            return 0
+        ph = ",".join("?" * len(stale))
+        conn.execute(
+            f"DELETE FROM plan_drawings WHERE kit_code IN ({ph})",
+            tuple(stale))
+        conn.execute(
+            f"DELETE FROM plan_kits WHERE code IN ({ph})", tuple(stale))
+    return len(stale)
+
+
+def _norm_kit_rows(rows: list[dict]) -> tuple[list[dict], list[str]]:
+    """Нормализация и валидация шифров перед записью в plan_kits
+    (патч 12): каждый шифр проходит _kit_code_of (верхний регистр,
+    латинские двойники → кириллица, строгое регулярное выражение).
+    Строки с невалидным шифром отбрасываются со счётчиком.
+    Возвращает (строки, предупреждения)."""
+    out: list[dict] = []
+    dropped: list[str] = []
+    for r in rows or []:
+        code = _kit_code_of(r.get("code"))
+        if not code:
+            dropped.append(str(r.get("code") or ""))
+            continue
+        out.append(dict(r, code=code))
+    warns: list[str] = []
+    if dropped:
+        examples = "; ".join(f"«{d[:40]}»" for d in dropped[:3])
+        more = " …" if len(dropped) > 3 else ""
+        warns.append(
+            f"Отброшено строк с некорректным шифром комплекта: "
+            f"{len(dropped)} ({examples}{more}).")
+    return out, warns
+
+
 def _render_import_block() -> None:
     with st.expander("📥 Вводные данные: ведомости (Excel)", expanded=False):
         st.caption(
@@ -1069,13 +1153,36 @@ def _render_import_block() -> None:
                         "updated_by": "Кем",
                     }),
                     use_container_width=True, hide_index=True, height=200)
+                replace_plan = st.checkbox(
+                    "🔄 Заменить план: удалить комплекты, которых "
+                    "нет в загружаемой ведомости",
+                    value=False, key="plan_replace_kits",
+                    help="Перед сохранением из плана удаляются "
+                         "комплекты (и их чертежи), отсутствующие в "
+                         "загружаемой ведомости. Включайте при "
+                         "повторной загрузке ПОЛНОЙ ведомости — "
+                         "старые записи (в т. ч. мусорные шифры и "
+                         "дубль-написания) не смешаются с новыми. "
+                         "Для частичной ведомости оставьте "
+                         "выключенным.",
+                )
                 if st.button("💾 Сохранить комплекты в план",
                              type="primary", key="plan_save_kits"):
                     user = ensure_user()
                     if user:
                         try:
-                            n = upsert_plan_kits(kits_rows, user)
-                            st.success(f"✅ Сохранено комплектов: {n}")
+                            norm_rows, norm_warns = _norm_kit_rows(kits_rows)
+                            removed = 0
+                            if replace_plan:
+                                removed = _prune_plan_kits(
+                                    {r["code"] for r in norm_rows})
+                            n = upsert_plan_kits(norm_rows, user)
+                            for w in norm_warns:
+                                st.warning(w)
+                            msg = f"✅ Сохранено комплектов: {n}"
+                            if removed:
+                                msg += f" · удалено устаревших: {removed}"
+                            st.success(msg)
                             log_event("plan_import",
                                       f"Ведомость комплектов: {n} строк "
                                       f"(файлов: {len(up_kits)})", rows=n)
@@ -1093,8 +1200,13 @@ def _render_import_block() -> None:
         if up_drawings:
             # Поддержка «один файл = один комплект»: если файлов несколько
             # и колонки шифра нет, применяется шифр по порядку файлов.
-            default_codes = [c.strip().upper() for c in
-                             (default_kit or "").split(",") if c.strip()]
+            # Патч 12: ручной шифр проходит ту же нормализацию/валидацию,
+            # что и ведомости (_kit_code_of) — мусор в план не попадёт.
+            default_codes = []
+            for c in (default_kit or "").split(","):
+                code = _kit_code_of(c)
+                if code:
+                    default_codes.append(code)
             for idx, f in enumerate(up_drawings):
                 dk = default_codes[idx] if idx < len(default_codes) else \
                     (default_codes[0] if len(default_codes) == 1 else "")
@@ -1134,11 +1246,16 @@ def _render_import_block() -> None:
                     if user:
                         try:
                             # Названия комплектов из шапок регистров —
-                            # в план (пустые существующие поля заполняются)
-                            if drawings_kits:
-                                upsert_plan_kits(
-                                    [{"code": c, "name": n} for c, n
-                                     in drawings_kits.items()], user)
+                            # в план (пустые существующие поля заполняются).
+                            # Патч 12: шифры проходят нормализацию/валидацию
+                            # перед записью в plan_kits.
+                            stub_rows, stub_warns = _norm_kit_rows(
+                                [{"code": c, "name": n} for c, n
+                                 in drawings_kits.items()])
+                            for w in stub_warns:
+                                st.warning(w)
+                            if stub_rows:
+                                upsert_plan_kits(stub_rows, user)
                             n = replace_plan_drawings_for_kits(drawings_rows, user)
                             n_kits = len({r["kit_code"] for r in drawings_rows})
                             st.success(f"✅ Сохранено листов: {n} "
