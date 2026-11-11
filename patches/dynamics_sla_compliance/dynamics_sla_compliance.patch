@@ -1,0 +1,337 @@
+diff --git a/vitro/ui/dynamics.py b/vitro/ui/dynamics.py
+index 48dfa18..c6e05be 100644
+--- a/vitro/ui/dynamics.py
++++ b/vitro/ui/dynamics.py
+@@ -1,8 +1,9 @@
+ # vitro/ui/dynamics.py
+ """
+-📈 Динамика — потоки замечаний по месяцам.
++📈 Динамика — потоки замечаний и соблюдение сроков.
+ 
+-Инструмент РП и Директора: сколько выдаётся, отвечаем, закрывается.
++Инструмент РП и Директора: сколько выдаётся, отвечаем, закрывается
++и какой процент ответов уложился в SLA (10 рабочих дней).
+ Каскадные фильтры: дисциплина → раздел → расположение → комплект.
+ Период: пресеты + календарь.
+ """
+@@ -16,6 +17,7 @@ import streamlit as st
+ 
+ from vitro.sqlite_db import get_conn
+ from vitro.disciplines import discipline_name
++from vitro.workdays import workdays_between
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -309,70 +311,239 @@ def _render_kpi(issue: pd.DataFrame,
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Потоки по месяцам
++#  Соблюдение сроков (SLA)
+ # ---------------------------------------------------------------------------
+-def _render_monthly_flow(issue: pd.DataFrame,
+-                          our_answers: pd.DataFrame,
+-                          cust_closed: pd.DataFrame):
+-    st.markdown("### 📊 Потоки по месяцам")
++SLA_ON_TIME_DAYS = 10   # ≤10 р.д. — ответ дан в срок
++SLA_LATE_DAYS = 30      # 10–30 р.д. — опоздание; >30 — критично
+ 
+-    frames = []
+-    if not issue.empty:
+-        df = issue.rename(columns={"n": "Выдано"}).copy()
+-        frames.append(df.set_index("ym"))
+-    if not our_answers.empty:
+-        df = our_answers.rename(columns={"n": "Наши ответы"}).copy()
+-        frames.append(df.set_index("ym"))
+-    if not cust_closed.empty:
+-        df = cust_closed.rename(columns={"n": "Закрыто заказчиком"}).copy()
+-        frames.append(df.set_index("ym"))
++SLA_MIN_MONTH_N = 5     # мин. закрытых за месяц, чтобы считать тренд
++SLA_MIN_KIT_N = 3       # мин. закрытых по комплекту для топ-5
+ 
+-    if not frames:
+-        st.info("Нет данных за выбранный период.")
++SLA_BUCKET_ORDER = ["В срок", "Опоздание", "Критично"]
++
++SLA_BUCKET_COLORS = {
++    "В срок":    "#2E7D32",   # зелёный
++    "Опоздание": "#F9A825",   # жёлтый
++    "Критично":  "#C62828",   # красный
++}
++
++
++def _closing_bucket(created_d, fix_d):
++    """Бакет скорости нашего ответа по факту закрытия.
++
++    Пороги те же, что у our_bucket из _load_all_categorized
++    (SLA 10 р.д.): ≤10 — «В срок», ≤30 — «Опоздание», >30 —
++    «Критично» (бакеты 30–90 и >90 слиты).
++    """
++    if not created_d or not fix_d:
++        return None
++    wd = workdays_between(created_d, fix_d)
++    if wd <= SLA_ON_TIME_DAYS:
++        return "В срок"
++    if wd <= SLA_LATE_DAYS:
++        return "Опоздание"
++    return "Критично"
++
++
++@st.cache_data(ttl=3600, show_spinner=False)
++def _load_closed_with_sla() -> pd.DataFrame:
++    """Закрытые нами замечания («Выполнено») с бакетом скорости ответа.
++
++    База — единый источник _load_all_categorized() из deadlines.py
++    (кэш 3600 c): новых запросов к БД вкладка не делает.
++    """
++    from vitro.ui.deadlines import _load_all_categorized as _src
++    base = _src()
++
++    if base.empty:
++        return pd.DataFrame(
++            columns=["ym", "complex", "discipline", "section", "bucket"])
++
++    closed = base[
++        (base["status"] == "Выполнено")
++        & base["fix_date_d"].notna()
++        & (base["holder"] != "annulled")
++    ]
++
++    out = pd.DataFrame({
++        "ym": closed["created_d"].map(
++            lambda d: d.strftime("%Y-%m") if d else None),
++        "complex": closed["complex"],
++        "discipline": closed["discipline"],
++        "section": closed["section"],
++    })
++    out["bucket"] = [
++        _closing_bucket(c, f)
++        for c, f in zip(closed["created_d"], closed["fix_date_d"])
++    ]
++    return out.dropna(subset=["ym"]).reset_index(drop=True)
++
++
++def _filter_sla_frame(df: pd.DataFrame,
++                      disc_t: tuple, sect_t: tuple,
++                      kit_t: tuple, block_codes: tuple) -> pd.DataFrame:
++    """Фильтры Дисциплина → Раздел → Комплект → Расположение (в pandas)."""
++    out = df
++    if out.empty:
++        return out
++    if disc_t:
++        out = out[out["discipline"].isin(disc_t)]
++    if sect_t:
++        out = out[out["section"].isin(sect_t)]
++    if kit_t:
++        out = out[out["complex"].isin(kit_t)]
++    if block_codes:
++        blocks = out["complex"].apply(_extract_4th_block)
++        out = out[blocks.isin(block_codes)]
++    return out
++
++
++def _shift_month(d: date, k: int) -> date:
++    """Первый день месяца со сдвигом k месяцев от месяца даты d."""
++    y = d.year + (d.month - 1 + k) // 12
++    m = (d.month - 1 + k) % 12 + 1
++    return date(y, m, 1)
++
++
++def _sla_on_time_share(df: pd.DataFrame):
++    """Доля «В срок» среди закрытых замечаний (или None)."""
++    if df.empty:
++        return None
++    return float((df["bucket"] == "В срок").mean())
++
++
++def _sla_monthly_pct(df: pd.DataFrame) -> pd.DataFrame:
++    """Доля «В срок» и число закрытых по месяцам выдачи."""
++    g = (df.groupby("ym")
++           .agg(n=("bucket", "size"),
++                ontime=("bucket", lambda b: int((b == "В срок").sum())))
++           .sort_index())
++    g["pct"] = g["ontime"] / g["n"]
++    return g
++
++
++def _render_sla_compliance(disc_t: tuple, sect_t: tuple,
++                           kit_t: tuple, block_codes: tuple,
++                           date_from: date, date_to: date):
++    """Блок «Соблюдение сроков»: главный показатель + тренд,
++    100%-столбцы по месяцам выдачи и топ-5 проблемных комплектов."""
++    st.markdown("### ⏱ Соблюдение сроков")
++    st.caption(
++        "«В срок» — ответ за ≤10 р.д., «Опоздание» — 10–30 р.д., "
++        "«Критично» — >30 р.д. Учитываются замечания, по которым "
++        "АТП ТЛП уже дал ответ (статус «Выполнено»)."
++    )
++
++    base = _load_closed_with_sla()
++    sdf = _filter_sla_frame(base, disc_t, sect_t, kit_t, block_codes)
++
++    if sdf.empty:
++        st.info("Нет закрытых замечаний с учётом фильтров.")
+         return
+ 
+-    merged = pd.concat(frames, axis=1).fillna(0).sort_index()
+-    merged = merged.reset_index().rename(columns={"index": "ym"})
++    today = date.today()
++    ym_3m = _shift_month(today, -2).strftime("%Y-%m")
++    recent = sdf[sdf["ym"] >= ym_3m]
++
++    # ===== 1. Главный показатель + тренд =====
++    pct3 = _sla_on_time_share(recent)
++
++    delta = None
++    monthly = _sla_monthly_pct(sdf)
++    solid = monthly[monthly["n"] >= SLA_MIN_MONTH_N]
++    if len(solid) >= 2:
++        delta = (solid["pct"].iloc[-1] - solid["pct"].iloc[-2]) * 100
++
++    st.metric(
++        "Закрыто в срок (≤10 р.д.) за последние 3 месяца",
++        f"{pct3:.0%}" if pct3 is not None else "—",
++        delta=round(delta, 1) if delta is not None else None,
++        help="Среди замечаний, выданных за последние 3 месяца "
++             "и уже закрытых («Выполнено»). Тренд — изменение доли "
++             "«в срок» в процентных пунктах к предыдущему месяцу "
++             f"(месяцы с ≥{SLA_MIN_MONTH_N} закрытыми замечаниями).",
++    )
+ 
+-    fig = go.Figure()
++    # ===== 2. Столбцы с накоплением по месяцам (100%) =====
++    st.markdown("#### Доля ответов по скорости закрытия")
++    st.caption("По месяцу выдачи замечания, 0–100%.")
++
++    win = sdf[(sdf["ym"] >= date_from.strftime("%Y-%m"))
++              & (sdf["ym"] <= date_to.strftime("%Y-%m"))]
++    if win.empty:
++        st.info("Нет закрытых замечаний за выбранный период.")
++    else:
++        counts = (win.groupby(["ym", "bucket"]).size()
++                  .unstack(fill_value=0)
++                  .reindex(columns=SLA_BUCKET_ORDER, fill_value=0))
++        shares = counts.div(counts.sum(axis=1), axis=0)
++
++        plot_df = shares.reset_index().melt(
++            id_vars="ym", var_name="Скорость ответа",
++            value_name="share")
++        plot_df = plot_df[plot_df["share"] > 0]
++
++        fig = px.bar(
++            plot_df, x="ym", y="share", color="Скорость ответа",
++            barmode="stack", text_auto=".0%",
++            category_orders={"Скорость ответа": SLA_BUCKET_ORDER},
++            color_discrete_map=SLA_BUCKET_COLORS,
++            labels={"ym": "Месяц выдачи замечания",
++                    "share": "Доля закрытых"},
++        )
++        fig.update_layout(
++            height=450,
++            xaxis_tickangle=-45,
++            yaxis_tickformat=".0%",
++            legend=dict(
++                orientation="h", yanchor="bottom", y=1.02,
++                xanchor="right", x=1,
++            ),
++        )
++        st.plotly_chart(fig, use_container_width=True,
++                        key="dyn_sla_monthly")
+ 
+-    if "Выдано" in merged.columns:
+-        fig.add_trace(go.Scatter(
+-            x=merged["ym"], y=merged["Выдано"],
+-            mode="lines+markers", name="📤 Выдано",
+-            line=dict(color="#64B5F6", width=3),
+-            marker=dict(size=7),
+-        ))
++    # ===== 3. Топ-5 проблемных комплектов =====
++    st.markdown("#### 🚩 Топ-5 проблемных комплектов")
++    st.caption(
++        "Наибольшая доля ответов позже 30 р.д. среди закрытых "
++        f"за последние 3 месяца (от {SLA_MIN_KIT_N} закрытых)."
++    )
+ 
+-    if "Наши ответы" in merged.columns:
+-        fig.add_trace(go.Scatter(
+-            x=merged["ym"], y=merged["Наши ответы"],
+-            mode="lines+markers", name="🔴 Наши ответы",
+-            line=dict(color="#E57373", width=3),
+-            marker=dict(size=7),
+-        ))
++    if recent.empty:
++        st.info("Нет закрытых замечаний за последние 3 месяца.")
++        return
+ 
+-    if "Закрыто заказчиком" in merged.columns:
+-        fig.add_trace(go.Scatter(
+-            x=merged["ym"], y=merged["Закрыто заказчиком"],
+-            mode="lines+markers", name="🟢 Закрыто заказчиком",
+-            line=dict(color="#2E7D32", width=3),
+-            marker=dict(size=7),
+-        ))
++    kits_df = recent.copy()
++    kits_df["complex"] = kits_df["complex"].fillna("(без комплекта)")
++    kit_stats = (kits_df.groupby("complex")
++                 .agg(total=("bucket", "size"),
++                      late=("bucket",
++                            lambda b: int((b == "Критично").sum()))))
++    kit_stats = kit_stats[kit_stats["total"] >= SLA_MIN_KIT_N]
++    if kit_stats.empty:
++        st.info("Недостаточно данных: нет комплектов с "
++                f"{SLA_MIN_KIT_N}+ закрытыми замечаниями за 3 месяца.")
++        return
+ 
+-    fig.update_layout(
+-        title="Выдача / Наши ответы / Закрытие — по месяцам",
+-        xaxis_title="Месяц",
+-        yaxis_title="Замечаний",
+-        height=500,
+-        xaxis_tickangle=-45,
+-        hovermode="x unified",
+-        legend=dict(
+-            orientation="h", yanchor="bottom", y=1.02,
+-            xanchor="right", x=1,
+-        ),
++    kit_stats["share_late"] = kit_stats["late"] / kit_stats["total"]
++    kit_stats = (kit_stats.sort_values(["share_late", "total"],
++                                       ascending=False)
++                 .head(5).reset_index())
++
++    st.dataframe(
++        kit_stats,
++        column_config={
++            "complex": st.column_config.TextColumn("Комплект"),
++            "total": st.column_config.NumberColumn("Закрыто"),
++            "late": st.column_config.NumberColumn("Критично (>30 р.д.)"),
++            "share_late": st.column_config.ProgressColumn(
++                "Доля критичных", min_value=0.0, max_value=1.0,
++                format="percent"),
++        },
++        hide_index=True,
++        use_container_width=True,
+     )
+-    st.plotly_chart(fig, use_container_width=True)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -586,7 +757,8 @@ def _render_period_filter() -> tuple[date, date]:
+ def render():
+     st.header("📈 Динамика")
+     st.caption(
+-        "Инструмент РП и Директора: потоки замечаний по месяцам."
++        "Инструмент РП и Директора: потоки замечаний по месяцам "
++        "и соблюдение сроков ответа."
+     )
+ 
+     # ===== Каскадные фильтры (как в Сроках) =====
+@@ -667,7 +839,8 @@ def render():
+ 
+     st.divider()
+ 
+-    _render_monthly_flow(issue, our_answers, cust_closed)
++    _render_sla_compliance(disc_t, sect_t, kit_t, block_codes,
++                           date_from, date_to)
+ 
+     st.divider()
+ 

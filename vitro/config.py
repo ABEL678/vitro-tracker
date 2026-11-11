@@ -18,4 +18,4 @@ VITRO_VERIFY_SSL = os.getenv("VITRO_VERIFY_SSL", "true").lower() == "true"
 HEADERS = {"Accept": "application/json;odata=verbose"}
 
 # Версия приложения
-APP_VERSION = "1.4 от 09.11.2026"
+APP_VERSION = "1.4 от 11.11.2026"

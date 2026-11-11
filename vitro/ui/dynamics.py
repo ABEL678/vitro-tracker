@@ -1,8 +1,9 @@
 # vitro/ui/dynamics.py
 """
-📈 Динамика — потоки замечаний по месяцам.
+📈 Динамика — потоки замечаний и соблюдение сроков.
 
-Инструмент РП и Директора: сколько выдаётся, отвечаем, закрывается.
+Инструмент РП и Директора: сколько выдаётся, отвечаем, закрывается
+и какой процент ответов уложился в SLA (10 рабочих дней).
 Фильтры: дисциплина → раздел → расположение → комплект → марка
 (через render_standard_filters).
 Период: пресеты (1 неделя / 1 месяц / …) + календарь.
@@ -14,7 +15,10 @@
   2. «Общий объём за период» — замечания + выгруженные
      комплекты/листы за выбранный период.
   3. «Выполнение плана» — бублики «выполнено / осталось» против
-     Ведомости комплектов (таблица plan_kits).
+     Ведомости комплектов (plan_drawings / plan_kits).
+     «Выполнено» — уникальные листы и комплекты в Витро (дедуп
+     ревизий через vitro.sheets.dedup_document_rows, как в
+     «Плане выдачи», поэтому цифры совпадают).
 
 Все НОВЫЕ запросы к БД идут через @versioned_cache — кэш,
 инвалидируемый по версии данных (последняя синхронизация),
@@ -31,6 +35,7 @@ import streamlit as st
 from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
 from vitro.disciplines import discipline_name
+from vitro.workdays import workdays_between
 from vitro.ui._filters import render_standard_filters
 
 
@@ -260,22 +265,23 @@ def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
 def _load_doc_volume(disciplines: tuple, sections: tuple,
                      kits: tuple, block_codes: tuple,
                      date_from: date, date_to: date) -> dict:
-    """Выгружено комплектов и листов за период (documents.status_date).
+    """Выгружено комплектов и УНИКАЛЬНЫХ листов за период.
 
-    Учитывает каскадные фильтры. Листы без даты статуса
-    в период не попадают (их невозможно датировать).
+    Листы дедуплицируются как в «Плане выдачи» (последняя ревизия
+    на лист), датировка — status_date этой ревизии. Учитывает
+    каскадные фильтры. Листы без даты статуса в период не
+    попадают (их невозможно датировать).
     """
-    where, params = _build_filter_sql(
-        disciplines, sections, kits, block_codes,
-        date_from, date_to, "substr(d.status_date, 1, 10)")
-    q = f"""
-        SELECT COUNT(DISTINCT d.complex) AS kits, COUNT(*) AS sheets
-        FROM documents d
-        WHERE d.complex IS NOT NULL {where}
-    """
-    with get_conn() as conn:
-        row = conn.execute(q, tuple(params)).fetchone()
-    return {"kits": int(row["kits"] or 0), "sheets": int(row["sheets"] or 0)}
+    df = _load_unique_documents()
+    df = _filter_doc_frame(df, disciplines, sections, kits, block_codes)
+    if date_from:
+        df = df[df["status_day"] >= date_from.isoformat()]
+    if date_to:
+        df = df[df["status_day"] <= date_to.isoformat()]
+    if df.empty:
+        return {"kits": 0, "sheets": 0}
+    return {"kits": int(df["complex"].nunique()),
+            "sheets": int(len(df))}
 
 
 # ---------------------------------------------------------------------------
@@ -381,110 +387,247 @@ def _render_kpi(issue: pd.DataFrame,
     k1.metric(
         "🏗 Выгружено комплектов", _fmt(doc_volume["kits"]),
         help="Комплекты, у которых за выбранный период изменился статус "
-             "в Витро (по дате статуса листа).",
+             "в Витро (по дате статуса листа последней ревизии).",
     )
     k2.metric(
         "📄 Выгружено листов", _fmt(doc_volume["sheets"]),
-        help="Листы РД, чей статус в Витро изменился за выбранный период "
-             "(по дате статуса листа).",
+        help="Уникальные листы РД (последняя ревизия, дедуп как в "
+             "«Плане выдачи»), чей статус в Витро изменился "
+             "за выбранный период.",
     )
 
 
 # ---------------------------------------------------------------------------
-#  План (Ведомость комплектов) и бублики выполнения
+#  Уникальные листы, план (Ведомость) и бублики выполнения
 # ---------------------------------------------------------------------------
-_PLAN_TABLE = "plan_kits"
+_PLAN_TABLE = "plan_kits"              # Ведомость комплектов (по комплектам)
+_PLAN_DRAWINGS_TABLE = "plan_drawings"  # Ведомость: чертежи по комплектам
+
+
+def _builtin_dedup(rows: list) -> list[dict]:
+    """Встроенный дедуп: последняя ревизия на (complex, leaf)."""
+    best: dict = {}
+    for r in rows:
+        d = dict(r) if not isinstance(r, dict) else r
+        key = (d.get("complex"), d.get("leaf"))
+        rank = (int(d.get("vitro_version") or 0), int(d.get("id") or 0))
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, d)
+    return [v[1] for v in best.values()]
+
+
+def _dedup_document_rows(rows: list) -> list[dict]:
+    """Уникальные листы из строк documents — как в «Плане выдачи».
+
+    Основной путь — vitro.sheets.dedup_document_rows (единый
+    механизм дедупликации проекта). Если модуля нет или сигнатура
+    другая — встроенный дедуп по (complex, leaf): последняя ревизия
+    по max(vitro_version), затем max(id).
+    """
+    if not rows:
+        return []
+
+    try:
+        from vitro.sheets import dedup_document_rows as _dedup
+    except Exception:
+        _dedup = None
+
+    if _dedup is not None:
+        attempts = (
+            lambda: _dedup(rows),
+            lambda: _dedup(pd.DataFrame([dict(r) for r in rows])),
+        )
+        for call in attempts:
+            try:
+                out = call()
+            except Exception:
+                continue
+            if out is None:
+                continue
+            if isinstance(out, pd.DataFrame):
+                out = out.to_dict("records")
+            try:
+                out = [dict(r) if not isinstance(r, dict) else r
+                       for r in out]
+            except (TypeError, ValueError):
+                continue
+            if out:
+                return out
+        print("[dynamics] vitro.sheets.dedup_document_rows недоступен или "
+              "вернул пусто — встроенный дедуп по (complex, leaf)")
+
+    return _builtin_dedup(rows)
+
+
+@versioned_cache(ttl=3600)
+def _load_unique_documents() -> pd.DataFrame:
+    """Уникальные листы Витро (последняя ревизия) одним кадром.
+
+    Единый источник «факта» для бубликов и метрик «Выгружено …»:
+    дедуп убирает повторные ревизии, поэтому «Листов всего»
+    совпадает с «Планом выдачи».
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, complex, discipline, section, status,
+                   revision, status_date, leaf, vitro_guid, vitro_version
+            FROM documents
+            WHERE complex IS NOT NULL
+        """).fetchall()
+
+    df = pd.DataFrame(_dedup_document_rows(rows))
+    if df.empty:
+        return pd.DataFrame(columns=["complex", "discipline",
+                                     "section", "status_day"])
+    df["status_day"] = df["status_date"].fillna("").astype(str).str[:10]
+    return df
+
+
+def _filter_doc_frame(df: pd.DataFrame,
+                      disciplines: tuple, sections: tuple,
+                      kits: tuple, block_codes: tuple) -> pd.DataFrame:
+    """Фильтры Дисциплина → Раздел → Комплект → Расположение (pandas).
+
+    Расположение — по 4-му блоку шифра (как в deadlines._apply_filters).
+    """
+    out = df
+    if out.empty:
+        return out
+    if disciplines:
+        out = out[out["discipline"].isin(disciplines)]
+    if sections:
+        out = out[out["section"].isin(sections)]
+    if kits:
+        out = out[out["complex"].isin(kits)]
+    if block_codes:
+        blocks = out["complex"].apply(_extract_4th_block)
+        out = out[blocks.isin(block_codes)]
+    return out
 
 
 @versioned_cache(ttl=600)
-def _load_plan(
-    disciplines: tuple = (),
-    sections: tuple = (),
-    kits: tuple = (),
-    block_codes: tuple = (),
-) -> dict:
-    """План комплектов/листов из plan_drawings с фильтрацией.
+def _load_plan(disciplines: tuple, sections: tuple,
+               kits: tuple, block_codes: tuple) -> dict:
+    """План комплектов/листов из Ведомости — с учётом фильтров.
 
-    Структура БД:
-      plan_drawings.kit_code → complexes.code (JOIN);
-      plan_drawings.qty — количество листов.
+    Комплекты — ВСЕ шифры из plan_drawings, включая комплекты без
+    чертежей (как в «Плане выдачи»): общее число комплектов
+    совпадает с ним. План листов — число чертежей на комплект.
+    Комплекты из plan_kits, которых нет в plan_drawings,
+    добавляются с планом листов 0 (чтобы не задваивать план).
+    Если plan_drawings нет — fallback на plan_kits целиком
+    (complex / plan_kits / plan_sheets), как раньше.
 
-    Фильтры: discipline, section, kits, block_codes (4-й блок).
-    Возвращает {code: {'kits': 1, 'sheets': N}}.
+    Фильтры применяются внутри:
+      kits и block_codes — по шифру комплекта;
+      disciplines и sections — через пересечение с documents
+      (_load_scope_codes): в ведомости этих колонок нет.
     """
-    with get_conn() as conn:
-        where_parts, params = [], []
-
-        # discipline
-        if disciplines:
-            where_parts.append(
-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-
-        # section
-        if sections:
-            ph = ",".join("?" * len(sections))
-            where_parts.append(
-                f"c.code IN (SELECT DISTINCT complex FROM documents "
-                f"WHERE section IN ({ph}))")
-            params += list(sections)
-
-        # kits (прямое указание)
-        if kits:
-            ph = ",".join("?" * len(kits))
-            where_parts.append(f"c.code IN ({ph})")
-            params += list(kits)
-
-        where = ""
-        if where_parts:
-            where = " WHERE " + " AND ".join(where_parts)
-
-        # Основной запрос: сумма qty по kit_code
-        q = f"""
-            SELECT pd.kit_code, SUM(pd.qty) AS total_sheets
-            FROM plan_drawings pd
-            JOIN complexes c ON pd.kit_code = c.code
-            {where}
-            GROUP BY pd.kit_code
-        """
-        rows = conn.execute(q, tuple(params)).fetchall()
+    scope = None
+    if disciplines or sections:
+        scope = _load_scope_codes(disciplines, sections)
 
     plan: dict[str, dict] = {}
-    for r in rows:
-        code = str(r["kit_code"] or "").strip()
-        if not code:
+
+    with get_conn() as conn:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN (?, ?)",
+            (_PLAN_DRAWINGS_TABLE, _PLAN_TABLE),
+        ).fetchall()}
+
+        def _code_column(table: str):
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            return next(
+                (c for c in ("complex", "code", "kit", "cipher", "kit_code")
+                 if c in cols), None)
+
+        drawings_used = False
+        if _PLAN_DRAWINGS_TABLE in tables:
+            code_col = _code_column(_PLAN_DRAWINGS_TABLE)
+            if code_col:
+                drawings_used = True
+                for r in conn.execute(f"""
+                        SELECT "{code_col}" AS code, COUNT(*) AS sheets
+                        FROM {_PLAN_DRAWINGS_TABLE}
+                        GROUP BY 1
+                """):
+                    code = str(r["code"] or "").strip()
+                    if code:
+                        plan[code] = {"kits": 1,
+                                      "sheets": max(0, int(r["sheets"] or 0))}
+
+        if drawings_used:
+            # Комплекты ведомости без чертежей — из plan_kits,
+            # план листов для них 0 (план листов уже учтён строками
+            # plan_drawings, задваивать нельзя)
+            if _PLAN_TABLE in tables:
+                code_col = _code_column(_PLAN_TABLE)
+                if code_col:
+                    for r in conn.execute(
+                            f'SELECT "{code_col}" AS code FROM {_PLAN_TABLE}'):
+                        code = str(r["code"] or "").strip()
+                        if code and code not in plan:
+                            plan[code] = {"kits": 1, "sheets": 0}
+        elif _PLAN_TABLE in tables:
+            # plan_drawings нет/пуста — старый путь: план из plan_kits
+            cols = [r[1] for r in conn.execute(
+                f"PRAGMA table_info({_PLAN_TABLE})")]
+            code_col = next(
+                (c for c in ("complex", "code", "kit", "cipher", "kit_code")
+                 if c in cols), None)
+            kits_col = next(
+                (c for c in ("plan_kits", "kits", "kits_plan", "kit_plan")
+                 if c in cols), None)
+            sheets_col = next(
+                (c for c in ("plan_sheets", "sheets", "sheets_plan",
+                             "sheet_plan") if c in cols), None)
+            if code_col:
+                parts = [f'"{code_col}" AS code']
+                parts.append(f'COALESCE("{kits_col}", 0) AS kits' if kits_col
+                             else "0 AS kits")
+                parts.append(f'COALESCE("{sheets_col}", 0) AS sheets'
+                             if sheets_col else "0 AS sheets")
+                for r in conn.execute(
+                        f"SELECT {', '.join(parts)} FROM {_PLAN_TABLE}"):
+                    code = str(r["code"] or "").strip()
+                    if not code:
+                        continue
+                    try:
+                        k = int(float(r["kits"] or 0))
+                        s = int(float(r["sheets"] or 0))
+                    except (ValueError, TypeError):
+                        k, s = 0, 0
+                    plan[code] = {"kits": max(0, k), "sheets": max(0, s)}
+
+    # Фильтры — Дисциплина → Раздел → Комплект → Расположение
+    out: dict[str, dict] = {}
+    for code, vals in plan.items():
+        if kits and code not in kits:
             continue
-        # Дополнительная фильтрация по block_codes (в Python)
-        if block_codes:
-            block = _extract_4th_block(code)
-            if block not in block_codes:
-                continue
-        try:
-            s = int(float(r["total_sheets"] or 0))
-        except (ValueError, TypeError):
-            s = 0
-        plan[code] = {"kits": 1, "sheets": max(0, s)}
-    return plan
+        if block_codes and _extract_4th_block(code) not in block_codes:
+            continue
+        if scope is not None and code not in scope:
+            continue
+        out[code] = vals
+    return out
 
 
 @versioned_cache(ttl=3600)
 def _load_doc_totals(disciplines: tuple, sections: tuple,
                      kits: tuple, block_codes: tuple) -> dict:
-    """Сколько комплектов и листов УЖЕ есть в Витро (всего, без периода).
+    """Сколько комплектов и УНИКАЛЬНЫХ листов уже есть в Витро.
 
-    «Выполнено» для бубликов сравнения с планом.
+    «Выполнено» для бубликов сравнения с планом. Дедуп ревизий —
+    vitro.sheets.dedup_document_rows (как в «Плане выдачи»),
+    поэтому цифры сходятся с ним.
     """
-    where, params = _build_filter_sql(
-        disciplines, sections, kits, block_codes,
-        None, None, "d.status_date")
-    q = f"""
-        SELECT COUNT(DISTINCT d.complex) AS kits, COUNT(*) AS sheets
-        FROM documents d
-        WHERE d.complex IS NOT NULL {where}
-    """
-    with get_conn() as conn:
-        row = conn.execute(q, tuple(params)).fetchone()
-    return {"kits": int(row["kits"] or 0), "sheets": int(row["sheets"] or 0)}
+    df = _load_unique_documents()
+    df = _filter_doc_frame(df, disciplines, sections, kits, block_codes)
+    if df.empty:
+        return {"kits": 0, "sheets": 0}
+    return {"kits": int(df["complex"].nunique()),
+            "sheets": int(len(df))}
 
 
 @versioned_cache(ttl=600)
@@ -570,41 +713,32 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
                             kits: tuple, block_codes: tuple):
     """Бублики сравнения с планом: комплекты и листы.
 
-    «Выполнено» — сколько уже есть в Витро (_load_doc_totals),
-    «Осталось» — план из Ведомости комплектов (plan_drawings) минус
-    выполненное. Фильтрация плана — внутри _load_plan.
+    «Выполнено» — уникальные листы/комплекты в Витро
+    (_load_doc_totals: дедуп ревизий как в «Плане выдачи»),
+    «Осталось» — план из Ведомости минус выполненное.
+    Фильтры (Дисциплина, Раздел, Комплект, Расположение)
+    передаются и в план (_load_plan), и в факт (_load_doc_totals).
     """
     st.markdown("### 🎯 Выполнение плана (Ведомость комплектов)")
 
-    # Фильтр плана происходит внутри _load_plan
     plan = _load_plan(disciplines, sections, kits, block_codes)
     if not plan:
         st.info(
-            "План не задан: таблица `plan_kits` не найдена или пуста. "
-            "Загрузите Ведомость комплектов — и бублики появятся."
+            "План не задан: таблицы `plan_drawings` / `plan_kits` "
+            "не найдены или пусты. Загрузите Ведомость комплектов — "
+            "и бублики появятся."
         )
         return
 
-    if not plan:
+    plan_kits_total = sum(v["kits"] for v in plan.values())
+    plan_sheets_total = sum(v["sheets"] for v in plan.values())
+
+    if plan_kits_total == 0 and plan_sheets_total == 0:
         st.info(
-            "Нет плановых значений для выбранной комбинации фильтров."
+            "В Ведомости нет плановых значений для выбранной "
+            "комбинации фильтров."
         )
         return
-
-    # kit_codes и суммы — из отфильтрованного плана
-    kit_codes = tuple(code for code, vals in plan.items())
-
-    # Плановые листы — сумма qty из plan_drawings по kit_codes
-    with get_conn() as conn:
-        ph = ",".join("?" * len(kit_codes))
-        plan_rows = conn.execute(
-            f"SELECT SUM(qty) AS total_sheets FROM plan_drawings "
-            f"WHERE kit_code IN ({ph})", kit_codes
-        ).fetchone()
-        plan_sheets_total = int(plan_rows["total_sheets"] or 0)
-
-    # Плановые комплекты = количество уникальных kit_codes
-    plan_kits_total = len(kit_codes)
 
     totals = _load_doc_totals(disciplines, sections, kits, block_codes)
 
@@ -656,70 +790,239 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
 
 
 # ---------------------------------------------------------------------------
-#  Потоки по месяцам
+#  Соблюдение сроков (SLA)
 # ---------------------------------------------------------------------------
-def _render_monthly_flow(issue: pd.DataFrame,
-                          our_answers: pd.DataFrame,
-                          cust_closed: pd.DataFrame):
-    st.markdown("### 📊 Потоки по месяцам")
+SLA_ON_TIME_DAYS = 10   # ≤10 р.д. — ответ дан в срок
+SLA_LATE_DAYS = 30      # 10–30 р.д. — опоздание; >30 — критично
 
-    frames = []
-    if not issue.empty:
-        df = issue.rename(columns={"n": "Выдано"}).copy()
-        frames.append(df.set_index("ym"))
-    if not our_answers.empty:
-        df = our_answers.rename(columns={"n": "Наши ответы"}).copy()
-        frames.append(df.set_index("ym"))
-    if not cust_closed.empty:
-        df = cust_closed.rename(columns={"n": "Закрыто заказчиком"}).copy()
-        frames.append(df.set_index("ym"))
+SLA_MIN_MONTH_N = 5     # мин. закрытых за месяц, чтобы считать тренд
+SLA_MIN_KIT_N = 3       # мин. закрытых по комплекту для топ-5
 
-    if not frames:
-        st.info("Нет данных за выбранный период.")
+SLA_BUCKET_ORDER = ["В срок", "Опоздание", "Критично"]
+
+SLA_BUCKET_COLORS = {
+    "В срок":    "#2E7D32",   # зелёный
+    "Опоздание": "#F9A825",   # жёлтый
+    "Критично":  "#C62828",   # красный
+}
+
+
+def _closing_bucket(created_d, fix_d):
+    """Бакет скорости нашего ответа по факту закрытия.
+
+    Пороги те же, что у our_bucket из _load_all_categorized
+    (SLA 10 р.д.): ≤10 — «В срок», ≤30 — «Опоздание», >30 —
+    «Критично» (бакеты 30–90 и >90 слиты).
+    """
+    if not created_d or not fix_d:
+        return None
+    wd = workdays_between(created_d, fix_d)
+    if wd <= SLA_ON_TIME_DAYS:
+        return "В срок"
+    if wd <= SLA_LATE_DAYS:
+        return "Опоздание"
+    return "Критично"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_closed_with_sla() -> pd.DataFrame:
+    """Закрытые нами замечания («Выполнено») с бакетом скорости ответа.
+
+    База — единый источник _load_all_categorized() из deadlines.py
+    (кэш 3600 c): новых запросов к БД вкладка не делает.
+    """
+    from vitro.ui.deadlines import _load_all_categorized as _src
+    base = _src()
+
+    if base.empty:
+        return pd.DataFrame(
+            columns=["ym", "complex", "discipline", "section", "bucket"])
+
+    closed = base[
+        (base["status"] == "Выполнено")
+        & base["fix_date_d"].notna()
+        & (base["holder"] != "annulled")
+    ]
+
+    out = pd.DataFrame({
+        "ym": closed["created_d"].map(
+            lambda d: d.strftime("%Y-%m") if d else None),
+        "complex": closed["complex"],
+        "discipline": closed["discipline"],
+        "section": closed["section"],
+    })
+    out["bucket"] = [
+        _closing_bucket(c, f)
+        for c, f in zip(closed["created_d"], closed["fix_date_d"])
+    ]
+    return out.dropna(subset=["ym"]).reset_index(drop=True)
+
+
+def _filter_sla_frame(df: pd.DataFrame,
+                      disc_t: tuple, sect_t: tuple,
+                      kit_t: tuple, block_codes: tuple) -> pd.DataFrame:
+    """Фильтры Дисциплина → Раздел → Комплект → Расположение (в pandas)."""
+    out = df
+    if out.empty:
+        return out
+    if disc_t:
+        out = out[out["discipline"].isin(disc_t)]
+    if sect_t:
+        out = out[out["section"].isin(sect_t)]
+    if kit_t:
+        out = out[out["complex"].isin(kit_t)]
+    if block_codes:
+        blocks = out["complex"].apply(_extract_4th_block)
+        out = out[blocks.isin(block_codes)]
+    return out
+
+
+def _shift_month(d: date, k: int) -> date:
+    """Первый день месяца со сдвигом k месяцев от месяца даты d."""
+    y = d.year + (d.month - 1 + k) // 12
+    m = (d.month - 1 + k) % 12 + 1
+    return date(y, m, 1)
+
+
+def _sla_on_time_share(df: pd.DataFrame):
+    """Доля «В срок» среди закрытых замечаний (или None)."""
+    if df.empty:
+        return None
+    return float((df["bucket"] == "В срок").mean())
+
+
+def _sla_monthly_pct(df: pd.DataFrame) -> pd.DataFrame:
+    """Доля «В срок» и число закрытых по месяцам выдачи."""
+    g = (df.groupby("ym")
+           .agg(n=("bucket", "size"),
+                ontime=("bucket", lambda b: int((b == "В срок").sum())))
+           .sort_index())
+    g["pct"] = g["ontime"] / g["n"]
+    return g
+
+
+def _render_sla_compliance(disc_t: tuple, sect_t: tuple,
+                           kit_t: tuple, block_codes: tuple,
+                           date_from: date, date_to: date):
+    """Блок «Соблюдение сроков»: главный показатель + тренд,
+    100%-столбцы по месяцам выдачи и топ-5 проблемных комплектов."""
+    st.markdown("### ⏱ Соблюдение сроков")
+    st.caption(
+        "«В срок» — ответ за ≤10 р.д., «Опоздание» — 10–30 р.д., "
+        "«Критично» — >30 р.д. Учитываются замечания, по которым "
+        "АТП ТЛП уже дал ответ (статус «Выполнено»)."
+    )
+
+    base = _load_closed_with_sla()
+    sdf = _filter_sla_frame(base, disc_t, sect_t, kit_t, block_codes)
+
+    if sdf.empty:
+        st.info("Нет закрытых замечаний с учётом фильтров.")
         return
 
-    merged = pd.concat(frames, axis=1).fillna(0).sort_index()
-    merged = merged.reset_index().rename(columns={"index": "ym"})
+    today = date.today()
+    ym_3m = _shift_month(today, -2).strftime("%Y-%m")
+    recent = sdf[sdf["ym"] >= ym_3m]
 
-    fig = go.Figure()
+    # ===== 1. Главный показатель + тренд =====
+    pct3 = _sla_on_time_share(recent)
 
-    if "Выдано" in merged.columns:
-        fig.add_trace(go.Scatter(
-            x=merged["ym"], y=merged["Выдано"],
-            mode="lines+markers", name="📤 Выдано",
-            line=dict(color="#64B5F6", width=3),
-            marker=dict(size=7),
-        ))
+    delta = None
+    monthly = _sla_monthly_pct(sdf)
+    solid = monthly[monthly["n"] >= SLA_MIN_MONTH_N]
+    if len(solid) >= 2:
+        delta = (solid["pct"].iloc[-1] - solid["pct"].iloc[-2]) * 100
 
-    if "Наши ответы" in merged.columns:
-        fig.add_trace(go.Scatter(
-            x=merged["ym"], y=merged["Наши ответы"],
-            mode="lines+markers", name="🔴 Наши ответы",
-            line=dict(color="#E57373", width=3),
-            marker=dict(size=7),
-        ))
-
-    if "Закрыто заказчиком" in merged.columns:
-        fig.add_trace(go.Scatter(
-            x=merged["ym"], y=merged["Закрыто заказчиком"],
-            mode="lines+markers", name="🟢 Закрыто заказчиком",
-            line=dict(color="#2E7D32", width=3),
-            marker=dict(size=7),
-        ))
-
-    fig.update_layout(
-        title="Выдача / Наши ответы / Закрытие — по месяцам",
-        xaxis_title="Месяц",
-        yaxis_title="Замечаний",
-        height=500,
-        xaxis_tickangle=-45,
-        hovermode="x unified",
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="right", x=1,
-        ),
+    st.metric(
+        "Закрыто в срок (≤10 р.д.) за последние 3 месяца",
+        f"{pct3:.0%}" if pct3 is not None else "—",
+        delta=round(delta, 1) if delta is not None else None,
+        help="Среди замечаний, выданных за последние 3 месяца "
+             "и уже закрытых («Выполнено»). Тренд — изменение доли "
+             "«в срок» в процентных пунктах к предыдущему месяцу "
+             f"(месяцы с ≥{SLA_MIN_MONTH_N} закрытыми замечаниями).",
     )
-    st.plotly_chart(fig, use_container_width=True)
+
+    # ===== 2. Столбцы с накоплением по месяцам (100%) =====
+    st.markdown("#### Доля ответов по скорости закрытия")
+    st.caption("По месяцу выдачи замечания, 0–100%.")
+
+    win = sdf[(sdf["ym"] >= date_from.strftime("%Y-%m"))
+              & (sdf["ym"] <= date_to.strftime("%Y-%m"))]
+    if win.empty:
+        st.info("Нет закрытых замечаний за выбранный период.")
+    else:
+        counts = (win.groupby(["ym", "bucket"]).size()
+                  .unstack(fill_value=0)
+                  .reindex(columns=SLA_BUCKET_ORDER, fill_value=0))
+        shares = counts.div(counts.sum(axis=1), axis=0)
+
+        plot_df = shares.reset_index().melt(
+            id_vars="ym", var_name="Скорость ответа",
+            value_name="share")
+        plot_df = plot_df[plot_df["share"] > 0]
+
+        fig = px.bar(
+            plot_df, x="ym", y="share", color="Скорость ответа",
+            barmode="stack", text_auto=".0%",
+            category_orders={"Скорость ответа": SLA_BUCKET_ORDER},
+            color_discrete_map=SLA_BUCKET_COLORS,
+            labels={"ym": "Месяц выдачи замечания",
+                    "share": "Доля закрытых"},
+        )
+        fig.update_layout(
+            height=450,
+            xaxis_tickangle=-45,
+            yaxis_tickformat=".0%",
+            legend=dict(
+                orientation="h", yanchor="bottom", y=1.02,
+                xanchor="right", x=1,
+            ),
+        )
+        st.plotly_chart(fig, use_container_width=True,
+                        key="dyn_sla_monthly")
+
+    # ===== 3. Топ-5 проблемных комплектов =====
+    st.markdown("#### 🚩 Топ-5 проблемных комплектов")
+    st.caption(
+        "Наибольшая доля ответов позже 30 р.д. среди закрытых "
+        f"за последние 3 месяца (от {SLA_MIN_KIT_N} закрытых)."
+    )
+
+    if recent.empty:
+        st.info("Нет закрытых замечаний за последние 3 месяца.")
+        return
+
+    kits_df = recent.copy()
+    kits_df["complex"] = kits_df["complex"].fillna("(без комплекта)")
+    kit_stats = (kits_df.groupby("complex")
+                 .agg(total=("bucket", "size"),
+                      late=("bucket",
+                            lambda b: int((b == "Критично").sum()))))
+    kit_stats = kit_stats[kit_stats["total"] >= SLA_MIN_KIT_N]
+    if kit_stats.empty:
+        st.info("Недостаточно данных: нет комплектов с "
+                f"{SLA_MIN_KIT_N}+ закрытыми замечаниями за 3 месяца.")
+        return
+
+    kit_stats["share_late"] = kit_stats["late"] / kit_stats["total"]
+    kit_stats = (kit_stats.sort_values(["share_late", "total"],
+                                       ascending=False)
+                 .head(5).reset_index())
+
+    st.dataframe(
+        kit_stats,
+        column_config={
+            "complex": st.column_config.TextColumn("Комплект"),
+            "total": st.column_config.NumberColumn("Закрыто"),
+            "late": st.column_config.NumberColumn("Критично (>30 р.д.)"),
+            "share_late": st.column_config.ProgressColumn(
+                "Доля критичных", min_value=0.0, max_value=1.0,
+                format="percent"),
+        },
+        hide_index=True,
+        use_container_width=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +1252,8 @@ def _render_period_filter() -> tuple[date, date]:
 def render():
     st.header("📈 Динамика")
     st.caption(
-        "Инструмент РП и Директора: потоки замечаний по месяцам."
+        "Инструмент РП и Директора: потоки замечаний по месяцам "
+        "и соблюдение сроков ответа."
     )
 
     # ===== Прогресс за прошедшую неделю =====
@@ -993,7 +1297,8 @@ def render():
 
     st.divider()
 
-    _render_monthly_flow(issue, our_answers, cust_closed)
+    _render_sla_compliance(disc_t, sect_t, kit_t, block_codes,
+                           date_from, date_to)
 
     st.divider()
 
