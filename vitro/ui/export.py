@@ -572,7 +572,8 @@ def _load_authors_analytics() -> pd.DataFrame:
 @versioned_cache(3600)
 def _load_monthly_dynamics() -> pd.DataFrame:
     """
-    Динамика по месяцам: выдача / наши ответы / закрыто заказчиком.
+    Динамика по месяцам: выдача / выполнено АТП ТЛП /
+    закрыто заказчиком.
     """
     with get_conn() as conn:
         issue = pd.read_sql("""
@@ -586,7 +587,7 @@ def _load_monthly_dynamics() -> pd.DataFrame:
             SELECT substr(fix_date, 1, 7) AS ym, COUNT(*) AS our
             FROM comments
             WHERE fix_date IS NOT NULL AND fix_date <> ''
-              AND status IN ('Закрыто', 'Выполнено')
+              AND status = 'Выполнено'
             GROUP BY ym
         """, conn)
 
@@ -602,11 +603,12 @@ def _load_monthly_dynamics() -> pd.DataFrame:
         issue, our, on="ym", how="outer",
     ).merge(cust, on="ym", how="outer").fillna(0).sort_values("ym")
 
-    merged.columns = ["Месяц", "Выдано", "Наши ответы", "Закрыто заказчиком"]
-    for c in ["Выдано", "Наши ответы", "Закрыто заказчиком"]:
+    merged.columns = ["Месяц", "Выдано", "Выполнено", "Закрыто заказчиком"]
+    for c in ["Выдано", "Выполнено", "Закрыто заказчиком"]:
         merged[c] = merged[c].astype(int)
 
-    merged["Баланс (наш)"] = merged["Выдано"] - merged["Наши ответы"]
+    # Сколько замечаний мы ещё не выполнили (Выдано − Выполнено).
+    merged["Баланс (наш)"] = merged["Выдано"] - merged["Выполнено"]
     return merged
 
 
@@ -890,7 +892,7 @@ def _render_analytics():
         st.caption(f"Месяцев: **{len(df)}**")
         st.dataframe(df, use_container_width=True, hide_index=True)
         _make_download(df, "Динамика_по_месяцам", "monthly",
-                        subtitle="Динамика: выдача, ответы АТП ТЛП, "
+                        subtitle="Динамика: выдача, выполнено АТП ТЛП, "
                                   "закрытие заказчиком")
 
     with tab3:
