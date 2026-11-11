@@ -24,7 +24,7 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
-from vitro.sheets import dedup_documents
+from vitro.sheets import unique_vitro_sheets
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
     _doc_status_group,
@@ -166,25 +166,36 @@ def _filter_documents(df: pd.DataFrame,
 # ---------------------------------------------------------------------------
 @versioned_cache(3600)
 def _load_documents() -> pd.DataFrame:
-    """Листы РД — ПОСЛЕ дедупликации (патчи 11–12).
+    """Листы РД — ЕДИНЫЙ СТАНДАРТ «Плана выдачи» (патч 14).
 
     Одна строка = один УНИКАЛЬНЫЙ лист (complex, sheet_number):
-    из ревизий/повторных выгрузок остаётся последняя (MAX(status_date)).
-    Строки с пустым sheet_number не склеиваются (fallback по id).
-    Аннулирование «липкое» (патч 12): если хотя бы одна ревизия листа
-    имеет статус «Аннулировано», лист учитывается как аннулированный —
-    даже если последняя ревизия живая (иначе плитка «Аннулировано»
-    показывала 0 вместо реальных аннулированных листов).
-    Единый стандарт с «Планом выдачи»: ревизии одного листа не удваивают
-    счётчики «Листы РД» и разрезов.
+      * дедуп ревизий/повторных выгрузок (последняя ревизия,
+        sheets.unique_vitro_sheets — тот же код, что в «Плане
+        выдачи»);
+      * строки с пустым sheet_number не склеиваются (fallback по id);
+      * аннулирование «липкое» (патч 12): если хотя бы одна ревизия
+        листа имеет статус «Аннулировано», лист учитывается как
+        аннулированный;
+      * шифр комплекта нормализуется (trim, регистр, латинские
+        двойники) и обязан проходить is_valid_kit_code — мусорные
+        шифры из папок SharePoint исключаются, как в таблице
+        «Плана выдачи».
+
+    Благодаря этому «Листов всего» в Сводке совпадает с
+    «Листов в Витро» в «Плане выдачи» (раньше: 12 451 против
+    11 312 — Сводка не отсекала мусорные шифры).
     """
     with get_conn() as conn:
         df = pd.read_sql("""
             SELECT id, leaf, discipline, section, complex,
                    status, revision, name, status_date, sheet_number
             FROM documents
+            WHERE complex IS NOT NULL
         """, conn)
-    return dedup_documents(df)
+    kept = unique_vitro_sheets(df.to_dict("records"))
+    if not kept:
+        return df.iloc[0:0]
+    return pd.DataFrame(kept).reindex(columns=df.columns)
 
 
 

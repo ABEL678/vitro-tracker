@@ -85,7 +85,7 @@ from vitro.sqlite_db import (
     clear_plan,
     log_event,
 )
-from vitro.sheets import dedup_document_rows
+from vitro.sheets import dedup_document_rows, unique_vitro_sheets
 from vitro._cache import versioned_cache
 from vitro.ui._auth import ensure_user
 from vitro.ui._filters import (
@@ -156,17 +156,19 @@ MAX_DETAIL_ROWS = 2000  # строки детальных таблиц свер�
 def _vitro_sheet_counts() -> dict[str, int]:
     """{шифр комплекта: количество УНИКАЛЬНЫХ листов в Витро}.
 
-    Патч 13: тот же код, что и в Сводке — sheets.dedup_document_rows
-    (единый стандарт патчей 11–13):
+    Патч 14: считается через sheets.unique_vitro_sheets — единый
+    стандарт всех вкладок (Сводка, Динамика, Экспорт, Управление):
       * ревизии/повторы листа с номером считаются ОДИН раз
-        (ключ complex + sheet_number);
+        (ключ complex + sheet_number, последняя ревизия);
       * файлы с ПУСТЫМ sheet_number — самостоятельные листы
         (fallback по id);
       * complex НОРМАЛИЗУЕТСЯ (trim, регистр, латинские двойники):
         синк пишет complex как есть из папок SharePoint, поэтому
         один комплект мог храниться под несколькими написаниями —
         группировка делила его листы (пример СМИК: 33 вместо 44,
-        фантомный дубль в «Только в Витро» раздувал бублик).
+        фантомный дубль в «Только в Витро» раздувал бублик);
+      * мусорные шифры (is_valid_kit_code) исключаются — как и раньше
+        в _build_overview, теперь отсечение живёт в sheets.py.
     """
     with get_conn() as conn:
         rows = conn.execute("""
@@ -175,10 +177,9 @@ def _vitro_sheet_counts() -> dict[str, int]:
             WHERE complex IS NOT NULL
         """).fetchall()
     counts: dict[str, int] = {}
-    for r in dedup_document_rows([dict(x) for x in rows]):
-        code = str(r.get("complex") or "").strip()
-        if code:
-            counts[code] = counts.get(code, 0) + 1
+    for r in unique_vitro_sheets([dict(x) for x in rows]):
+        code = str(r.get("complex") or "")
+        counts[code] = counts.get(code, 0) + 1
     return counts
 
 

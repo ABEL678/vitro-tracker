@@ -17,7 +17,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from vitro.sheets import sql_count_sheets
+from vitro.sheets import unique_vitro_sheets
 from vitro.time_utils import msk_now_str
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -516,14 +516,22 @@ def log_event(event: str, message: str = "", rows: int = 0, status: str = "OK") 
 # ---------------------------------------------------------------------------
 def db_stats() -> dict:
     with get_conn() as conn:
+        # Уникальные листы — ЕДИНЫЙ СТАНДАРТ «Плана выдачи» (патч 14):
+        # sheets.unique_vitro_sheets (дедуп ревизий по complex +
+        # sheet_number, нормализация шифров, отсечение мусорных).
+        # Раньше считали SQL-выражением sql_count_sheets — без
+        # нормализации латинских двойников и без отсечения мусорных
+        # шифров, поэтому «Листов РД» в Управлении расходилось
+        # с «Планом выдачи».
+        doc_rows = conn.execute(
+            "SELECT id, complex, sheet_number FROM documents "
+            "WHERE complex IS NOT NULL"
+        ).fetchall()
         return {
             "documents":         conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
-            # Уникальные листы (патч 11): стандарт «Плана выдачи».
-            # Ревизии/повторные выгрузки одного листа считаются один раз.
-            "sheets":            conn.execute(
-                                    f"SELECT {sql_count_sheets('d')} "
-                                    "FROM documents AS d"
-                                 ).fetchone()[0],
+            # Уникальные листы (патчи 11/14): стандарт «Плана выдачи».
+            "sheets":            len(unique_vitro_sheets(
+                                    [dict(r) for r in doc_rows])),
             "comments":          conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
             "categorized":       conn.execute(
                                     "SELECT COUNT(*) FROM comments "

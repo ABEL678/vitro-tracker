@@ -16,7 +16,7 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
-from vitro.sheets import dedup_documents, sql_count_sheets
+from vitro.sheets import unique_vitro_sheets
 from vitro.pdf_builder import build_pdf
 from vitro.ui._filters import render_standard_filters
 
@@ -62,18 +62,28 @@ def _load_discipline_summary() -> pd.DataFrame:
     Сводка по дисциплинам:
       - Всего / Закрыто / Аннулировано — по всей базе
       - Активных + ответственные + категории — из _load_all_categorized
-      - Листов — УНИКАЛЬНЫЕ листы (патч 11): ревизии одного листа
-        считаются один раз (стандарт «Плана выдачи»)
+      - Листов — ЕДИНЫЙ СТАНДАРТ «Плана выдачи» (патч 14):
+        sheets.unique_vitro_sheets — дедуп ревизий, нормализация
+        шифров (в т.ч. латинских двойников), отсечение мусорных.
+        Раньше считали SQL-выражением sql_count_sheets — без
+        нормализации и отсечения, поэтому цифры расходились
+        с «Планом выдачи».
     """
     active = _load_active_df()
 
     with get_conn() as conn:
-        # ---- Общие цифры по всей базе ----
-        base = pd.read_sql("""
+        # ---- Листы: единый стандарт (дедуп + валидные шифры) ----
+        docs = pd.read_sql("""
+            SELECT id, discipline, complex, sheet_number
+            FROM documents
+            WHERE discipline IS NOT NULL
+        """, conn)
+
+        # ---- Замечания: считаем по ВСЕМ строкам documents (без дедупликации:
+        #      замечание, привязанное к старой ревизии, продолжает учитываться)
+        remarks = pd.read_sql("""
             SELECT
                 d.discipline AS discipline,
-                COUNT(DISTINCT d.complex) AS complexes,
-                {sheets} AS docs_total,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -83,7 +93,18 @@ def _load_discipline_summary() -> pd.DataFrame:
             LEFT JOIN comments c ON c.doc_id = d.id
             WHERE d.discipline IS NOT NULL
             GROUP BY d.discipline
-        """.format(sheets=sql_count_sheets("d")), conn)
+        """, conn)
+
+    kept = unique_vitro_sheets(docs.to_dict("records"))
+    if kept:
+        ddf = pd.DataFrame(kept)
+        base = (ddf.groupby("discipline", dropna=False)
+                .agg(complexes=("complex", "nunique"),
+                     docs_total=("id", "count"))
+                .reset_index())
+    else:
+        base = pd.DataFrame(columns=["discipline", "complexes",
+                                     "docs_total"])
 
     # ---- Активные по дисциплинам ----
     if not active.empty:
@@ -130,7 +151,10 @@ def _load_discipline_summary() -> pd.DataFrame:
             "closed_doc", "cat_1", "cat_2", "cat_3", "cat_4", "cat_none",
         ])
 
-    df = base.merge(active_disc, on="discipline", how="outer").fillna(0)
+    # base (листы) + remarks (замечания, docs-driven) + active_disc
+    df = (base.merge(remarks, on="discipline", how="outer")
+              .merge(active_disc, on="discipline", how="outer")
+              .fillna(0))
 
     df["pct_closed"] = df.apply(
         lambda r: round(r["closed"] / r["total"] * 100, 1)
@@ -170,9 +194,12 @@ def _load_discipline_summary() -> pd.DataFrame:
 def _load_complex_summary() -> pd.DataFrame:
     """Сводка по комплектам.
 
-    Патч 11 — единый стандарт листов:
+    Патчи 11/14 — единый стандарт листов:
       * Листы и статусы A/B/C/И — по УНИКАЛЬНЫМ листам (complex +
-        sheet_number), статус берётся с ПОСЛЕДНЕЙ ревизии листа.
+        sheet_number), статус берётся с ПОСЛЕДНЕЙ ревизии листа;
+        sheets.unique_vitro_sheets — тот же код, что в «Плане
+        выдачи»: нормализация шифров (латинские двойники) +
+        отсечение мусорных.
       * Замечания (Всего/Закрыто/Аннулировано) — по всем замечаниям
         без дедупликации: замечание, привязанное к старой ревизии,
         продолжает учитываться.
@@ -203,8 +230,14 @@ def _load_complex_summary() -> pd.DataFrame:
             GROUP BY d.discipline, d.complex
         """, conn)
 
-    # Уникальные листы: одна строка = один лист (последняя ревизия)
-    docs = dedup_documents(docs)
+    # Уникальные листы: одна строка = один лист (последняя ревизия,
+    # нормализованный шифр, только валидные комплекты)
+    kept = unique_vitro_sheets(docs.to_dict("records"))
+    if not kept:
+        docs = docs.iloc[0:0]
+    else:
+        docs = pd.DataFrame(kept).reindex(columns=docs.columns)
+
     if docs.empty:
         base = remarks.iloc[0:0].copy()
         for c in ("docs_total", "doc_a", "doc_b", "doc_c", "doc_info"):
@@ -298,16 +331,27 @@ def _load_complex_summary() -> pd.DataFrame:
 
 @versioned_cache(3600)
 def _load_section_summary() -> pd.DataFrame:
-    """Сводка по разделам."""
+    """Сводка по разделам.
+
+    Патч 14: листы — единый стандарт «Плана выдачи»
+    (sheets.unique_vitro_sheets) вместо SQL-выражения
+    sql_count_sheets (без нормализации шифров и отсечения мусорных).
+    """
     active = _load_active_df()
 
     with get_conn() as conn:
-        base = pd.read_sql("""
+        # ---- Листы: единый стандарт (дедуп + валидные шифры) ----
+        docs = pd.read_sql("""
+            SELECT id, discipline, section, complex, sheet_number
+            FROM documents
+            WHERE section IS NOT NULL AND section <> ''
+        """, conn)
+
+        # ---- Замечания: по всем строкам documents (без дедупликации)
+        remarks = pd.read_sql("""
             SELECT
                 d.discipline AS discipline,
                 d.section AS section,
-                COUNT(DISTINCT d.complex) AS complexes,
-                {sheets} AS docs_total,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -317,7 +361,18 @@ def _load_section_summary() -> pd.DataFrame:
             LEFT JOIN comments c ON c.doc_id = d.id
             WHERE d.section IS NOT NULL AND d.section <> ''
             GROUP BY d.discipline, d.section
-        """.format(sheets=sql_count_sheets("d")), conn)
+        """, conn)
+
+    kept = unique_vitro_sheets(docs.to_dict("records"))
+    if kept:
+        ddf = pd.DataFrame(kept)
+        base = (ddf.groupby(["discipline", "section"], dropna=False)
+                .agg(complexes=("complex", "nunique"),
+                     docs_total=("id", "count"))
+                .reset_index())
+    else:
+        base = pd.DataFrame(columns=["discipline", "section",
+                                     "complexes", "docs_total"])
 
     if not active.empty:
         rows = []
@@ -350,8 +405,11 @@ def _load_section_summary() -> pd.DataFrame:
             "ours", "waiting", "chronic", "closed_doc",
         ])
 
-    df = base.merge(active_sect, on=["discipline", "section"],
-                     how="outer").fillna(0)
+    # base (листы) + remarks (замечания, docs-driven) + active_sect
+    df = (base.merge(remarks, on=["discipline", "section"], how="outer")
+              .merge(active_sect, on=["discipline", "section"],
+                     how="outer")
+              .fillna(0))
 
     df["pct_closed"] = df.apply(
         lambda r: round(r["closed"] / r["total"] * 100, 1)
