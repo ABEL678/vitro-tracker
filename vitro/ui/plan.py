@@ -872,10 +872,11 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
                             flt: dict,
                             date_from, date_to) -> pd.DataFrame:
     """
-    Таблица Б: позиции листов (plan_drawings) комплектов, прошедших
-    фильтры. Дата позиции = плановая дата листа, а если её нет —
-    срок готовности комплекта. «Фактическая дата» — дата статуса листа
-    в Витро (если лист загружен; MAX по ревизиям).
+    Таблица Б: позиции листов из Ведомости (plan_drawings) + из Витро
+    (documents). Объединяет:
+      - Листы из Ведомости: плановая дата, наименование из ведомости;
+      - Листы из Витро (без Ведомости): статус «Выдан», наименование
+        из Витро, пометка «Нет в ведомости».
     С патча 12 есть колонка «Шифр листа» — полный шифр листа
     (шифр комплекта + номер листа).
     """
@@ -883,25 +884,109 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
         return pd.DataFrame(columns=SHEET_PLAN_COLUMNS)
 
     drawings = load_plan_drawings()
-    if drawings.empty:
-        return pd.DataFrame(columns=SHEET_PLAN_COLUMNS)
-
     ov = overview_filtered[[
         "code", "status", "due_date", "discipline", "section",
     ]].rename(columns={"discipline": "kit_discipline",
                        "section": "kit_section"})
-    df = drawings.merge(
-        ov, left_on="kit_code", right_on="code", how="inner",
-    )
-    df = df.rename(columns={"kit_code": "Комплект(ы)",
-                            "title": "Наименование листа"})
-    df = df.drop(columns=["code"])
+
+    # ---- 1. Листы из Ведомости (plan_drawings) ----
+    if not drawings.empty:
+        df_dwg = drawings.merge(
+            ov, left_on="kit_code", right_on="code", how="inner",
+        )
+        df_dwg = df_dwg.rename(columns={
+            "kit_code": "Комплект(ы)",
+            "title": "Наименование листа",
+            "discipline": "dwg_discipline",
+            "section": "dwg_section",
+        })
+        # Добавляем колонку name для единообразия с df_vitro
+        df_dwg["name"] = df_dwg["Наименование листа"]
+        df_dwg["sheet_number"] = df_dwg.get("sheet_no", "")
+        df_dwg["_source"] = "dwg"
+        df_dwg = df_dwg.drop(columns=["code"])
+    else:
+        df_dwg = pd.DataFrame()
+
+    # ---- 2. Листы из Витро (documents), которых нет в Ведомости ----
+    if not df_dwg.empty:
+        dwg_codes = set(df_dwg["Комплект(ы)"])
+    else:
+        dwg_codes = set()
+
+    # Загружаем уникальные листы из Витро (dedup по complex + sheet_number)
+    with get_conn() as conn:
+        doc_rows = conn.execute("""
+            SELECT complex, sheet_number, status_date, name
+            FROM documents
+            WHERE complex IS NOT NULL
+              AND TRIM(COALESCE(sheet_number, '')) != ''
+        """).fetchall()
+
+    vitro_sheets = dedup_document_rows([dict(r) for r in doc_rows])
+    if vitro_sheets:
+        df_vitro = pd.DataFrame(vitro_sheets)
+        df_vitro["Комплект(ы)"] = df_vitro["complex"].apply(_norm_complex_code)
+        df_vitro["_source"] = "vitro"
+        df_vitro["dwg_discipline"] = ""
+        df_vitro["dwg_section"] = ""
+        # Отфильтровываем комплекты, которых нет в overview_filtered
+        if not df_vitro.empty:
+            valid_codes = set(overview_filtered["code"])
+            df_vitro = df_vitro[df_vitro["Комплект(ы)"].isin(valid_codes)]
+            # Отфильтровываем те, что уже есть в Ведомости
+            df_vitro = df_vitro[~df_vitro["Комплект(ы)"].isin(dwg_codes)]
+    else:
+        df_vitro = pd.DataFrame()
+
+    # ---- 3. Приводим обе таблицы к общему набору колонок ----
+    common_cols = [
+        "Комплект(ы)", "Наименование листа", "dwg_discipline",
+        "dwg_section", "_source", "name", "sheet_number",
+        "sheet_no", "planned_date", "discipline", "section",
+    ]
+    for col in common_cols:
+        if col not in df_dwg.columns:
+            df_dwg[col] = "" if col != "planned_date" else None
+        if col not in df_vitro.columns:
+            df_vitro[col] = "" if col != "planned_date" else None
+
+    # ---- 4. Объединяем Ведомость + Витро ----
+    if df_dwg.empty and df_vitro.empty:
+        return pd.DataFrame(columns=SHEET_PLAN_COLUMNS)
+
+    if df_dwg.empty:
+        df = df_vitro
+    elif df_vitro.empty:
+        df = df_dwg
+    else:
+        df = pd.concat([df_dwg, df_vitro], ignore_index=True)
+
+    # Для листов из Витро (без Ведомости) — заполняем поля
+    if "_source" in df.columns:
+        is_vitro = df["_source"] == "vitro"
+        # Безопасный доступ: используем .get() чтобы не падать, если колонки нет
+        df.loc[is_vitro, "Наименование листа"] = (
+            df.loc[is_vitro, "name"].fillna(""))
+        # sheet_number может отсутствовать если df_dwg пустой
+        if "sheet_number" in df.columns:
+            df.loc[is_vitro, "sheet_no"] = (
+                df.loc[is_vitro, "sheet_number"].fillna(""))
+        else:
+            df.loc[is_vitro, "sheet_no"] = ""
+        df.loc[is_vitro, "planned_date"] = None
+        df.loc[is_vitro, "discipline"] = ""
+        df.loc[is_vitro, "section"] = ""
+        # Добавляем отсутствующие колонки (из Ведомости)
+        for col in ["sheet_no", "planned_date", "discipline", "section"]:
+            if col not in df.columns:
+                df[col] = ""
 
     # Дисциплина/раздел: значение строки листа, а если пусто — комплекта.
-    row_disc = df["discipline"].fillna("")
+    row_disc = df["dwg_discipline"].fillna("")
     df["Дисциплина"] = row_disc.where(row_disc != "", df["kit_discipline"]
                                       .fillna(""))
-    row_sect = df["section"].fillna("")
+    row_sect = df["dwg_section"].fillna("")
     df["Раздел"] = row_sect.where(row_sect != "", df["kit_section"].fillna(""))
 
     # ---- Стандартные фильтры ----
