@@ -1,0 +1,284 @@
+diff --git a/vitro/ui/dynamics.py b/vitro/ui/dynamics.py
+index 768d8af..d038bab 100755
+--- a/vitro/ui/dynamics.py
++++ b/vitro/ui/dynamics.py
+@@ -10,7 +10,7 @@
+ 
+ Блоки вкладки:
+   1. «Прогресс за прошедшую неделю» — метрики за 7 дней (выдано
+-     замечаний, наши ответы, закрыто заказчиком, выгружено
++     замечаний, выполнено, закрыто заказчиком, выгружено
+      комплектов и листов) + прогресс-бары «доля недели от общего
+      объёма за всё время».
+      «Выгружено комплектов» — только комплекты, ПОЯВИВШИЕСЯ в
+@@ -21,7 +21,7 @@
+      комплекты / уникальные листы за выбранный период.
+   3. «Выполнение плана» — бублики против Ведомости комплектов
+      (plan_drawings / plan_kits): комплекты, листы + два бублика
+-     по замечаниям за период («Наши ответы / Осталось» и
++     по замечаниям за период («Выполнено / Осталось» и
+      «Закрыто заказчиком / Осталось», процент — в центре).
+      «Выполнено» — уникальные листы и комплекты в Витро по
+      sheets.unique_vitro_sheets — ЕДИНОМУ стандарту «Плана
+@@ -50,6 +50,20 @@
+   3. Сводка: плитка «Прочие статусы» + строка арифметики —
+      11 312 = (A+B+C+И) + прочие (на согласовании, готовится,
+      аннулировано).
++
++Патч 16 (терминология): «Наши ответы» → «Выполнено».
++  Метрика «Наши ответы» (Выполнено + Закрыто) вводила в
++  заблуждение: смешивала два разных статуса. Теперь «Выполнено»
++  — ТОЛЬКО замечания со статусом «Выполнено» (АТП ТЛП выполнил
++  и направил заказчику на согласование, заказчик ещё не
++  закрыл); «Закрыто заказчиком» считается отдельно. Запросы
++  считают только status = 'Выполнено' (_load_weekly_stats,
++  _load_totals_all, _load_our_answers_stats,
++  _load_our_answers_by_discipline).
++  Сходимость: Выполнено + Закрыто заказчиком = все снятые
++  замечания. «Выполнено» в Динамике шире, чем «со статусом
++  Выполнено» в Сводке: там часть замечаний со статусом
++  «Выполнено» уходит в «К листам A» и «К аннулированным».
+ """
+ 
+ from datetime import date, timedelta
+@@ -105,8 +119,8 @@ def _load_weekly_stats(date_from: date, date_to: date) -> dict:
+ 
+     Ключи словаря:
+       issued      — выдано замечаний (comments.created);
+-      our_answers — наши ответы (comments.fix_date, статус
+-                    «Выполнено» или «Закрыто»);
++      our_answers — выполнено (comments.fix_date, статус
++                    «Выполнено»; заказчик ещё не закрыл);
+       cust_closed — закрыто заказчиком (comments.fix_date, «Закрыто»);
+       kits        — комплекты, ПОЯВИВШИЕСЯ в Витро ВПЕРВЫЕ за период;
+       sheets      — уникальные листы, чья последняя ревизия
+@@ -133,7 +147,7 @@ def _load_weekly_stats(date_from: date, date_to: date) -> dict:
+                 COALESCE(SUM(CASE WHEN c.created >= ? AND c.created < ?
+                                   THEN 1 ELSE 0 END), 0) AS issued,
+                 COALESCE(SUM(CASE WHEN c.fix_date >= ? AND c.fix_date < ?
+-                                   AND c.status IN ('Закрыто', 'Выполнено')
++                                   AND c.status = 'Выполнено'
+                                   THEN 1 ELSE 0 END), 0) AS our_answers,
+                 COALESCE(SUM(CASE WHEN c.fix_date >= ? AND c.fix_date < ?
+                                    AND c.status = 'Закрыто'
+@@ -182,8 +196,7 @@ def _load_totals_all() -> dict:
+             SELECT COUNT(*) AS issued,
+                    COALESCE(SUM(CASE WHEN c.fix_date IS NOT NULL
+                                       AND c.fix_date <> ''
+-                                      AND c.status IN ('Закрыто',
+-                                                       'Выполнено')
++                                      AND c.status = 'Выполнено'
+                                      THEN 1 ELSE 0 END), 0)
+                        AS our_answers,
+                    COALESCE(SUM(CASE WHEN c.fix_date IS NOT NULL
+@@ -227,9 +240,10 @@ def _render_weekly_progress():
+         help="Замечания заказчика, созданные за последние 7 дней.",
+     )
+     c2.metric(
+-        "🔴 Наши ответы", _fmt(stats["our_answers"]),
+-        help="Замечания, переведённые АТП ТЛП в «Выполнено» "
+-             "или «Закрыто» за последние 7 дней.",
++        "🟠 Выполнено", _fmt(stats["our_answers"]),
++        help="Замечания, которые АТП ТЛП выполнил и направил "
++             "заказчику на согласование (статус «Выполнено») "
++             "за последние 7 дней. Заказчик их ещё не закрыл.",
+     )
+     c3.metric(
+         "🟢 Закрыто заказчиком", _fmt(stats["cust_closed"]),
+@@ -352,7 +366,7 @@ def _load_our_answers_stats(disciplines: tuple, sections: tuple,
+         FROM comments c
+         JOIN documents d ON c.doc_id = d.id
+         WHERE c.fix_date IS NOT NULL AND c.fix_date <> ''
+-          AND c.status IN ('Закрыто', 'Выполнено')
++          AND c.status = 'Выполнено'
+           {where}
+         GROUP BY ym ORDER BY ym
+     """
+@@ -475,7 +489,7 @@ def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
+         FROM comments c
+         JOIN documents d ON c.doc_id = d.id
+         WHERE c.fix_date IS NOT NULL AND c.fix_date <> ''
+-          AND c.status IN ('Закрыто', 'Выполнено')
++          AND c.status = 'Выполнено'
+           AND d.discipline IS NOT NULL
+           {where}
+         GROUP BY ym, d.discipline ORDER BY ym, d.discipline
+@@ -545,9 +559,12 @@ def _render_kpi(issue: pd.DataFrame,
+         help="Сколько замечаний поступило от заказчика за выбранный период.",
+     )
+     c2.metric(
+-        "Наши ответы", _fmt(total_our),
+-        help="Сколько замечаний АТП ТЛП перевёл в «Выполнено» "
+-             "или «Закрыто» за период.",
++        "Выполнено", _fmt(total_our),
++        help="Замечания, которые АТП ТЛП выполнил и направил "
++             "заказчику на согласование (статус «Выполнено»). "
++             "Заказчик их ещё не закрыл.\n\n"
++             "Вместе с «Закрыто заказчиком» показывает все снятые "
++             "замечания.",
+     )
+     c3.metric(
+         "Закрыто заказчиком", _fmt(total_cust),
+@@ -844,7 +861,7 @@ def _build_donut_figure(done: int, plan_total: int,
+     Возвращает (fig, процент, осталось/перевыполнено, признак_перевыполнения).
+ 
+     done_label/over_label/done_color — подписи и цвет сегмента
+-    «сделано» (для бубликов по замечаниям: «Наши ответы» /
++    «сделано» (для бубликов по замечаниям: «Выполнено» /
+     «Закрыто заказчиком»). Сегмент «Осталось» — серый, «сверх» —
+     оранжевый, как и раньше.
+     """
+@@ -900,7 +917,7 @@ def _build_donut_figure(done: int, plan_total: int,
+ def _render_remark_donuts(remark_totals: dict | None):
+     """Бублики по замечаниям за период (патч 14).
+ 
+-    «Наши ответы / Осталось» и «Закрыто заказчиком / Осталось» —
++    «Выполнено / Осталось» и «Закрыто заказчиком / Осталось» —
+     от общего числа выданных за период замечаний, процент в центре.
+     Не зависят от Ведомости — рисуются даже если план не задан.
+     """
+@@ -908,12 +925,12 @@ def _render_remark_donuts(remark_totals: dict | None):
+     if issued_total <= 0:
+         return
+ 
+-    st.markdown("#### Замечания за период: ответы и закрытие")
++    st.markdown("#### Замечания за период: выполнение и закрытие")
+     st.caption(
+         f"От общего числа замечаний, выданных за выбранный период "
+-        f"({_fmt(issued_total)}). «Осталось» — без ответа/закрытия. "
+-        f"Ответы и закрытия замечаний, выданных до периода, дают "
+-        f"долю выше 100% (сегмент «Сверх периода»)."
++        f"({_fmt(issued_total)}). «Осталось» — не выполнено и не "
++        f"закрыто. Выполненные и закрытые замечания, выданные до "
++        f"периода, дают долю выше 100% (сегмент «Сверх периода»)."
+     )
+ 
+     our_total = int((remark_totals or {}).get("our_answers") or 0)
+@@ -924,15 +941,15 @@ def _render_remark_donuts(remark_totals: dict | None):
+     with r1:
+         fig, pct, status_text, is_over = _build_donut_figure(
+             our_total, issued_total,
+-            done_label="Наши ответы",
++            done_label="Выполнено",
+             over_label="Сверх периода",
+-            done_color="#E57373",
++            done_color="#F9A825",
+         )
+         st.plotly_chart(fig, use_container_width=True,
+                         key="dyn_donut_our")
+         if is_over:
+             st.markdown(
+-                f"<div style='text-align:center'>Наши ответы "
++                f"<div style='text-align:center'>Выполнено "
+                 f"<b>{_fmt(our_total)}</b> из "
+                 f"<b>{_fmt(issued_total)}</b> выданных — "
+                 f"<b style='color:#FFA726'>+{_fmt(status_text)} "
+@@ -941,7 +958,7 @@ def _render_remark_donuts(remark_totals: dict | None):
+             )
+         else:
+             st.markdown(
+-                f"<div style='text-align:center'>Наши ответы "
++                f"<div style='text-align:center'>Выполнено "
+                 f"<b>{_fmt(our_total)}</b> из "
+                 f"<b>{_fmt(issued_total)}</b> выданных — "
+                 f"осталось <b>{_fmt(status_text)}</b></div>",
+@@ -1319,7 +1336,7 @@ def _render_cumulative(issue: pd.DataFrame,
+         df = issue.rename(columns={"n": "Выдано"}).copy()
+         frames.append(df.set_index("ym"))
+     if not our_answers.empty:
+-        df = our_answers.rename(columns={"n": "Наши ответы"}).copy()
++        df = our_answers.rename(columns={"n": "Выполнено"}).copy()
+         frames.append(df.set_index("ym"))
+     if not cust_closed.empty:
+         df = cust_closed.rename(columns={"n": "Закрыто заказчиком"}).copy()
+@@ -1342,11 +1359,11 @@ def _render_cumulative(issue: pd.DataFrame,
+             line=dict(color="#64B5F6", width=3),
+         ))
+ 
+-    if "Наши ответы" in merged.columns:
++    if "Выполнено" in merged.columns:
+         fig.add_trace(go.Scatter(
+-            x=merged["ym"], y=merged["Наши ответы"],
+-            mode="lines", name="🔴 Наши ответы",
+-            line=dict(color="#E57373", width=3),
++            x=merged["ym"], y=merged["Выполнено"],
++            mode="lines", name="🟠 Выполнено",
++            line=dict(color="#F9A825", width=3),
+         ))
+ 
+     if "Закрыто заказчиком" in merged.columns:
+@@ -1357,7 +1374,7 @@ def _render_cumulative(issue: pd.DataFrame,
+         ))
+ 
+     fig.update_layout(
+-        title="Накопительно: выдано vs наши ответы vs закрыто",
++        title="Накопительно: выдано vs выполнено vs закрыто",
+         xaxis_title="Месяц",
+         yaxis_title="Всего замечаний",
+         height=500,
+@@ -1387,7 +1404,7 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
+     st.markdown("#### 🏷 По дисциплинам")
+ 
+     tab_issue, tab_our, tab_cust = st.tabs([
+-        "📤 Выдача", "🔴 Наши ответы", "🟢 Закрыто заказчиком"
++        "📤 Выдача", "🟠 Выполнено", "🟢 Закрыто заказчиком"
+     ])
+ 
+     with tab_issue:
+@@ -1421,7 +1438,7 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
+             fig = px.bar(
+                 df, x="ym", y="n", color="label",
+                 barmode="stack",
+-                labels={"ym": "Месяц", "n": "Ответов",
++                labels={"ym": "Месяц", "n": "Выполнено",
+                         "label": "Дисциплина"},
+             )
+             fig.update_layout(height=500, xaxis_tickangle=-45,
+diff --git a/vitro/ui/export.py b/vitro/ui/export.py
+index 6dd54b1..af8bdce 100644
+--- a/vitro/ui/export.py
++++ b/vitro/ui/export.py
+@@ -572,7 +572,8 @@ def _load_authors_analytics() -> pd.DataFrame:
+ @versioned_cache(3600)
+ def _load_monthly_dynamics() -> pd.DataFrame:
+     """
+-    Динамика по месяцам: выдача / наши ответы / закрыто заказчиком.
++    Динамика по месяцам: выдача / выполнено АТП ТЛП /
++    закрыто заказчиком.
+     """
+     with get_conn() as conn:
+         issue = pd.read_sql("""
+@@ -586,7 +587,7 @@ def _load_monthly_dynamics() -> pd.DataFrame:
+             SELECT substr(fix_date, 1, 7) AS ym, COUNT(*) AS our
+             FROM comments
+             WHERE fix_date IS NOT NULL AND fix_date <> ''
+-              AND status IN ('Закрыто', 'Выполнено')
++              AND status = 'Выполнено'
+             GROUP BY ym
+         """, conn)
+ 
+@@ -602,11 +603,12 @@ def _load_monthly_dynamics() -> pd.DataFrame:
+         issue, our, on="ym", how="outer",
+     ).merge(cust, on="ym", how="outer").fillna(0).sort_values("ym")
+ 
+-    merged.columns = ["Месяц", "Выдано", "Наши ответы", "Закрыто заказчиком"]
+-    for c in ["Выдано", "Наши ответы", "Закрыто заказчиком"]:
++    merged.columns = ["Месяц", "Выдано", "Выполнено", "Закрыто заказчиком"]
++    for c in ["Выдано", "Выполнено", "Закрыто заказчиком"]:
+         merged[c] = merged[c].astype(int)
+ 
+-    merged["Баланс (наш)"] = merged["Выдано"] - merged["Наши ответы"]
++    # Сколько замечаний мы ещё не выполнили (Выдано − Выполнено).
++    merged["Баланс (наш)"] = merged["Выдано"] - merged["Выполнено"]
+     return merged
+ 
+ 
+@@ -890,7 +892,7 @@ def _render_analytics():
+         st.caption(f"Месяцев: **{len(df)}**")
+         st.dataframe(df, use_container_width=True, hide_index=True)
+         _make_download(df, "Динамика_по_месяцам", "monthly",
+-                        subtitle="Динамика: выдача, ответы АТП ТЛП, "
++                        subtitle="Динамика: выдача, выполнено АТП ТЛП, "
+                                   "закрытие заказчиком")
+ 
+     with tab3:

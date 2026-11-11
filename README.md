@@ -35,12 +35,13 @@ Vitro_tracker/
     ├── text_utils.py          # clean_leaf_key, normalize_homoglyphs
     ├── xlsx_builder.py        # Генерация XLSX
     ├── pdf_builder.py         # Генерация PDF
+    ├── sheets.py              # ЕДИНЫЙ СТАНДАРТ листов (unique_vitro_sheets)
+    ├── plan_xlsx.py           # Парсеры ведомостей плана
     └── ui/
         ├── summary.py         # Сводка по проекту
         ├── dynamics.py        # Динамика (потоки по месяцам)
         ├── authors.py         # Авторы замечаний
-        ├── deadlines.py       # Сроки + единый источник
-        ├── plan.py            # План выдачи комплектов
+
         ├── categories.py      # Категории (ручная разметка)
         ├── search.py          # Поиск по тексту
         ├── export.py          # Экспорт
@@ -90,6 +91,10 @@ streamlit run app.py
 
 Все вкладки используют функцию **`vitro/ui/deadlines.py` → `_load_all_categorized()`** для получения активных замечаний. SQL не дублируется.
 
+### Единый источник истиины (листы)
+
+**`vitro/sheets.py` → `unique_vitro_sheets(rows)`** — единственный источник уникальных листов. Дедуп ревизий: последняя по `(complex, leaf)` — `max(vitro_version)`, затем `max(id)`.
+
 Функция возвращает колонки:
 - `holder` — `ours` / `customer` / `customer_a` / `annulled`
 - `our_status` — `new` / `in_work` / `rejected` / `discussion`
@@ -131,6 +136,8 @@ streamlit run app.py
 | `our_bucket == "≤10"` | Срок ответа не превышен |
 | `our_bucket > "≤10"` | Просрочено (>10 р.д.) |
 | `holder == "customer"` | Заказчик (Выполнено) |
+| Статус `Выполнено` | АТП ТЛП перевёл в «Выполнено» |
+| Статус `Закрыто` | Закрыто заказчиком (формально) |
 | `category_flag` | Категории (ручная разметка) |
 | `status` (comments) | Статус замечания (сырой из Витрокад) |
 | `doc_status` (comments) | Статус листа (сырой из Витрокад) |

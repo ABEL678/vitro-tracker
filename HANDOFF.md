@@ -4,11 +4,18 @@
 
 ### Последняя работа
 
-**Документация обновлена** после серии из 11 задач (см. ниже).
+**Ветка:** `release/1.4-plan`
+**Последний коммит:** после патча 15 (dynamics_v4_unified + patch15_dynamics_summary)
+
+**Документация обновлена** после серии из 15 задач (см. ниже).
 
 ### Что сделано за последние заходы
 
-1. **Второй ряд фильтров в Сводке** — «Статус замечания» (5 сырых) + «Статус листа» (8 групп). DISPLAY_LIMIT убран — все строки разреза видны.
+1. **Единый источник листов** — `vitro/sheets.py` → `unique_vitro_sheets(rows)`, 11 312 уникальных листов.
+2. **Вкладка «План выдачи»** — 424 комплекта, ведомости Excel, бублики «всего/план», детальная таблица.
+3. **Единые фильтры** — `vitro/ui/_filters.py` → `render_standard_filters()` во всех вкладках.
+4. **SLA в «Динамике»** — блок «Соблюдение сроков» (≤10 р.д., 10–30 р.д., >30 р.д.), топ-5 проблемных комплектов.
+5. **Второй ряд фильтров в Сводке** — «Статус замечания» (5 сырых) + «Статус листа» (8 групп). DISPLAY_LIMIT убран — все строки разреза видны.
 2. **Ссылки на Витро** — колонка «Витро» в трёх местах (Авторы drilldown, Сроки список, Поиск результаты). URL: `https://pdm-lakhta.ru/okhta/_layouts/15/Vitro/Viewer/PDF/web/Viewer.aspx?Id={guid}&version={v}&noteId={id}`.
 3. **Рефакторинг `_filters.py`** — вынос общих фильтров (статусы листов, статусы замечаний, марка комплекта).
 4. **`_urls.py`** — хелперы для URL Витро.
@@ -53,6 +60,12 @@ ce612c1 fix(summary): fixed column widths and freeze header
 - `.gigacode/` — файлы планов
 
 ## Критические детали
+
+### `vitro/sheets.py` — единый источник листов
+
+- `unique_vitro_sheets(rows)` — дедуп ревизий: последняя по `(complex, leaf)`.
+- `dedup_document_rows(rows)` — обёртка для pandas/списка.
+- Используется в: `dynamics.py` (_load_unique_documents), `summary.py`, `export.py`, `plan.py`.
 
 ### `vitro/ui/_filters.py` — общие фильтры
 
@@ -126,9 +139,13 @@ ce612c1 fix(summary): fixed column widths and freeze header
 - Расширен ключами `sheet_groups`, `remark_status`, `marka` — хранит выбранные фильтры.
 - Передаётся в `_filter_key()` для кэширования.
 
-### `_build_summary_rows`
+### `vitro/ui/dynamics.py` — план и бублики
 
-- Использует `our_status` (не `status`): `"new"`, `"in_work"`, `"rejected"`, `"discussion"`.
+- `_load_plan(disciplines, sections, kits, block_codes)` — план из `plan_drawings` + `plan_kits` с фильтрами.
+- `_load_doc_totals(disciplines, sections, kits, block_codes)` — уникальные листы через `unique_vitro_sheets`.
+- `_render_progress_donuts()` — бублики «выполнено/план» с учётом фильтров.
+
+### `_build_summary_rows`
 - `n_customer = len(customer)` где `customer = sub[sub["holder"] == "customer"]`.
 - `active_total = n_new + n_in_work + n_rejected + n_discussion + n_customer`.
 
@@ -172,6 +189,7 @@ Vitro_tracker/
         ├── dynamics.py        # Динамика (потоки по месяцам)
         ├── authors.py         # Авторы замечаний
         ├── deadlines.py       # Сроки + единый источник
+        ├── plan.py            # План выдачи комплектов
         ├── categories.py      # Категории (ручная разметка)
         ├── search.py          # Поиск по тексту
         ├── export.py          # Экспорт
