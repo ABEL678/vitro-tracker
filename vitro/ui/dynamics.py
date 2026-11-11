@@ -35,6 +35,21 @@
 Единый подсчёт листов: дублирующие SQL COUNT(*) убраны — факты
 считаются pandas-ом от сырых строк documents через vitro.sheets
 (см. _load_document_rows).
+
+Патч 15 (период ↔ KPI ↔ план ↔ Сводка):
+  1. Пресет периода и календарь жёстко синхронизированы
+     (_render_period_filter): рассинхрон старых сессий самолечится,
+     ручной ввод дат защищён флагом dyn_dates_manual. Именно
+     рассинхрон (радио «Всё время», даты — 12 мес.) давал
+     «KPI не меняется при переключении периода». Граница периода —
+     строго «< начала следующего дня». Под «Общий объём за период»
+     виден фактический период, по которому считаются метрики.
+  2. «Выполнение плана»: в план добавлены комплекты «Только в
+     Витро» (_load_plan) — как в «Плане выдачи», план 424 = 416
+     (ведомость) + 8, цифры вкладок совпадают.
+  3. Сводка: плитка «Прочие статусы» + строка арифметики —
+     11 312 = (A+B+C+И) + прочие (на согласовании, готовится,
+     аннулировано).
 """
 
 from datetime import date, timedelta
@@ -290,7 +305,13 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
         parts.append(f"{date_col} >= ?")
         params.append(date_from.isoformat())
     if date_to:
-        parts.append(f"{date_col} <= ?")
+        # Патч 15: строго «< начала следующего дня», а не «<=».
+        # Для колонок с чистыми датами (без времени) «<= следующего
+        # дня» неверно включало бы ВЕСЬ следующий день
+        # ('2026-11-12' <= '2026-11-12' — TRUE); для меток времени
+        # оба варианта равны. '<' — однозначная граница «до конца
+        # date_to», та же, что в _load_weekly_stats.
+        parts.append(f"{date_col} < ?")
         params.append((date_to + timedelta(days=1)).isoformat())
     return (" AND " + " AND ".join(parts)) if parts else "", params
 
@@ -492,12 +513,31 @@ def _load_customer_closed_by_discipline(disciplines: tuple, sections: tuple,
 def _render_kpi(issue: pd.DataFrame,
                  our_answers: pd.DataFrame,
                  cust_closed: pd.DataFrame,
-                 doc_volume: dict):
+                 doc_volume: dict,
+                 date_from: date | None = None,
+                 date_to: date | None = None):
+    """KPI «Общий объём за период» (патч 15).
+
+    Все пять метрик считаются ТОЛЬКО за выбранный период:
+    замечания/ответы/закрытия приходят из _load_issue_stats /
+    _load_our_answers_stats / _load_customer_closed_stats, куда
+    date_from/date_to передаются из _render_period_filter()
+    (см. render()), комплекты/листы — из _load_doc_volume с теми же
+    датами. Патч 15 добавляет подпись с ФАКТИЧЕСКИМ периодом — чтобы
+    расхождение «пресет vs цифры» было видно сразу (раньше радио
+    показывало «Всё время», а запросы шли за 12 месяцев).
+    """
     total_issue = int(issue["n"].sum()) if not issue.empty else 0
     total_our = int(our_answers["n"].sum()) if not our_answers.empty else 0
     total_cust = int(cust_closed["n"].sum()) if not cust_closed.empty else 0
 
     st.markdown("##### 📦 Общий объём за период")
+    if date_from and date_to:
+        st.caption(
+            f"Период: **{date_from.strftime('%d.%m.%Y')} — "
+            f"{date_to.strftime('%d.%m.%Y')}** — все метрики ниже "
+            "отфильтрованы по нему."
+        )
 
     c1, c2, c3 = st.columns(3)
     c1.metric(
@@ -517,14 +557,15 @@ def _render_kpi(issue: pd.DataFrame,
     k1, k2 = st.columns(2)
     k1.metric(
         "🏗 Выгружено комплектов", _fmt(doc_volume["kits"]),
-        help="Комплекты, у которых за выбранный период изменился статус "
-             "в Витро (по дате статуса листа последней ревизии).",
+        help="Комплекты, ПОЯВИВШИЕСЯ в Витро впервые за выбранный "
+             "период (первая дата статуса их листов). Повторные "
+             "изменения статуса уже загруженных комплектов "
+             "не считаются.",
     )
     k2.metric(
         "📄 Выгружено листов", _fmt(doc_volume["sheets"]),
         help="Уникальные листы РД (последняя ревизия, дедуп как в "
-             "«Плане выдачи»), чей статус в Витро изменился "
-             "за выбранный период.",
+             "«Плане выдачи»), датированные выбранным периодом.",
     )
 
 
@@ -616,12 +657,25 @@ def _load_plan(disciplines: tuple, sections: tuple,
     """План комплектов/листов из Ведомости — с учётом фильтров.
 
     Комплекты — ВСЕ шифры из plan_drawings, включая комплекты без
-    чертежей (как в «Плане выдачи»): общее число комплектов
-    совпадает с ним. План листов — число чертежей на комплект.
-    Комплекты из plan_kits, которых нет в plan_drawings,
-    добавляются с планом листов 0 (чтобы не задваивать план).
-    Если plan_drawings нет — fallback на plan_kits целиком
-    (complex / plan_kits / plan_sheets), как раньше.
+    чертежей (как в «Плане выдачи»). План листов — число чертежей
+    на комплект. Комплекты из plan_kits, которых нет в
+    plan_drawings, добавляются с планом листов 0 (чтобы не
+    задваивать план). Если plan_drawings нет — fallback на
+    plan_kits целиком (complex / plan_kits / plan_sheets), как
+    раньше.
+
+    Патч 15 — фикс расхождения 416 против 424:
+      * шифры plan_drawings / plan_kits нормализуются
+        (_norm_complex: trim, регистр, латинские двойники) — так же,
+        как шифры факта в _load_document_rows, поэтому «шифр в
+        ведомости» и «шифр в Витро» всегда совпадают;
+      * в план добавляются комплекты «Только в Витро» — есть в
+        documents, но отсутствуют в Ведомости (план листов 0).
+        «План выдачи» включает их в «Комплектов всего» (чекбокс
+        «Только в Витро» включён по умолчанию), поэтому там 424 =
+        416 (ведомость) + 8 (только в Витро), а бублик «Динамики»
+        показывал план 416. После патча цифры совпадают: план 424,
+        выполнено 296, осталось 128.
 
     Патч 14: мусорные шифры (is_valid_kit_code — та же проверка,
     что в «Плане выдачи») исключаются из плана, как и раньше
@@ -661,7 +715,8 @@ def _load_plan(disciplines: tuple, sections: tuple,
                         FROM {_PLAN_DRAWINGS_TABLE}
                         GROUP BY 1
                 """):
-                    code = str(r["code"] or "").strip()
+                    # Патч 15: нормализация — как у факта (_load_document_rows)
+                    code = _norm_kit_code(r["code"])
                     if code and is_valid_kit_code(code):
                         plan[code] = {"kits": 1,
                                       "sheets": max(0, int(r["sheets"] or 0))}
@@ -675,7 +730,8 @@ def _load_plan(disciplines: tuple, sections: tuple,
                 if code_col:
                     for r in conn.execute(
                             f'SELECT "{code_col}" AS code FROM {_PLAN_TABLE}'):
-                        code = str(r["code"] or "").strip()
+                        # Патч 15: нормализация — как у plan_drawings
+                        code = _norm_kit_code(r["code"])
                         if (code and code not in plan
                                 and is_valid_kit_code(code)):
                             plan[code] = {"kits": 1, "sheets": 0}
@@ -700,7 +756,7 @@ def _load_plan(disciplines: tuple, sections: tuple,
                              if sheets_col else "0 AS sheets")
                 for r in conn.execute(
                         f"SELECT {', '.join(parts)} FROM {_PLAN_TABLE}"):
-                    code = str(r["code"] or "").strip()
+                    code = _norm_kit_code(r["code"])  # патч 15
                     if not code or not is_valid_kit_code(code):
                         continue
                     try:
@@ -709,6 +765,20 @@ def _load_plan(disciplines: tuple, sections: tuple,
                     except (ValueError, TypeError):
                         k, s = 0, 0
                     plan[code] = {"kits": max(0, k), "sheets": max(0, s)}
+
+    # Патч 15: комплекты «Только в Витро» — есть в documents, но их
+    # нет в Ведомости. «План выдачи» включает их в «Комплектов всего»
+    # (чекбокс «Только в Витро» включён по умолчанию), поэтому без
+    # этого шага план «Динамики» был меньше его плана (416 против
+    # 424). План листов для них 0 — их листы уже учтены в факте
+    # (_load_doc_totals), задваивать нельзя. Добавляются только когда
+    # Ведомость вообще загружена: без неё остаётся честное
+    # «План не задан».
+    if plan:
+        for code in _load_unique_documents()["complex"].unique():
+            if (code and code not in plan
+                    and is_valid_kit_code(str(code))):
+                plan[code] = {"kits": 1, "sheets": 0}
 
     # Фильтры — Дисциплина → Раздел → Комплект → Расположение
     out: dict[str, dict] = {}
@@ -1397,6 +1467,29 @@ _PRESET_ALIASES = {"Всё": "Всё время"}
 
 
 def _render_period_filter() -> tuple[date, date]:
+    """Фильтр периода: пресет + календарь, ЖЁСТКО синхронизированы.
+
+    Патч 15 — фикс «KPI не реагирует на переключение периода».
+    Причина: пресет и календарь могли РАСХОДИТЬСЯ — в долгой сессии
+    (Streamlit хранит session_state, пока открыта вкладка) оставались
+    старые даты при переключённом пресете, и радио показывало
+    «Всё время», а запросы шли за 12 месяцев (на скриншоте: радио
+    «Всё время», даты 11.11.2025–11.11.2026, комплектов 256, а не 424).
+
+    Правила синхронизации:
+      1. Пресет — источник правды. Сменился пресет → даты
+         перезаписываются диапазоном пресета, флаг ручного ввода
+         сбрасывается.
+      2. Самолечение рассинхрона: если даты НЕ соответствуют пресету
+         и пользователь не вводил их вручную (флаг dyn_dates_manual
+         сброшен) — даты тихо приводятся к диапазону пресета. Лечит
+         сессии, пережившие старые версии вкладки, и смену суток
+         (пресеты «N мес.» всегда означают «последние N дней от
+         сегодняшнего»).
+      3. Ручной ввод дат (on_change на календарях) ставит флаг
+         dyn_dates_manual — после этого самолечение не трогает даты,
+         пока пользователь снова не переключит пресет.
+    """
     today = date.today()
     min_date = date(2020, 1, 1)
 
@@ -1406,6 +1499,8 @@ def _render_period_filter() -> tuple[date, date]:
         st.session_state["dyn_from_input"] = today - timedelta(days=365)
     if "dyn_to_input" not in st.session_state:
         st.session_state["dyn_to_input"] = today
+    if "dyn_dates_manual" not in st.session_state:
+        st.session_state["dyn_dates_manual"] = False
 
     st.markdown("##### 📅 Период")
 
@@ -1432,25 +1527,41 @@ def _render_period_filter() -> tuple[date, date]:
             key="dyn_preset_radio",
         )
 
-    if preset != current:
+    # Диапазон, соответствующий выбранному пресету (источник правды)
+    days = dict(_PRESETS)[preset]
+    exp_from = min_date if not days else today - timedelta(days=days)
+    exp_to = today
+
+    def _mark_manual_dates():
+        """Пользователь правит календарь вручную → самолечение выключается."""
+        st.session_state["dyn_dates_manual"] = True
+
+    # 1. Пресет сменился → даты пересчитываются из пресета
+    if preset != st.session_state.get("dyn_preset"):
         st.session_state["dyn_preset"] = preset
-        days = dict(_PRESETS)[preset]
-        if days:
-            st.session_state["dyn_from_input"] = (
-                today - timedelta(days=days)
-            )
-            st.session_state["dyn_to_input"] = today
-        else:
-            st.session_state["dyn_from_input"] = min_date
-            st.session_state["dyn_to_input"] = today
+        st.session_state["dyn_dates_manual"] = False
+        st.session_state["dyn_from_input"] = exp_from
+        st.session_state["dyn_to_input"] = exp_to
         st.rerun()
 
+    # 2. Самолечение рассинхрона (старые сессии, смена суток):
+    #    пресет тот же, но даты ему не соответствуют, и пользователь
+    #    не задавал их вручную — тихо приводим к диапазону пресета.
+    if (not st.session_state.get("dyn_dates_manual")
+            and (st.session_state.get("dyn_from_input") != exp_from
+                 or st.session_state.get("dyn_to_input") != exp_to)):
+        st.session_state["dyn_from_input"] = exp_from
+        st.session_state["dyn_to_input"] = exp_to
+        st.rerun()
+
+    # 3. Ручной ввод дат — только флаг, значения не трогаем
     with c2:
         date_from = st.date_input(
             "От",
             min_value=min_date,
             max_value=today,
             key="dyn_from_input",
+            on_change=_mark_manual_dates,
         )
     with c3:
         date_to = st.date_input(
@@ -1458,6 +1569,7 @@ def _render_period_filter() -> tuple[date, date]:
             min_value=min_date,
             max_value=today,
             key="dyn_to_input",
+            on_change=_mark_manual_dates,
         )
 
     return date_from, date_to
@@ -1508,7 +1620,8 @@ def render():
         doc_volume = _load_doc_volume(
             disc_t, sect_t, kit_t, block_codes, date_from, date_to)
 
-    _render_kpi(issue, our_answers, cust_closed, doc_volume)
+    _render_kpi(issue, our_answers, cust_closed, doc_volume,
+                date_from, date_to)
 
     remark_totals = {
         "issued": int(issue["n"].sum()) if not issue.empty else 0,
