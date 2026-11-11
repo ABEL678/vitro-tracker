@@ -13,32 +13,38 @@
     латинские двойники в шифрах).
 
 Структура вкладки (сверху вниз):
-  0. 📥 Вводные данные — импорт ведомостей Excel (свёрнут, без шаблонов).
   1. Фильтры — единый стандарт (как в «Сводке по проекту»).
   2. 📆 Период «с / по» — сразу под фильтрами; применяется к сводной
      таблице (по «Сроку готовности» комплекта) и к детальному плану
      по листам (по «Плановой дате» листа).
   3. 🎯 Бублики — сразу после фильтров и периода, ДО таблиц
      (патч 10): «Комплектов всего/план» и «Листов всего/план» по
-     всему отфильтрованному отбору (без периода). «Листов всего» =
-     max(листов по плану, УНИКАЛЬНЫХ листов в Витро) — листы
-     комплектов без ведомостей не теряются; при превышении
-     показывается «сверх плана».
+     всему отфильтрованному отбору (без периода). Патч 17: стиль
+     Сводки — слева бублик без легенды, справа список с маркерами
+     и числами; загруженные листы разбиты по статусам A/B/C/Другие.
+     «Листов всего» = max(листов по плану, УНИКАЛЬНЫХ листов в
+     Витро) — листы комплектов без ведомостей не теряются; при
+     превышении показывается «сверх плана».
   4. 📋 «Сводный план готовности комплектов и количества выданных
      листов» (патч 10 — переименована): группировка
      «Дисциплина → Раздел» строками-заголовками (как в Сводке),
-     внутри групп — комплекты; колонки: шифр, наименование, общий
-     статус, листов в Витро, листов (план), срок готовности
-     (редактируемый); внизу — строка «ИТОГО» с суммами.
+     внутри групп — комплекты; колонки: шифр, наименование,
+     дисциплина, раздел (патч 17), общий статус, листов в Витро,
+     листов (план), срок готовности (редактируемый); внизу — строка
+     «ИТОГО» с суммами.
   5. 🗓 Детальный план по листам комплекта — позиции plan_drawings:
      дисциплина, раздел, комплект, номер и ПОЛНЫЙ ШИФР листа (патч 12:
      «Шифр листа» = шифр комплекта + номер, например
      АТ-РД-СМИК-0-00-10), наименование, плановая дата, фактическая
      дата (из Витро) и статус выдачи («Выдан» — есть фактическая
      дата, «Планируется» — нет).
-  6. 📥 Выгрузка в Excel — кнопка в самом низу: лист «Листы»
+  6. 📥 Выгрузка в Excel — кнопка: лист «Листы»
      (таблица выше) + «Параметры выгрузки», с учётом фильтров
      и выбранного периода.
+  7. 📥 Вводные данные — импорт ведомостей Excel (свёрнут),
+     «⚠️ Замечания последней загрузки» и «📜 Журнал загрузок» —
+     в самом низу вкладки (патч 17), чтобы не отодвигали рабочие
+     бублики и таблицы.
 
 Импорт (с патча 12): шифры комплектов перед записью в plan_kits
 нормализуются и валидируются (_kit_code_of); чекбокс «🔄 Заменить
@@ -65,6 +71,19 @@ sheet_number — отдельные листы (пример СМИК: 44, а н
   4. ШАПКИ ТХ/ЭС/АК: см. plan_xlsx.parse_drawings_workbook.
   5. «📜 ЖУРНАЛ ЗАГРУЗОК»: последние события plan_import/plan_clear
      из таблицы log (дата, строки, сообщение) — переживает F5.
+
+Патч 17 (компоновка и бублики как в Сводке):
+  1. «📥 Вводные данные», «⚠️ Замечания последней загрузки» и
+     «📜 Журнал загрузок» перенесены в самый низ вкладки.
+  2. Бублики «Комплектов и листов»: слева бублик, справа список
+     с маркерами и числами (как в Сводке). Загруженные листы
+     разбиты по статусам A/B/C/Другие — новый загрузчик
+     _vitro_sheet_status_counts на том же дедупе
+     sheets.unique_vitro_sheets, что и «Листов в Витро»:
+     A + B + C + Другие = «Листов в Витро» по отбору.
+  3. В «Сводный план готовности» добавлены колонки «Дисциплина»
+     и «Раздел» — значения видны в каждой строке; группировка
+     «Дисциплина → Раздел» строками-заголовками сохранена.
 
 Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
 """
@@ -121,11 +140,22 @@ KIT_STATUS_COLORS = {
     "Только в Витро":          "#1f77b4",
 }
 
-# Колонки сводной таблицы (требование ревизии: без «Дисциплина»/«Раздел» —
-# они стали заголовками групп).
+# Цвета бублика «Листы» (патч 17): статусы A/B/C — как в Сводке
+# (summary.py SHEET_COLORS); «Другие» и «Осталось по плану» — служебные.
+SHEET_STATUS_COLORS = {
+    "Статус A — утверждён": "#2ca02c",
+    "Статус B — к сдаче":   "#ffdd57",
+    "Статус C — в работе":  "#ff7f0e",
+    "Другие статусы":       "#17becf",
+    "Осталось по плану":    "#9467bd",
+}
+
+# Колонки сводной таблицы. Патч 17: «Дисциплина» и «Раздел» возвращены
+# как обычные колонки (значение в каждой строке) — при этом остаются
+# и заголовками групп.
 OVERVIEW_COLUMNS = [
-    "Шифр комплекта", "Наименование комплекта", "Общий статус",
-    "Листов в Витро", "Листов (план)", "Срок готовности",
+    "Шифр комплекта", "Наименование комплекта", "Дисциплина", "Раздел",
+    "Общий статус", "Листов в Витро", "Листов (план)", "Срок готовности",
 ]
 
 # Детальный план по листам комплекта — единственная детальная таблица
@@ -180,6 +210,34 @@ def _vitro_sheet_counts() -> dict[str, int]:
     for r in unique_vitro_sheets([dict(x) for x in rows]):
         code = str(r.get("complex") or "")
         counts[code] = counts.get(code, 0) + 1
+    return counts
+
+
+@versioned_cache(600)
+def _vitro_sheet_status_counts() -> dict[str, dict[str, int]]:
+    """{шифр комплекта: {"A": n, "B": n, "C": n, "other": n}} —
+    разбивка УНИКАЛЬНЫХ листов в Витро по статусам (патч 17).
+
+    Тот же дедуп sheets.unique_vitro_sheets, что и в
+    _vitro_sheet_counts, поэтому A + B + C + other по комплектам
+    отбора сходится с колонкой «Листов в Витро». Статус
+    нормализуется .strip().upper() — как в Сводке; «other» — все
+    не-A/B/C (И, на согласовании, готовится к загрузке,
+    аннулированные, прочие).
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, complex, sheet_number, status, status_date
+            FROM documents
+            WHERE complex IS NOT NULL
+        """).fetchall()
+    counts: dict[str, dict[str, int]] = {}
+    for r in unique_vitro_sheets([dict(x) for x in rows]):
+        code = str(r.get("complex") or "")
+        status_raw = str(r.get("status") or "").strip().upper()
+        bucket = status_raw if status_raw in ("A", "B", "C") else "other"
+        per = counts.setdefault(code, {"A": 0, "B": 0, "C": 0, "other": 0})
+        per[bucket] += 1
     return counts
 
 
@@ -357,8 +415,9 @@ def _overview_to_grouped_display(df: pd.DataFrame
         …
         ИТОГО                             (суммы по всему отбору)
 
-    Колонки — только OVERVIEW_COLUMNS («Дисциплина»/«Раздел» стали
-    заголовками групп). Срок готовности — тип date (для DateColumn).
+    Колонки — OVERVIEW_COLUMNS (с патча 17 включают «Дисциплину» и
+    «Раздел»: они и заголовки групп, и значения в строках).
+    Срок готовности — тип date (для DateColumn).
 
     Возвращает (display_df, valid_codes) — valid_codes нужен
     _save_due_dates, чтобы служебные строки (📁… / ИТОГО) не попадали
@@ -388,6 +447,8 @@ def _overview_to_grouped_display(df: pd.DataFrame
             "Шифр комплекта":
                 f"{_GROUP_MARK} {disc_label} · {sect_label}",
             "Наименование комплекта": f"комплектов: {len(sub)}",
+            "Дисциплина": disc_label,
+            "Раздел": sect_label,
             "Общий статус": "",
             "Листов в Витро": int(sub["sheets_vitro"].astype(int).sum()),
             "Листов (план)": int(sub["sheets_plan"].astype(int).sum()),
@@ -400,6 +461,8 @@ def _overview_to_grouped_display(df: pd.DataFrame
             out_rows.append({
                 "Шифр комплекта": r["code"],
                 "Наименование комплекта": r["name"] or "",
+                "Дисциплина": str(r["discipline"] or ""),
+                "Раздел": str(r["section"] or ""),
                 "Общий статус": r["status"] or "",
                 "Листов в Витро": int(r["sheets_vitro"]),
                 "Листов (план)": int(r["sheets_plan"]),
@@ -409,6 +472,8 @@ def _overview_to_grouped_display(df: pd.DataFrame
     out_rows.append({
         "Шифр комплекта": _TOTAL_MARK,
         "Наименование комплекта": f"всего комплектов: {len(valid_codes)}",
+        "Дисциплина": "",
+        "Раздел": "",
         "Общий статус": "",
         "Листов в Витро": sum_vitro,
         "Листов (план)": sum_plan,
@@ -503,6 +568,8 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
             "Шифр комплекта": st.column_config.TextColumn(width="medium"),
             "Наименование комплекта": st.column_config.TextColumn(
                 width="large"),
+            "Дисциплина": st.column_config.TextColumn(width="small"),
+            "Раздел": st.column_config.TextColumn(width="small"),
             "Общий статус": st.column_config.TextColumn(width="small"),
             "Листов в Витро": st.column_config.NumberColumn(width="small"),
             "Листов (план)": st.column_config.NumberColumn(width="small"),
@@ -515,7 +582,8 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
             ),
         },
         disabled=[
-            "Шифр комплекта", "Наименование комплекта", "Общий статус",
+            "Шифр комплекта", "Наименование комплекта",
+            "Дисциплина", "Раздел", "Общий статус",
             "Листов в Витро", "Листов (план)",
         ],
         key="plan_overview_editor",
@@ -751,8 +819,14 @@ def _plan_totals(overview_filtered: pd.DataFrame) -> dict:
 #  Бублики
 # ---------------------------------------------------------------------------
 def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
-           key: str, center_total: str) -> None:
-    """Бублик в стиле Сводки: без легенды, проценты внутри."""
+           key: str, center_total: str,
+           color_map: dict | None = None) -> None:
+    """Бублик в стиле Сводки: без легенды, проценты внутри.
+
+    Патч 17: легенда убрана — подписи сегментов даёт список
+    справа от бублика; цветовая карта задаётся параметром
+    color_map (по умолчанию — статусы комплектов).
+    """
     if fig_data.empty or int(fig_data[values_col].sum()) == 0:
         st.caption("Нет данных для диаграммы.")
         return
@@ -762,7 +836,7 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
         values=values_col,
         hole=0.45,
         color=names_col,
-        color_discrete_map=KIT_STATUS_COLORS,
+        color_discrete_map=color_map or KIT_STATUS_COLORS,
     )
     fig.update_traces(
         textposition="inside",
@@ -770,11 +844,9 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
         textfont_size=11,
     )
     fig.update_layout(
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.15,
-                    xanchor="center", x=0.5, font=dict(size=11)),
+        showlegend=False,
         margin=dict(l=5, r=5, t=5, b=5),
-        height=220,
+        height=200,
         annotations=[dict(
             text=center_total,
             showarrow=False,
@@ -785,13 +857,26 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
     st.plotly_chart(fig, use_container_width=True, key=key)
 
 
+def _fmt_num(n) -> str:
+    """Число с пробелами-разделителями тысяч: 12 880."""
+    try:
+        return f"{int(n):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(n)
+
+
 def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
     """Секция 3. Бублики «Комплектов всего/план» и «Листов всего/план»
     — сразу после фильтров и периода, до таблиц (патч 10).
 
-    Числа — из _plan_totals: по всему отфильтрованному отбору
-    (без периода), включая комплекты «Только в Витро». «Листов всего»
-    = max(план, УНИКАЛЬНЫХ листов в Витро) — см. патчи 09–10.
+    Патч 17: стиль Сводки — слева бублик без легенды, справа список
+    с маркерами и числами. Загруженные листы разбиты по статусам
+    A/B/C/Другие (_vitro_sheet_status_counts — тот же дедуп
+    sheets.unique_vitro_sheets, что и у «Листов в Витро», поэтому
+    A + B + C + Другие = «Листов в Витро» по отбору). Числа — из
+    _plan_totals: по всему отфильтрованному отбору (без периода),
+    включая комплекты «Только в Витро». «Листов всего» = max(план,
+    УНИКАЛЬНЫХ листов в Витро) — см. патчи 09–10.
     """
     st.markdown("##### 🎯 Комплектов и листов: всего / план")
 
@@ -811,38 +896,102 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
     ])
     kits_data = kits_data[kits_data["Количество"] > 0]
 
-    # ---- ЛИСТЫ: «всего» = max(план ведомостей, фактически в Витро) ----
-    # Листы комплектов без ведомостей чертежей и превышения плана
-    # (повторы, извещения) не теряются: при преимуществе Витро показываем
+    st.markdown("###### Комплекты")
+    k_left, k_right = st.columns([2, 3])
+    with k_left:
+        st.caption(f"Комплектов всего: **{n_total}**")
+        _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
+               center_total=f"{n_total}")
+    with k_right:
+        st.metric(
+            "🟢 Загружено в Витро", _fmt_num(n_loaded),
+            help="Комплекты, у которых есть хотя бы один лист в Витро "
+                 "(включая «Только в Витро» — отсутствующие в "
+                 "ведомостях).",
+        )
+        st.metric(
+            "🟣 План к загрузке", _fmt_num(n_plan),
+            help="Комплекты из ведомостей, которых ещё нет в Витро.",
+        )
+        st.caption(
+            f"Арифметика: {_fmt_num(n_loaded)} + {_fmt_num(n_plan)} = "
+            f"**{_fmt_num(n_total)}**."
+        )
+
+    # ---- ЛИСТЫ: разбивка загруженных по статусам A/B/C/Другие ----
+    # «всего» = max(план ведомостей, фактически в Витро): листы
+    # комплектов без ведомостей и превышения плана (повторы,
+    # извещения) не теряются — при преимуществе Витро показываем
     # «сверх плана», при преимуществе плана — «осталось по плану».
+    n_a = n_b = n_c = n_other = 0
+    if not overview_filtered.empty:
+        status_counts = _vitro_sheet_status_counts()
+        for code in overview_filtered["code"]:
+            per = status_counts.get(code)
+            if per:
+                n_a += per["A"]
+                n_b += per["B"]
+                n_c += per["C"]
+                n_other += per["other"]
+
     sheets_total = totals["sheets_total"]
-    sheets_done = totals["sheets_done"]
+    sheets_vitro = totals["sheets_vitro"]
+    sheets_plan = totals["sheets_plan"]
     sheets_remaining = totals["sheets_remaining"]
     sheets_excess = totals["sheets_excess"]
 
     sheets_data = pd.DataFrame([
-        {"Группа": "Выдано (в Витро)", "Количество": sheets_done},
-        {"Группа": "Осталось по плану", "Количество": sheets_remaining},
+        {"Группа": "Статус A — утверждён", "Количество": n_a},
+        {"Группа": "Статус B — к сдаче",   "Количество": n_b},
+        {"Группа": "Статус C — в работе",  "Количество": n_c},
+        {"Группа": "Другие статусы",       "Количество": n_other},
+        {"Группа": "Осталось по плану",    "Количество": sheets_remaining},
     ])
     sheets_data = sheets_data[sheets_data["Количество"] > 0]
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.caption(
-            f"Комплектов всего: **{n_total}** · "
-            f"загружено **{n_loaded}** · план **{n_plan}**"
-        )
-        _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
-               center_total=f"{n_total}")
-    with col2:
+    st.markdown("###### Листы")
+    s_left, s_right = st.columns([2, 3])
+    with s_left:
         cap = (f"Листов всего: **{sheets_total}** · "
-               f"в Витро: **{totals['sheets_vitro']}** · "
-               f"в плане: **{totals['sheets_plan']}**")
+               f"в Витро: **{sheets_vitro}** · "
+               f"в плане: **{sheets_plan}**")
         if sheets_excess:
             cap += f" · сверх плана: **{sheets_excess}**"
         st.caption(cap)
         _donut(sheets_data, "Группа", "Количество", "plan_pie_sheets",
-               center_total=f"{sheets_total}")
+               center_total=f"{sheets_total}",
+               color_map=SHEET_STATUS_COLORS)
+    with s_right:
+        st.metric(
+            "🟢 Статус A — утверждён", _fmt_num(n_a),
+            help="Уникальные листы в Витро со статусом A "
+                 "(последняя ревизия, дедуп как в Сводке).",
+        )
+        st.metric(
+            "🟡 Статус B — к сдаче", _fmt_num(n_b),
+            help="Уникальные листы в Витро со статусом B.",
+        )
+        st.metric(
+            "🟠 Статус C — в работе", _fmt_num(n_c),
+            help="Уникальные листы в Витро со статусом C.",
+        )
+        st.metric(
+            "⚪ Другие статусы", _fmt_num(n_other),
+            help="Статус И, «на согласовании Заказчика», «готовится "
+                 "к загрузке», аннулированные и прочие листы в Витро.",
+        )
+        if sheets_remaining > 0:
+            st.metric(
+                "🟣 Осталось по плану", _fmt_num(sheets_remaining),
+                help="План ведомостей минус листы в Витро.",
+            )
+        elif sheets_excess > 0:
+            st.metric(
+                "➕ Сверх плана", _fmt_num(sheets_excess),
+                help="Листов в Витро больше планового количества "
+                     "(комплекты без ведомостей чертежей, повторы, "
+                     "извещения, приложения).",
+            )
 
     if sheets_excess:
         st.caption(
@@ -1542,17 +1691,6 @@ def render():
         "Данные плана общие для всех пользователей приложения."
     )
 
-    # ---- 0. Вводные данные ----
-    _render_import_block()
-
-    # ---- Патч 13: замечания последней загрузки (переживают рераны) ----
-    _render_last_warnings()
-
-    # ---- Патч 13: журнал загрузок (переживает F5, данные из БД) ----
-    _render_import_log()
-
-    st.divider()
-
     # ---- 1. Фильтры (единый стандарт) ----
     flt = _render_filters()
 
@@ -1594,5 +1732,17 @@ def render():
 
     st.divider()
 
-    # ---- 6. Выгрузка в Excel — в самом низу (патч 10) ----
+    # ---- 6. Выгрузка в Excel ----
     _render_export_button(sheets_table, period_label)
+
+    st.divider()
+
+    # ---- 7. Вводные данные + журнал загрузок — в самом низу (патч 17):
+    #         служебные блоки не отодвигают рабочие таблицы ----
+    _render_import_block()
+
+    # ---- Патч 13: замечания последней загрузки (переживают рераны) ----
+    _render_last_warnings()
+
+    # ---- Патч 13: журнал загрузок (переживает F5, данные из БД) ----
+    _render_import_log()
