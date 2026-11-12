@@ -953,17 +953,22 @@ def _render_remark_donuts(remark_totals: dict | None,
 
     our_total = int((remark_totals or {}).get("our_answers") or 0)
     cust_total = int((remark_totals or {}).get("cust_closed") or 0)
-    remaining = max(0, issued_total - our_total - cust_total)
+    remaining = max(0, issued_total - cust_total - our_total)
 
     with left:
         st.caption(
             f"Выдано за период: **{_fmt(issued_total)}** · "
-            f"Выполнено за период: **{_fmt(our_total)}**"
+            f"Закрыто заказчиком: **{_fmt(cust_total)}** · "
+            f"Выполнено (ждёт закрытия): **{_fmt(our_total)}**"
         )
         if issued_total > 0:
             donut = pd.DataFrame([
-                {"Категория": "Выполнено за период", "Значение": our_total},
-                {"Категория": "Осталось",            "Значение": remaining},
+                {"Категория": "Закрыто заказчиком",
+                 "Значение": cust_total},
+                {"Категория": "Выполнено (ждёт закрытия)",
+                 "Значение": our_total},
+                {"Категория": "Осталось (в работе)",
+                 "Значение": remaining},
             ])
             donut = donut[donut["Значение"] > 0]
             fig = px.pie(
@@ -973,8 +978,9 @@ def _render_remark_donuts(remark_totals: dict | None,
                 hole=0.45,
                 color="Категория",
                 color_discrete_map={
-                    "Выполнено за период": "#2ca02c",
-                    "Осталось":            "#9E9E9E",
+                    "Закрыто заказчиком": "#9E9E9E",
+                    "Выполнено (ждёт закрытия)": "#2ca02c",
+                    "Осталось (в работе)": "#FFA726",
                 },
             )
             fig.update_traces(
