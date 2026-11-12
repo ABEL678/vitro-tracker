@@ -77,20 +77,22 @@ _QTY_KEYS = ("кол-во", "количество", "кол во")
 _PLANNED_DATE_KEYS = ("плановая дата", "дата выдачи", "дата")
 
 # Шифр комплекта — строка вида АТ-РД-АР12.1-1-00. Строгая регулярка
-# (патч 10; семантика точек уточнена в патче 12):
+# (патч 10; семантика точек уточнена в патчах 12 и 18):
 #   блок 1: организация (2-4 буквы) — «АТ»;
 #   блок 2: документ (1-3 буквы) — «РД»;
-#   блок 3: марка/дисциплина с номером — «АР1», «АР12.1», «КЖ2.1», «ОВ10».
+#   блок 3: марка/дисциплина с номером — «АР1», «АР12.1», «КЖ2.1», «ОВ10»,
+#           «ЛВС.АИС».
 #           ТОЧКИ В МАРКЕ ДОПУСТИМЫ (реальные комплекты «АР12.1»,
-#           «КЖ2.1» — патч 12 вернул их после ошибочного запрета);
-#           ЗАПЯТЫЕ ЗАПРЕЩЕНЫ («КЖ1,2» — мусор);
-#   блоки 4-5 (1-2 шт.): блок и индекс — «С-00», «1-08Т», «С-П1»
-#           (1-3 буквоцифры БЕЗ ТОЧЕК — точки бывают только в марке
-#            и в номерах листов: «10.01», «П.01»).
+#           «КЖ2.1», «ЛВС.АИС»);
+#           ЗАПЯТЫЕ ЗАПРЕЩЕНЫ («КЖ1,2» — объединение двух комплектов
+#           в одной строке);
+#   блоки 4-5 (1-2 шт.): блок и индекс — «С-00», «1-08Т», «С-П1»,
+#           «1-02.1» (1-4 буквоцифры, ТОЧКИ в индексе допустимы —
+#           патч 18: реальные комплекты «АТ-РД-КМ2-1-02.1»).
 # Поэтому мусор вида «АТ-РД-КЖ1,2-С-П2.3.ВР» отбрасывается дважды:
-# запятая в марке И точки в хвосте (П2.3.ВР). Полные шифры ЛИСТОВ
-# (АТ-РД-ОВ1-С-00-10.01 — 6 блоков, хвост с точкой) НЕ совпадают,
-# как и строки-разделы («Подземная часть»), итоги («Всего», «ИТОГО»),
+# запятая в марке И слишком длинный хвост (П2.3.ВР). Полные шифры
+# ЛИСТОВ (АТ-РД-ОВ1-С-00-10.01 — 6 блоков) НЕ совпадают, как и
+# строки-разделы («Подземная часть»), итоги («Всего», «ИТОГО»),
 # приложения («СО», «ВР», «П.01») и даты.
 # СТАРЫЙ мусор в plan_kits (загрузки до патча 10) удаляется не
 # регуляркой, а чекбоксом «Заменить план» (патч 12).
@@ -99,6 +101,9 @@ _PLANNED_DATE_KEYS = ("плановая дата", "дата выдачи", "д�
 # в vitro/sheets.py — единственную точку правды о листах и шифрах.
 # Отсюда они реэкспортируются: план.py и старый код продолжают
 # импортировать is_valid_kit_code из plan_xlsx без изменений.
+# ПАТЧ 18: расширение семантики (точки в блоках хвоста, длина блока
+# до 4 символов) сделано ТОЛЬКО в sheets.py — парсеры Excel и листы
+# из Витро валидируются одной и той же функцией.
 from vitro.sheets import _KIT_CODE_PATTERN, is_valid_kit_code
 
 # Латинские двойники кириллических букв (появляются при копировании
@@ -125,6 +130,24 @@ def _kit_code_of(value) -> str:
     """
     code = _norm_complex_code(value)
     return code if is_valid_kit_code(code) else ""
+
+
+def _kit_drop_reason(raw) -> str:
+    """Причина отброса строки ведомости (патч 18) — для предупреждений
+    «Замечаний последней загрузки». Возвращает ключ причины:
+      'comma'      — в значении есть запятая: объединение двух
+                     комплектов в одной строке;
+      'sheet_code' — 6 и более блоков: полный шифр листа
+                     («АТ-РД-АР1-С-00-1.1»), а не шифр комплекта;
+      'other'      — служебная строка (раздел, итог, приложение),
+                     дата или просто не шифр комплекта.
+    """
+    s = _norm_complex_code(raw)
+    if "," in s:
+        return "comma"
+    if len([b for b in s.split("-") if b]) >= 6:
+        return "sheet_code"
+    return "other"
 
 
 def _kit_from_row_cells(row, skip_cols: set = frozenset()
@@ -431,6 +454,11 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
     листов, приложения и даты отбрасываются со счётчиком в
     предупреждении (патч 10: фантомные комплекты 632 вместо ~479).
 
+    Патч 18: по каждому листу в предупреждения пишется сводка —
+    сколько всего строк, сколько успешно распознано, сколько
+    отброшено и ПОЧЕМУ (запятая/полный шифр листа/служебная строка);
+    служебные листы «Легенда» пропускаются молча.
+
     Возвращает (rows, warnings):
       rows — [{'code','name','discipline','section','plan_status',
                'due_date','due_comment'}]
@@ -438,7 +466,6 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
     """
     warnings: list[str] = []
     rows: list[dict] = []
-    skipped_total = 0   # суммарно отброшено строк с мусорным шифром
 
     try:
         wb = openpyxl.load_workbook(
@@ -456,6 +483,8 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
         ws = wb[sheet_name]
         if ws.sheet_state != "visible":
             continue
+        if "легенда" in sheet_name.strip().lower():
+            continue  # служебный лист «Легенда» — молча (патч 18)
 
         found = _find_header_row(
             ws,
@@ -474,7 +503,10 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
         header_idx, cols = found
         sheet_rows = 0
         skipped = 0            # строки с мусором в колонке шифра (патч 10)
+        skipped_empty = 0      # строки с пустой ячейкой шифра
+        total_rows = 0         # все строки данных листа (патч 18)
         skipped_examples: list[str] = []
+        reasons: dict[str, int] = {}
         for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
             if row is None or all(
                     v is None or str(v).strip() == "" for v in row):
@@ -483,16 +515,21 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
                 continue
             raw_code = row[cols["code"]] \
                 if len(row) > cols["code"] else None
+            total_rows += 1
             code = _kit_code_of(raw_code)
             if not code:
-                # Пустая ячейка — пропуск молча; НЕПУСТОЙ мусор
-                # (раздел, «Всего», шифр листа…) — со счётчиком и
-                # примерами в предупреждении (патч 10).
+                # Пустая ячейка — пропуск молча (только счётчик);
+                # НЕПУСТОЙ мусор (раздел, «Всего», шифр листа…) —
+                # со счётчиком, причиной и примерами (патчи 10, 18).
                 if raw_code is not None and str(raw_code).strip():
                     skipped += 1
+                    reason = _kit_drop_reason(raw_code)
+                    reasons[reason] = reasons.get(reason, 0) + 1
                     if len(skipped_examples) < 3:
                         skipped_examples.append(
                             " ".join(str(raw_code).split())[:40])
+                else:
+                    skipped_empty += 1
                 continue
             name = _clean_str(row[cols["name"]]) \
                 if cols.get("name") is not None and \
@@ -518,22 +555,40 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
             warnings.append(
                 f"{filename} · лист «{sheet_name}»: заголовок найден, "
                 f"но строк данных нет.")
+        # Патч 18: сводка по листу — сколько всего строк, сколько
+        # успешно распознано, сколько отброшено и по какой причине.
+        if total_rows:
+            reason_bits = []
+            if reasons.get("comma"):
+                reason_bits.append(
+                    "объединение нескольких комплектов в одной строке "
+                    f"(запятая) — {reasons['comma']}")
+            if reasons.get("sheet_code"):
+                reason_bits.append(
+                    "полный шифр листа, а не шифр комплекта — "
+                    f"{reasons['sheet_code']}")
+            if reasons.get("other"):
+                reason_bits.append(
+                    "служебная строка (раздел/итог/приложение) или "
+                    f"не шифр комплекта — {reasons['other']}")
+            if skipped_empty:
+                reason_bits.append(
+                    f"пустая ячейка шифра — {skipped_empty}")
+            dropped = skipped + skipped_empty
+            warn = (f"{filename} · лист «{sheet_name}»: всего строк — "
+                    f"{total_rows}, распознано комплектов — {sheet_rows}, "
+                    f"отброшено — {dropped}")
+            if reason_bits:
+                warn += " (" + "; ".join(reason_bits) + ")"
+            warnings.append(warn + ".")
         if skipped:
             examples = "; ".join(f"«{e}»" for e in skipped_examples)
             more = " …" if skipped > len(skipped_examples) else ""
             warnings.append(
-                f"{filename} · лист «{sheet_name}»: отброшено "
-                f"{skipped} строк(и) — значение в колонке шифра не "
-                f"похоже на шифр комплекта (разделы, итоги, шифры "
-                f"листов, приложения): {examples}{more}")
-        skipped_total += skipped
+                f"{filename} · лист «{sheet_name}»: примеры отброшенных "
+                f"шифров: {examples}{more}")
     wb.close()
 
-    if skipped_total:
-        warnings.insert(0,
-            f"{filename}: всего отброшено {skipped_total} строк(и), "
-            f"не похожих на шифры комплектов — это нормально: в план "
-            f"попали только реальные комплекты.")
     if not rows and not warnings:
         warnings.append(f"{filename}: не найдено ни одной строки комплектов.")
     return rows, warnings
@@ -552,6 +607,11 @@ def parse_drawings_workbook(
       - номер листа:     «Номер листа», «Номер» (может отсутствовать);
       - наименование:    «Название листа», «Наименование чертежа»;
       - полный шифр:     «Шифр листа», «Полный шифр листа», «Шифр чертежа».
+
+    Патч 18: по каждому листу в предупреждения пишется сводка —
+    сколько всего строк, сколько распознано листов, сколько шапок
+    комплектов, сколько пропущено и почему; служебные листы
+    «Легенда» пропускаются молча.
 
     Структура строк реальных регистров:
       - строка-раздел («Подземная часть», «Прилагаемые документы») — пропуск;
@@ -607,6 +667,8 @@ def parse_drawings_workbook(
         ws = wb[sheet_name]
         if ws.sheet_state != "visible":
             continue
+        if "легенда" in sheet_name.strip().lower():
+            continue  # служебный лист «Легенда» — молча (патч 18)
 
         found = _find_header_row(
             ws,
@@ -638,6 +700,9 @@ def parse_drawings_workbook(
         sheet_rows = 0
         no_kit = 0
         empty_run = 0  # подряд идущие пустые строки
+        total_rows = 0        # все строки данных листа (патч 18)
+        headers_count = 0     # шапки комплектов (патч 18)
+        skipped_service = 0   # служебные строки/разделы (патч 18)
 
         for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
             if row is None or all(
@@ -650,6 +715,7 @@ def parse_drawings_workbook(
                     break
                 continue
             empty_run = 0
+            total_rows += 1
 
             # ---- колонка шифра комплекта: контекст ----
             # Переводы строк внутри ячейки («АТ-РД-ОВ1-С-00\nСистема…»)
@@ -666,6 +732,7 @@ def parse_drawings_workbook(
                     current_kit_name = " ".join(name_part.split())
                     if not kits.get(current_kit):
                         kits[current_kit] = current_kit_name
+                    headers_count += 1
                     continue  # это не чертёж
                 # шифр без названия — смена комплекта внутри листа,
                 # строка ниже всё ещё может быть чертежом
@@ -690,6 +757,7 @@ def parse_drawings_workbook(
                         kits.setdefault(current_kit, "")
                     if not _looks_like_drawing_row(
                             row, cols, c_full, c_no, f_col):
+                        headers_count += 1
                         continue  # это шапка комплекта, не чертёж
             # иначе в колонке шифра метка («Приложение 1», «Подземная
             # часть», «Прилагаемые документы») — комплект НЕ сменяем.
@@ -704,9 +772,11 @@ def parse_drawings_workbook(
             if not sheet_no and c_no is not None:
                 sheet_no = _fmt_sheet_no(_cell(row, c_no))
             if not title and not sheet_no:
-                continue  # служебная строка (раздел/метка) без данных
+                skipped_service += 1  # служебная строка (раздел/метка) без данных
+                continue
             if _looks_like_section_header(title) and not sheet_no:
-                continue  # «Подземная часть» в колонке названия
+                skipped_service += 1  # «Подземная часть» в колонке названия
+                continue
 
             kit = current_kit or default_kit
             if not kit:
@@ -741,6 +811,22 @@ def parse_drawings_workbook(
             rows.append(row_data)
             sheet_rows += 1
 
+        # Патч 18: сводка по листу — сколько всего строк, сколько
+        # распознано листов, сколько шапок, сколько пропущено и почему.
+        if total_rows:
+            bits = []
+            if headers_count:
+                bits.append(f"шапок комплектов — {headers_count}")
+            if no_kit:
+                bits.append(f"без шифра комплекта — {no_kit}")
+            if skipped_service:
+                bits.append(
+                    f"служебные строки/разделы — {skipped_service}")
+            warn = (f"{filename} · лист «{sheet_name}»: всего строк — "
+                    f"{total_rows}, распознано листов — {sheet_rows}")
+            if bits:
+                warn += " (" + "; ".join(bits) + ")"
+            warnings.append(warn + ".")
         if no_kit:
             warnings.append(
                 f"{filename} · лист «{sheet_name}»: {no_kit} строк пропущено — "

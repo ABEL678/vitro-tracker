@@ -11,6 +11,10 @@
   4. Замечания на стороне Заказчика — 6 плиток.
   5. Категории замечаний, оценка АТП ТЛП — 6 плиток.
   + Разрез по дисциплинам / разделам / комплектам.
+    Патч 18 (Блок 6): в таблицу разреза добавлены колонки
+    «Ревизия комплекта» (revision из documents, только на уровне
+    «По комплектам») и «Количество листов» (docs_total — уникальные
+    листы, в разрезах — сумма групп).
 
 Источник: `_load_all_categorized` (deadlines.py).
 Фильтры: дисциплина → раздел → расположение → комплект.
@@ -852,6 +856,17 @@ def _build_summary_rows(group_col: str,
 
     # --- Листы (docs_df уже дедуплицирован в _load_documents, патч 11:
     #     одна строка = один уникальный лист, статусы последней ревизии) ---
+    # Патч 18 (Блок 6): «Ревизия комплекта» — поле revision из documents
+    # (VitroBaseDocumentRevision); осмысленна только для уровня
+    # «По комплектам» (группа = один комплект) — берётся максимальная
+    # ревизия листов комплекта (численно: «2.0» > «10.0» как числа).
+    # Для разрезов по дисциплинам/разделам колонка не заполняется.
+    def _rev_key(v: str) -> float:
+        try:
+            return float(str(v).strip())
+        except (TypeError, ValueError):
+            return -1.0
+
     if not docs_df.empty:
         doc_rows = []
         for grp, sub in docs_df.groupby(group_col, dropna=True):
@@ -866,9 +881,16 @@ def _build_summary_rows(group_col: str,
             annulled = int((statuses == "АННУЛИРОВАНО").sum())
             pct_ab = (round((a + b) / total * 100, 1)
                       if total > 0 else 0.0)
+            kit_revision = ""
+            if group_col == "complex" and "revision" in sub.columns:
+                rev_vals = [str(v).strip() for v in sub["revision"].tolist()
+                            if v is not None and str(v).strip()]
+                if rev_vals:
+                    kit_revision = max(rev_vals, key=_rev_key)
             doc_rows.append({
                 group_col: grp,
                 "docs_total": total,
+                "kit_revision": kit_revision,
                 "doc_a": a,
                 "doc_b": b,
                 "doc_c": c,
@@ -962,6 +984,11 @@ def _build_summary_rows(group_col: str,
             if group_col in frame.columns:
                 frame[group_col] = frame[group_col].fillna("").astype(str)
         result = docs_grp.merge(active_grp, on=group_col, how="outer")
+    # Патч 18: kit_revision — текстовая колонка; пустые значения
+    # заполняем строкой ДО общего fillna(0), иначе группы без листов
+    # (outer merge) получили бы 0 в текстовой колонке.
+    if "kit_revision" in result.columns:
+        result["kit_revision"] = result["kit_revision"].fillna("")
     result = result.fillna(0)
 
     group_col_names = {
@@ -1069,6 +1096,8 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
         column_width_map = {
             group_label: 20,
             "Полное наименование": 50,
+            "Ревизия комплекта": 16,
+            "Количество листов": 14,
             "Открытых замечаний": 14,
             "Всего у АТП ТЛП": 14,
             "Всего у Заказчика": 18,
@@ -1181,9 +1210,24 @@ def _render_summary_table(df: pd.DataFrame,
 
     # --- Приводим числовые колонки к int ---
     for c in ["active_total", "n_new", "n_in_work", "n_rejected",
-              "n_discussion", "n_customer", "n_customer_a", "n_annulled"]:
+              "n_discussion", "n_customer", "n_customer_a", "n_annulled",
+              "docs_total"]:
         if c in view.columns:
             view[c] = view[c].fillna(0).astype(int)
+
+    # --- Патч 18 (Блок 6): «Ревизия комплекта» и «Количество листов» ---
+    # «Количество листов» — docs_total: число УНИКАЛЬНЫХ листов
+    # (тот же дедуп, что в секции «Листы РД»); в разрезах — сумма
+    # листов групп. «Ревизия комплекта» — revision из documents,
+    # заполняется только на уровне «По комплектам».
+    if "docs_total" in view.columns:
+        view = view.rename(columns={"docs_total": "Количество листов"})
+    if "kit_revision" in view.columns:
+        view = view.rename(columns={"kit_revision": "Ревизия комплекта"})
+        if level != "complex":
+            # Ревизия осмысленна только для комплекта — в разрезах
+            # по дисциплинам/разделам колонку не показываем.
+            view = view.drop(columns=["Ревизия комплекта"])
 
     # --- Формируем финальные колонки ---
     view = view.rename(columns={
@@ -1221,6 +1265,8 @@ def _render_summary_table(df: pd.DataFrame,
     cols_order = [
         group_label,
         "Полное наименование",
+        "Ревизия комплекта",
+        "Количество листов",
         "Открытых замечаний",
         "Всего у АТП ТЛП",
         "🔵 Новое",
@@ -1242,9 +1288,13 @@ def _render_summary_table(df: pd.DataFrame,
     totals_row = {group_label: "ИТОГО"}
     totals_row["Полное наименование"] = ""
     totals_row["Пояснения"] = ""
+    if "Ревизия комплекта" in view.columns:
+        # Ревизия — не число: в ИТОГО не суммируется (патч 18).
+        totals_row["Ревизия комплекта"] = ""
 
     for c in view.columns:
-        if c in (group_label, "Полное наименование", "Пояснения"):
+        if c in (group_label, "Полное наименование", "Пояснения",
+                 "Ревизия комплекта"):
             continue
         totals_row[c] = int(view[c].fillna(0).sum())
 

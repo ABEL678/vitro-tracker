@@ -21,9 +21,13 @@
      комплекты / уникальные листы за выбранный период + листы
      со статусами B и A за период.
   3. «Выполнение плана» — бублики против Ведомости комплектов
-     (plan_drawings / plan_kits): комплекты, листы + два бублика
-     по замечаниям за период («Выполнено / Осталось» и
-     «Закрыто заказчиком / Осталось», процент — в центре).
+     (plan_drawings / plan_kits): комплекты, листы + блок
+     «Замечания за период» в стиле Сводки (патч 18): бублик
+     «Объём замечаний» — числитель «Выдано за период», сегменты
+     Выдано / Отработано; справа список с маркерами — Выполнено и
+     Закрыто заказчиком за период, «Отработано всего» = Закрыто +
+     Аннулировано + Без статуса по всем замечаниям с фильтрами
+     без ограничения периодом (_load_remark_scope).
      «Выполнено» — уникальные листы и комплекты в Витро по
      sheets.unique_vitro_sheets — ЕДИНОМУ стандарту «Плана
      выдачи», поэтому цифры совпадают (11 312 / 424).
@@ -501,11 +505,11 @@ def _render_kpi(issue: pd.DataFrame,
 
     c1, c2, c3 = st.columns(3)
     c1.metric(
-        "Выдано замечаний", _fmt(total_issue),
+        "📤 Выдано замечаний", _fmt(total_issue),
         help="Сколько замечаний поступило от заказчика за выбранный период.",
     )
     c2.metric(
-        "Выполнено", _fmt(total_our),
+        "🟢 Выполнено", _fmt(total_our),
         help="Замечания, которые АТП ТЛП выполнил и направил "
              "заказчику на согласование (статус «Выполнено»). "
              "Заказчик их ещё не закрыл.\n\n"
@@ -513,7 +517,7 @@ def _render_kpi(issue: pd.DataFrame,
              "замечания.",
     )
     c3.metric(
-        "Закрыто заказчиком", _fmt(total_cust),
+        "⚪ Закрыто заказчиком", _fmt(total_cust),
         help="Сколько замечаний заказчик формально закрыл за период.",
     )
 
@@ -872,91 +876,159 @@ def _build_donut_figure(done: int, plan_total: int,
     return fig, pct, status_text, is_over
 
 
-def _render_remark_donuts(remark_totals: dict | None):
-    """Бублики по замечаниям за период (патч 14).
+@versioned_cache(ttl=3600)
+def _load_remark_scope(disciplines: tuple, sections: tuple,
+                       kits: tuple, block_codes: tuple,
+                       marka: str = "") -> dict:
+    """«Отработано» по всем замечаниям с учётом фильтров (патч 18).
 
-    «Выполнено / Осталось» и «Закрыто заказчиком / Осталось» —
-    от общего числа выданных за период замечаний, процент в центре.
-    Не зависят от Ведомости — рисуются даже если план не задан.
+    Формула (согласована с координатором, В1): Отработано =
+    Замечания со статусом «Закрыто» + «Аннулировано» + Без статуса —
+    по ВСЕМ замечаниям с учётом фильтров вкладки, БЕЗ ограничения
+    выбранным периодом. Числители «Выдано / Выполнено / Закрыто
+    заказчиком» считаются отдельно (_load_issue_stats /
+    _load_our_answers_stats / _load_customer_closed_stats) и строго
+    за выбранный период.
+
+    Фильтры — те же, что во всех запросах вкладки
+    (_build_filter_sql без дат, включая марку комплекта).
+    """
+    where, params = _build_filter_sql(
+        disciplines, sections, kits, block_codes,
+        None, None, "c.created", marka=marka)
+    q = f"""
+        SELECT
+            COALESCE(SUM(CASE WHEN c.status = 'Закрыто'
+                              THEN 1 ELSE 0 END), 0) AS closed,
+            COALESCE(SUM(CASE WHEN c.status = 'Аннулировано'
+                              THEN 1 ELSE 0 END), 0) AS annulled,
+            COALESCE(SUM(CASE WHEN c.status IS NULL OR c.status = ''
+                              THEN 1 ELSE 0 END), 0) AS no_status
+        FROM comments c
+        JOIN documents d ON c.doc_id = d.id
+        WHERE 1=1 {where}
+    """
+    with get_conn() as conn:
+        row = conn.execute(q, tuple(params)).fetchone()
+    closed = int(row["closed"] or 0)
+    annulled = int(row["annulled"] or 0)
+    no_status = int(row["no_status"] or 0)
+    return {"closed": closed, "annulled": annulled,
+            "no_status": no_status,
+            "worked": closed + annulled + no_status}
+
+
+def _render_remark_donuts(remark_totals: dict | None,
+                          remark_scope: dict | None = None):
+    """Блок «Замечания за период: выполнение и закрытие» — стиль
+    Сводки (патч 18).
+
+    Слева бублик «Объём замечаний» (В2): числитель — «Выдано за
+    период», сегменты = Выдано за период / Отработано. «Отработано»
+    (В1) — Закрыто + Аннулировано + Без статуса по всем замечаниям
+    с учётом фильтров, без ограничения периодом (_load_remark_scope).
+    Справа — список с маркерами, как в Сводке: «Выполнено» и
+    «Закрыто заказчиком» — строго за выбранный период, «Отработано
+    всего» — за всё время по фильтрам; под списком — строка
+    арифметики «Отработано».
 
     Патч 17: цвета как в Сводке — «Выполнено» зелёный #2ca02c,
     «Закрыто заказчиком» серый #9E9E9E.
     """
     issued_total = int((remark_totals or {}).get("issued") or 0)
-    if issued_total <= 0:
+    worked = int((remark_scope or {}).get("worked") or 0)
+    if issued_total <= 0 and worked <= 0:
         return
 
     st.markdown("#### Замечания за период: выполнение и закрытие")
     st.caption(
-        f"От общего числа замечаний, выданных за выбранный период "
-        f"({_fmt(issued_total)}). «Осталось» — не выполнено и не "
-        f"закрыто. Выполненные и закрытые замечания, выданные до "
-        f"периода, дают долю выше 100% (сегмент «Сверх периода»)."
+        "Бублик: «Выдано за период» — замечания заказчика, созданные "
+        "за выбранный период (с учётом фильтров); «Отработано» — "
+        "закрытые, аннулированные и без статуса по всем замечаниям "
+        "с учётом фильтров (без ограничения периодом). «Выполнено» "
+        "и «Закрыто заказчиком» — строго за выбранный период."
     )
 
-    our_total = int((remark_totals or {}).get("our_answers") or 0)
-    cust_total = int((remark_totals or {}).get("cust_closed") or 0)
+    left, right = st.columns([2, 3])
 
-    r1, r2 = st.columns(2)
-
-    with r1:
-        fig, pct, status_text, is_over = _build_donut_figure(
-            our_total, issued_total,
-            done_label="Выполнено",
-            over_label="Сверх периода",
-            done_color="#2ca02c",
+    with left:
+        st.caption(
+            f"Выдано за период: **{_fmt(issued_total)}** · "
+            f"Отработано всего: **{_fmt(worked)}**"
         )
-        st.plotly_chart(fig, use_container_width=True,
-                        key="dyn_donut_our")
-        if is_over:
-            st.markdown(
-                f"<div style='text-align:center'>Выполнено "
-                f"<b>{_fmt(our_total)}</b> из "
-                f"<b>{_fmt(issued_total)}</b> выданных — "
-                f"<b style='color:#FFA726'>+{_fmt(status_text)} "
-                f"сверх периода</b></div>",
-                unsafe_allow_html=True,
+        if issued_total > 0:
+            donut = pd.DataFrame([
+                {"Категория": "Выдано за период", "Значение": issued_total},
+                {"Категория": "Отработано",       "Значение": worked},
+            ])
+            donut = donut[donut["Значение"] > 0]
+            fig = px.pie(
+                donut,
+                names="Категория",
+                values="Значение",
+                hole=0.45,
+                color="Категория",
+                color_discrete_map={
+                    "Выдано за период": "#1f77b4",
+                    "Отработано":       "#9E9E9E",
+                },
             )
+            fig.update_traces(
+                textposition="inside",
+                textinfo="percent",
+                textfont_size=11,
+            )
+            fig.update_layout(
+                showlegend=False,
+                margin=dict(l=5, r=5, t=5, b=5),
+                height=200,
+            )
+            st.plotly_chart(fig, use_container_width=True,
+                            key="dyn_donut_remarks")
         else:
-            st.markdown(
-                f"<div style='text-align:center'>Выполнено "
-                f"<b>{_fmt(our_total)}</b> из "
-                f"<b>{_fmt(issued_total)}</b> выданных — "
-                f"осталось <b>{_fmt(status_text)}</b></div>",
-                unsafe_allow_html=True,
-            )
+            st.caption("За выбранный период замечания не выдавались.")
 
-    with r2:
-        fig, pct, status_text, is_over = _build_donut_figure(
-            cust_total, issued_total,
-            done_label="Закрыто заказчиком",
-            over_label="Сверх периода",
-            done_color="#9E9E9E",
+    with right:
+        st.metric(
+            "📤 Выдано за период", _fmt(issued_total),
+            help="Замечания заказчика, созданные за выбранный период "
+                 "(с учётом фильтров).",
         )
-        st.plotly_chart(fig, use_container_width=True,
-                        key="dyn_donut_cust")
-        if is_over:
-            st.markdown(
-                f"<div style='text-align:center'>Закрыто заказчиком "
-                f"<b>{_fmt(cust_total)}</b> из "
-                f"<b>{_fmt(issued_total)}</b> выданных — "
-                f"<b style='color:#FFA726'>+{_fmt(status_text)} "
-                f"сверх периода</b></div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"<div style='text-align:center'>Закрыто заказчиком "
-                f"<b>{_fmt(cust_total)}</b> из "
-                f"<b>{_fmt(issued_total)}</b> выданных — "
-                f"осталось <b>{_fmt(status_text)}</b></div>",
-                unsafe_allow_html=True,
+        st.metric(
+            "🟢 Выполнено за период",
+            _fmt(int((remark_totals or {}).get("our_answers") or 0)),
+            help="Замечания, которые АТП ТЛП выполнил и направил "
+                 "заказчику на согласование (статус «Выполнено») "
+                 "за выбранный период. Замечания к листам A и "
+                 "аннулированным не считаются.",
+        )
+        st.metric(
+            "⚪ Закрыто заказчиком за период",
+            _fmt(int((remark_totals or {}).get("cust_closed") or 0)),
+            help="Замечания, формально закрытые заказчиком "
+                 "за выбранный период.",
+        )
+        st.metric(
+            "⚫ Отработано всего", _fmt(worked),
+            help="Закрыто + Аннулировано + Без статуса по всем "
+                 "замечаниям с учётом фильтров — без ограничения "
+                 "выбранным периодом.",
+        )
+        if worked > 0:
+            closed = int((remark_scope or {}).get("closed") or 0)
+            annulled = int((remark_scope or {}).get("annulled") or 0)
+            no_status = int((remark_scope or {}).get("no_status") or 0)
+            st.caption(
+                f"Арифметика: Отработано {_fmt(worked)} = "
+                f"Закрыто {_fmt(closed)} + Аннулировано "
+                f"{_fmt(annulled)} + Без статуса {_fmt(no_status)}."
             )
 
 
 def _render_progress_donuts(disciplines: tuple, sections: tuple,
                             kits: tuple, block_codes: tuple,
-                            remark_totals: dict | None = None):
+                            remark_totals: dict | None = None,
+                            remark_scope: dict | None = None):
     """Бублики сравнения с планом: комплекты, листы и замечания.
 
     «Выполнено» — уникальные листы/комплекты в Витро
@@ -979,7 +1051,7 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
             "не найдены или пусты. Загрузите Ведомость комплектов — "
             "и бублики появятся."
         )
-        _render_remark_donuts(remark_totals)
+        _render_remark_donuts(remark_totals, remark_scope)
         return
 
     plan_kits_total = sum(v["kits"] for v in plan.values())
@@ -990,7 +1062,7 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
             "В Ведомости нет плановых значений для выбранной "
             "комбинации фильтров."
         )
-        _render_remark_donuts(remark_totals)
+        _render_remark_donuts(remark_totals, remark_scope)
         return
 
     totals = _load_doc_totals(disciplines, sections, kits, block_codes)
@@ -1041,8 +1113,8 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
                 unsafe_allow_html=True,
             )
 
-    # ---- Бублики по замечаниям за период (патч 14) ----
-    _render_remark_donuts(remark_totals)
+    # ---- Бублики по замечаниям за период (патчи 14, 18) ----
+    _render_remark_donuts(remark_totals, remark_scope)
 
 
 # ---------------------------------------------------------------------------
@@ -1280,6 +1352,8 @@ def render():
             marka=marka_t)
         doc_volume = _load_doc_volume(
             disc_t, sect_t, kit_t, block_codes, date_from, date_to)
+        remark_scope = _load_remark_scope(
+            disc_t, sect_t, kit_t, block_codes, marka=marka_t)
 
     _render_kpi(issue, our_answers, cust_closed, doc_volume,
                 date_from, date_to)
@@ -1292,7 +1366,8 @@ def render():
                         if not cust_closed.empty else 0),
     }
     _render_progress_donuts(disc_t, sect_t, kit_t, block_codes,
-                            remark_totals=remark_totals)
+                            remark_totals=remark_totals,
+                            remark_scope=remark_scope)
 
     st.divider()
 
