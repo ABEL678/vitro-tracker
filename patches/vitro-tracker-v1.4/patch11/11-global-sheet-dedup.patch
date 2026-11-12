@@ -1,0 +1,742 @@
+--- a/vitro/sheets.py
++++ b/vitro/sheets.py
+@@ -0,0 +1,137 @@
++# vitro/sheets.py
++"""
++Единый стандарт подсчёта листов РД во всём приложении (PATCH-11).
++
++Проблема: таблица documents содержит по одной строке на каждый ФАЙЛ,
++выгруженный из Витро. Повторные выгрузки и ревизии одного и того же
++листа дают несколько строк, поэтому вкладки считали «файлы», а не
++«листы»: «Сводка по проекту» показывала 52 листа там, где «План выдачи»
++(уже после патча 10) — 44 уникальных листа.
++
++ЕДИНЫЙ СТАНДАРТ (с патча 11): один уникальный лист = одна строка.
++
++  1. Ключ уникальности: (complex, sheet_number), если sheet_number
++     заполнен (тот же ключ, что в «Плане выдачи» с патча 10).
++  2. Строки с ПУСТЫМ sheet_number — самостоятельные листы (fallback
++     по id): один файл = один лист, комплект не может «исчезнуть».
++  3. Из нескольких ревизий листа остаётся ПОСЛЕДНЯЯ: MAX(status_date),
++     при равенстве дат — MAX(id) (последняя выгрузка при синке).
++  4. Замечания (comments) НЕ дедуплицируются: каждое замечание —
++     отдельная сущность со своим ID. Дедупликация применяется только
++     к подсчёту ЛИСТОВ; замечание, привязанное к старой ревизии,
++     продолжает учитываться.
++
++Инструменты модуля:
++  * sheet_key(row)          — ключ уникальности листа для строки.
++  * dedup_document_rows(rows) — список dict'ов → уникальные листы.
++  * dedup_documents(df)     — pandas DataFrame → уникальные листы.
++  * sql_count_sheets(alias) — SQL-выражение COUNT(DISTINCT ...) для
++    подсчёта уникальных листов прямо в SQL-запросе.
++
++Изменения структуры базы НЕ требуются: дедупликация выполняется на
++уровне SQL-выражений и pandas; таблицы/представления не создаются.
++"""
++
++# ---------------------------------------------------------------------------
++#  Нормализация значений
++# ---------------------------------------------------------------------------
++def _s(v) -> str:
++    """None/NaN → '', остальное → str без пробелов по краям."""
++    if v is None:
++        return ""
++    try:
++        import pandas as pd
++        if pd.isna(v):
++            return ""
++    except (TypeError, ValueError):
++        pass
++    return str(v).strip()
++
++
++def _int(v) -> int:
++    """Безопасный int (None/мусор → 0)."""
++    try:
++        return int(v)
++    except (TypeError, ValueError):
++        return 0
++
++
++# ---------------------------------------------------------------------------
++#  Ключ уникальности листа
++# ---------------------------------------------------------------------------
++def sheet_key(row: dict) -> tuple:
++    """
++    Ключ уникальности листа для строки documents (dict).
++
++    sheet_number заполнен → ('sheet', complex, sheet_number);
++    sheet_number пустой   → ('row', id) — файл сам себе лист (fallback).
++    """
++    sn = _s(row.get("sheet_number"))
++    if not sn:
++        return ("row", _int(row.get("id")))
++    return ("sheet", _s(row.get("complex")), sn)
++
++
++def _rev_order(row: dict) -> tuple:
++    """Порядок ревизии: чем позже status_date / больше id, тем новее."""
++    return (_s(row.get("status_date")), _int(row.get("id")))
++
++
++# ---------------------------------------------------------------------------
++#  Дедупликация
++# ---------------------------------------------------------------------------
++def dedup_document_rows(rows) -> list:
++    """
++    Список строк documents (dict) → одна строка на уникальный лист.
++
++    Из ревизий одного листа остаётся последняя (MAX(status_date),
++    при равенстве — MAX(id)). Результат упорядочен по id.
++    Строки с пустым sheet_number не склеиваются (fallback по id).
++    """
++    best: dict[tuple, dict] = {}
++    for r in rows or []:
++        if not isinstance(r, dict):
++            continue
++        key = sheet_key(r)
++        cur = best.get(key)
++        if cur is None or _rev_order(r) > _rev_order(cur):
++            best[key] = r
++    return sorted(best.values(), key=lambda r: _int(r.get("id")))
++
++
++def dedup_documents(df):
++    """
++    pandas-обёртка dedup_document_rows: DataFrame documents → DataFrame
++    уникальных листов. Колонки и их порядок сохраняются. Если колонки
++    sheet_number нет — DataFrame возвращается без изменений.
++    """
++    import pandas as pd
++
++    if df is None or len(df) == 0 or "sheet_number" not in df.columns:
++        return df
++    kept = dedup_document_rows(df.to_dict("records"))
++    if not kept:
++        return df.iloc[0:0]
++    return pd.DataFrame(kept).reindex(columns=df.columns)
++
++
++# ---------------------------------------------------------------------------
++#  SQL-выражение для подсчёта в запросах
++# ---------------------------------------------------------------------------
++def sql_count_sheets(alias: str = "d") -> str:
++    """
++    SQL-выражение: число УНИКАЛЬНЫХ листов в группе (стандарт патча 11).
++
++    Вставляется в запрос вместо COUNT(DISTINCT {alias}.id) / COUNT(*).
++    Ключ — (complex, sheet_number); строки с пустым sheet_number
++    считаются поодиночке (по id). COALESCE(complex,'') защищает от
++    потери строк с NULL-комплектом (NULL || x = NULL в SQLite).
++    """
++    a = alias
++    return (
++        f"COUNT(DISTINCT CASE "
++        f"WHEN TRIM(COALESCE({a}.sheet_number, '')) != '' "
++        f"THEN COALESCE({a}.complex, '') || '||' "
++        f"|| TRIM({a}.sheet_number) "
++        f"ELSE 'row:' || {a}.id END)"
++    )
+--- a/vitro/sqlite_db.py
++++ b/vitro/sqlite_db.py
+@@ -17,6 +17,7 @@
+ 
+ from dotenv import load_dotenv
+ 
++from vitro.sheets import sql_count_sheets
+ from vitro.time_utils import msk_now_str
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+@@ -517,6 +518,12 @@
+     with get_conn() as conn:
+         return {
+             "documents":         conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
++            # Уникальные листы (патч 11): стандарт «Плана выдачи».
++            # Ревизии/повторные выгрузки одного листа считаются один раз.
++            "sheets":            conn.execute(
++                                    f"SELECT {sql_count_sheets('d')} "
++                                    "FROM documents AS d"
++                                 ).fetchone()[0],
+             "comments":          conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
+             "categorized":       conn.execute(
+                                     "SELECT COUNT(*) FROM comments "
+--- a/vitro/xlsx_builder.py
++++ b/vitro/xlsx_builder.py
+@@ -20,6 +20,7 @@
+ from openpyxl.styles.differential import DifferentialStyle
+ 
+ from vitro.sqlite_db import get_conn
++from vitro.sheets import dedup_document_rows
+ from vitro.disciplines import discipline_name
+ 
+ 
+@@ -102,8 +103,10 @@
+ # ---------------------------------------------------------------------------
+ def load_all_data():
+     with get_conn() as conn:
++        # sheet_number/status_date нужны для дедупликации листов (патч 11)
+         documents = [dict(r) for r in conn.execute(
+-            """SELECT id, leaf, discipline, section, complex, status, name
++            """SELECT id, leaf, discipline, section, complex, status, name,
++                      sheet_number, status_date
+                FROM documents""")]
+         comments = [dict(r) for r in conn.execute(
+             """SELECT id, doc_id, comment, status, author, created,
+@@ -138,8 +141,13 @@
+ 
+ 
+ def compute_stats(documents, comments):
++    # Патч 11: листы считаются по УНИКАЛЬНЫМ листам (complex + sheet_number,
++    # последняя ревизия). Замечания привязаны к конкретным ревизиям, поэтому
++    # маппинг doc→complex строится по ВСЕМ строкам documents.
++    unique_docs = dedup_document_rows(documents)
++
+     docs_by_complex = defaultdict(list)
+-    for d in documents:
++    for d in unique_docs:
+         if d.get("complex"):
+             docs_by_complex[d["complex"]].append(d)
+ 
+--- a/vitro/ui/summary.py
++++ b/vitro/ui/summary.py
+@@ -24,6 +24,7 @@
+ 
+ from vitro.sqlite_db import get_conn
+ from vitro._cache import versioned_cache
++from vitro.sheets import dedup_documents
+ from vitro.disciplines import discipline_name
+ from vitro.ui._filters import (
+     _doc_status_group,
+@@ -165,12 +166,21 @@
+ # ---------------------------------------------------------------------------
+ @versioned_cache(3600)
+ def _load_documents() -> pd.DataFrame:
++    """Листы РД — ПОСЛЕ дедупликации (патч 11).
++
++    Одна строка = один УНИКАЛЬНЫЙ лист (complex, sheet_number):
++    из ревизий/повторных выгрузок остаётся последняя (MAX(status_date)).
++    Строки с пустым sheet_number не склеиваются (fallback по id).
++    Единый стандарт с «Планом выдачи»: ревизии одного листа не удваивают
++    счётчики «Листы РД» и разрезов.
++    """
+     with get_conn() as conn:
+-        return pd.read_sql("""
++        df = pd.read_sql("""
+             SELECT id, leaf, discipline, section, complex,
+                    status, revision, name, status_date, sheet_number
+             FROM documents
+         """, conn)
++    return dedup_documents(df)
+ 
+ 
+ 
+@@ -360,6 +370,10 @@
+ # ===========================================================================
+ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
+     st.markdown("##### Листы РД")
++    st.caption(
++        "Один уникальный лист = одна строка: ревизии и повторные выгрузки "
++        "считаются один раз, берётся последняя ревизия листа."
++    )
+ 
+     if docs_df.empty:
+         st.info("Нет данных по листам.")
+@@ -387,7 +401,9 @@
+     with col_left:
+         _metric(
+             st, "Листов всего", total,
+-            "Выгрузка из Витро: COUNT(documents).",
++            "Выгрузка из Витро: УНИКАЛЬНЫЕ листы (complex + sheet_number).\n\n"
++            "Несколько ревизий/выгрузок одного листа считаются один лист — "
++            "как в «Плане выдачи». Строки без номера листа считаются по файлам.",
+         )
+         sheet_dist = _sheet_distribution_from_df(docs_df)
+         _pie(sheet_dist, "Статус листа", "Количество", SHEET_COLORS,
+@@ -396,15 +412,18 @@
+     with col_mid:
+         _metric(
+             st, f"{EMOJI['green']} Статус A — утверждён", n_a,
+-            "Выгрузка из Витро: COUNT(documents WHERE status='A').",
++            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
++            "ревизия имеет статус 'A'.",
+         )
+         _metric(
+             st, f"{EMOJI['yellow']} Статус B — к сдаче", n_b,
+-            "Выгрузка из Витро: COUNT(documents WHERE status='B').",
++            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
++            "ревизия имеет статус 'B'.",
+         )
+         _metric(
+             st, f"{EMOJI['orange']} Статус C — в работе", n_c,
+-            "Выгрузка из Витро: COUNT(documents WHERE status='C').",
++            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
++            "ревизия имеет статус 'C'.",
+         )
+         _metric(
+             st, " % готовых (A+B)", f"{pct_ab}%",
+@@ -414,7 +433,8 @@
+     with col_right:
+         _metric(
+             st, f"{EMOJI['white']} Статус И — информационный", n_i,
+-            "Выгрузка из Витро: COUNT(documents WHERE status='И').",
++            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
++            "ревизия имеет статус 'И'.",
+         )
+         _metric(
+             st, f"{EMOJI['globe']} На согласовании Заказчика",
+@@ -427,8 +447,8 @@
+         )
+         _metric(
+             st, f"{EMOJI['black']} Аннулировано", n_annulled,
+-            "Выгрузка из Витро: "
+-            "COUNT(documents WHERE status='Аннулировано').",
++            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
++            "ревизия — «Аннулировано».",
+         )
+ 
+ 
+@@ -781,7 +801,8 @@
+     if docs_df.empty and active_df.empty:
+         return pd.DataFrame()
+ 
+-    # --- Листы ---
++    # --- Листы (docs_df уже дедуплицирован в _load_documents, патч 11:
++    #     одна строка = один уникальный лист, статусы последней ревизии) ---
+     if not docs_df.empty:
+         doc_rows = []
+         for grp, sub in docs_df.groupby(group_col, dropna=True):
+@@ -885,6 +906,12 @@
+     elif active_grp.empty:
+         result = docs_grp
+     else:
++        # Патч 11: выравниваем тип ключа перед merge — groupby pandas
++        # по колонке из одних None даёт float64, а из строк — object,
++        # из-за расхождения типов merge падает с ValueError.
++        for frame in (docs_grp, active_grp):
++            if group_col in frame.columns:
++                frame[group_col] = frame[group_col].fillna("").astype(str)
+         result = docs_grp.merge(active_grp, on=group_col, how="outer")
+     result = result.fillna(0)
+ 
+--- a/vitro/ui/export.py
++++ b/vitro/ui/export.py
+@@ -16,6 +16,7 @@
+ 
+ from vitro.sqlite_db import get_conn
+ from vitro._cache import versioned_cache
++from vitro.sheets import dedup_documents, sql_count_sheets
+ from vitro.pdf_builder import build_pdf
+ from vitro.ui._filters import render_standard_filters
+ 
+@@ -61,7 +62,8 @@
+     Сводка по дисциплинам:
+       - Всего / Закрыто / Аннулировано — по всей базе
+       - Активных + ответственные + категории — из _load_all_categorized
+-      - Листов — из documents
++      - Листов — УНИКАЛЬНЫЕ листы (патч 11): ревизии одного листа
++        считаются один раз (стандарт «Плана выдачи»)
+     """
+     active = _load_active_df()
+ 
+@@ -71,7 +73,7 @@
+             SELECT
+                 d.discipline AS discipline,
+                 COUNT(DISTINCT d.complex) AS complexes,
+-                COUNT(DISTINCT d.id) AS docs_total,
++                {sheets} AS docs_total,
+                 COUNT(c.id) AS total,
+                 SUM(CASE WHEN c.status = 'Закрыто'
+                          THEN 1 ELSE 0 END) AS closed,
+@@ -81,7 +83,7 @@
+             LEFT JOIN comments c ON c.doc_id = d.id
+             WHERE d.discipline IS NOT NULL
+             GROUP BY d.discipline
+-        """, conn)
++        """.format(sheets=sql_count_sheets("d")), conn)
+ 
+     # ---- Активные по дисциплинам ----
+     if not active.empty:
+@@ -166,19 +168,30 @@
+ 
+ @versioned_cache(3600)
+ def _load_complex_summary() -> pd.DataFrame:
+-    """Сводка по комплектам."""
++    """Сводка по комплектам.
++
++    Патч 11 — единый стандарт листов:
++      * Листы и статусы A/B/C/И — по УНИКАЛЬНЫМ листам (complex +
++        sheet_number), статус берётся с ПОСЛЕДНЕЙ ревизии листа.
++      * Замечания (Всего/Закрыто/Аннулировано) — по всем замечаниям
++        без дедупликации: замечание, привязанное к старой ревизии,
++        продолжает учитываться.
++    """
+     active = _load_active_df()
+ 
+     with get_conn() as conn:
+-        base = pd.read_sql("""
++        # ---- Листы: дедуплицируются в pandas (нужен статус последней ревизии)
++        docs = pd.read_sql("""
++            SELECT id, discipline, complex, status, sheet_number, status_date
++            FROM documents
++            WHERE complex IS NOT NULL
++        """, conn)
++
++        # ---- Замечания: считаем по ВСЕМ строкам documents (без дедупликации)
++        remarks = pd.read_sql("""
+             SELECT
+                 d.discipline AS discipline,
+                 d.complex AS complex,
+-                COUNT(DISTINCT d.id) AS docs_total,
+-                SUM(CASE WHEN UPPER(d.status) = 'A' THEN 1 ELSE 0 END) AS doc_a,
+-                SUM(CASE WHEN UPPER(d.status) = 'B' THEN 1 ELSE 0 END) AS doc_b,
+-                SUM(CASE WHEN UPPER(d.status) = 'C' THEN 1 ELSE 0 END) AS doc_c,
+-                SUM(CASE WHEN d.status = 'И' THEN 1 ELSE 0 END) AS doc_info,
+                 COUNT(c.id) AS total,
+                 SUM(CASE WHEN c.status = 'Закрыто'
+                          THEN 1 ELSE 0 END) AS closed,
+@@ -190,6 +203,31 @@
+             GROUP BY d.discipline, d.complex
+         """, conn)
+ 
++    # Уникальные листы: одна строка = один лист (последняя ревизия)
++    docs = dedup_documents(docs)
++    if docs.empty:
++        base = remarks.iloc[0:0].copy()
++        for c in ("docs_total", "doc_a", "doc_b", "doc_c", "doc_info"):
++            base[c] = 0
++    else:
++        st_u = docs["status"].fillna("").astype(str).str.strip().str.upper()
++        docs = docs.assign(
++            _st=st_u,
++            _info=(st_u == "И").astype(int),
++        )
++        base = (
++            docs.groupby(["discipline", "complex"], dropna=False)
++            .agg(
++                docs_total=("id", "count"),
++                doc_a=("_st", lambda s: int((s == "A").sum())),
++                doc_b=("_st", lambda s: int((s == "B").sum())),
++                doc_c=("_st", lambda s: int((s == "C").sum())),
++                doc_info=("_info", "sum"),
++            )
++            .reset_index()
++        )
++        base["doc_info"] = base["doc_info"].astype(int)
++
+     if not active.empty:
+         rows = []
+         for (disc, cx), sub in active.groupby(["discipline", "complex"]):
+@@ -221,7 +259,17 @@
+             "ours", "waiting", "chronic", "closed_doc",
+         ])
+ 
+-    df = base.merge(active_cx, on=["discipline", "complex"],
++    # Ключи merge: groupby pandas по колонке из одних None даёт float64,
++    # а SQL/read_sql — object → выравниваем типы перед merge (иначе ValueError).
++    def _norm_cx_keys(df: pd.DataFrame) -> pd.DataFrame:
++        out = df.copy()
++        out["discipline"] = out["discipline"].fillna("").astype(str)
++        out["complex"] = out["complex"].fillna("").astype(str)
++        return out
++
++    df = _norm_cx_keys(base).merge(
++        _norm_cx_keys(remarks), on=["discipline", "complex"], how="outer")
++    df = df.merge(_norm_cx_keys(active_cx), on=["discipline", "complex"],
+                      how="outer").fillna(0)
+ 
+     df["pct_closed"] = df.apply(
+@@ -259,7 +307,7 @@
+                 d.discipline AS discipline,
+                 d.section AS section,
+                 COUNT(DISTINCT d.complex) AS complexes,
+-                COUNT(DISTINCT d.id) AS docs_total,
++                {sheets} AS docs_total,
+                 COUNT(c.id) AS total,
+                 SUM(CASE WHEN c.status = 'Закрыто'
+                          THEN 1 ELSE 0 END) AS closed,
+@@ -269,7 +317,7 @@
+             LEFT JOIN comments c ON c.doc_id = d.id
+             WHERE d.section IS NOT NULL AND d.section <> ''
+             GROUP BY d.discipline, d.section
+-        """, conn)
++        """.format(sheets=sql_count_sheets("d")), conn)
+ 
+     if not active.empty:
+         rows = []
+--- a/vitro/ui/admin.py
++++ b/vitro/ui/admin.py
+@@ -54,7 +54,12 @@
+ 
+     c1, c2, c3, c4, c5 = st.columns(5)
+     c1.metric("Комплектов", stats["complexes"])
+-    c2.metric("Листов РД", f"{stats['documents']:,}".replace(",", " "))
++    c2.metric(
++        "Листов РД", f"{stats['sheets']:,}".replace(",", " "),
++        help="Уникальные листы (патч 11): ревизии и повторные выгрузки "
++             "одного листа считаются один раз. "
++             f"Строк (файлов) в documents: {stats['documents']:,}".replace(",", " "),
++    )
+     c3.metric("Замечаний", f"{stats['comments']:,}".replace(",", " "))
+     c4.metric("С категорией", f"{stats['categorized']:,}".replace(",", " "))
+     c5.metric("Снимков истории", stats["history_snapshots"])
+@@ -94,7 +99,8 @@
+ 
+             st.success(
+                 f"✅ Синхронизация завершена\n\n"
+-                f"- Листов: **{result['documents']:,}**\n"
++                f"- Файлов (строк documents): "
++                f"**{result['documents']:,}**\n".replace(",", " ") +
+                 f"- Замечаний: **{result['comments']:,}**\n"
+                 f"- Комплектов: **{result['complexes']:,}**\n"
+                 f"- Время: **{result['elapsed']} сек**"
+--- a/scripts/test_patch11.py
++++ b/scripts/test_patch11.py
+@@ -0,0 +1,247 @@
++# test_patch11.py — тесты глобальной дедупликации листов (PATCH-11)
++"""
++Проверяет (PATCH-11) единый стандарт «один уникальный лист = одна строка»:
++
++  1. vitro/sheets.py: sheet_key / dedup_document_rows / dedup_documents /
++     sql_count_sheets — ревизии и повторные выгрузки склеиваются,
++     остаётся последняя ревизия (MAX(status_date), затем MAX(id));
++     пустой sheet_number → fallback по id; разные комплекты не склеиваются.
++  2. sqlite_db.db_stats: ключ "sheets" = уникальные листы,
++     "documents" = строки (файлы).
++  3. Сводка по проекту: _load_documents возвращает уникальные листы;
++     бублик «Листов всего» и разрез считают листы, а не файлы
++     (сценарий «8 файлов → 5 листов» — аналог «52 против 44»).
++  4. Экспорт: _load_discipline_summary / _load_complex_summary /
++     _load_section_summary — колонка «Листов» = уникальные листы,
++     статусы A/B/C — по последней ревизии; замечания НЕ теряются
++     (замечание у старой ревизии продолжает считаться).
++  5. xlsx_builder.compute_stats — «Всего листов» по уникальным листам.
++  6. Поиск: замечание, привязанное к старой ревизии, находится
++     (дедупликация листов не прячет замечания).
++
++Запуск: python3 scripts/test_patch11.py
++"""
++import os
++import sys
++
++REPO = "/home/z/my-project/vitro-tracker"
++sys.path.insert(0, REPO)
++os.environ["SQLITE_PATH"] = "data/vitro_test11.db"
++os.chdir(REPO)
++
++import pandas as pd  # noqa: E402
++
++import vitro.sqlite_db as db  # noqa: E402
++from vitro.sheets import (  # noqa: E402
++    dedup_document_rows,
++    dedup_documents,
++    sheet_key,
++    sql_count_sheets,
++)
++
++DB_FILE = os.path.join(REPO, "data", "vitro_test11.db")
++if os.path.exists(DB_FILE):
++    os.remove(DB_FILE)
++db.init_db()
++
++FAILURES = []
++
++
++def check(name, cond, detail=""):
++    print(f"[{'OK ' if cond else 'FAIL'}] {name} {detail}")
++    if not cond:
++        FAILURES.append(name)
++
++
++# ------------------------------------------------------------------
++# Фикстура: 8 файлов → 5 уникальных листов
++# ------------------------------------------------------------------
++def doc(i, cx, disc, sn, status, sd, section="Корпус 1"):
++    return dict(
++        id=i, leaf=f"FILE_{i}.pdf", discipline=disc, section=section,
++        complex=cx, status=status, revision="1", dir_ref="",
++        name=f"Лист {sn or i}", status_date=sd, sheet_number=sn,
++        vitro_guid=f"g{i}", vitro_version=1,
++    )
++
++
++K1 = "АТ-РД-АР1-С-00"
++K2 = "АТ-РД-КМ1-С-00"
++
++docs = [
++    # Лист 10.01 — три ревизии C → B → A; остаётся последняя (A)
++    doc(1, K1, "АР", "10.01", "C", "2025-01-10"),
++    doc(2, K1, "АР", "10.01", "B", "2025-02-10"),
++    doc(3, K1, "АР", "10.01", "A", "2025-03-10"),
++    # Лист 10.02 — повторная выгрузка той же ревизии (та же дата):
++    # остаётся строка с бОльшим id
++    doc(4, K1, "АР", "10.02", "B", "2025-02-11"),
++    doc(5, K1, "АР", "10.02", "B", "2025-02-11"),
++    # Листы без номера (sheet_number пустой) — два самостоятельных листа
++    doc(6, K1, "АР", "", "C", "2025-01-15"),
++    doc(7, K1, "АР", None, "C", "2025-01-16"),
++    # Тот же номер 10.01 в ДРУГОМ комплекте — отдельный лист
++    doc(8, K2, "КМ", "10.01", "A", "2025-04-01"),
++]
++
++comments = [
++    # Замечание привязано к СТАРОЙ ревизии листа 10.01 (doc_id=1):
++    # после дедупликации ревизия исчезает из подсчёта листов,
++    # но замечание обязано остаться во всех замечаниевых счётчиках.
++    dict(id=101, doc_id=1, comment="Тест-замечание к старой ревизии",
++         status="Новое", author="Инженер", created="2025-02-01 10:00:00",
++         fix_date=None),
++]
++
++n_docs, n_comments = db.save_all(docs, comments, {d["id"] for d in docs})
++check("fixture_saved", (n_docs, n_comments) == (8, 1),
++      f"docs={n_docs}, comments={n_comments}")
++
++# ------------------------------------------------------------------
++# 1. sheets.py — ключ и дедупликация
++# ------------------------------------------------------------------
++check("key_sheet", sheet_key(docs[0]) == ("sheet", K1, "10.01"))
++check("key_row_fallback", sheet_key(docs[6]) == ("row", 7))
++
++kept = dedup_document_rows(docs)
++# 5 = 10.01 + 10.02 + два листа без номера + 10.01 в K2
++check("dedup_count", len(kept) == 5, f"kept={len(kept)}, ожидалось 5")
++by_id = {r["id"]: r for r in kept}
++
++# 10.01 — последняя ревизия (дата 2025-03-10)
++check("latest_by_date", 3 in by_id and 1 not in by_id and 2 not in by_id,
++      "лист 10.01: осталась ревизия id=3 (A)")
++# Повторная выгрузка (та же дата) — остаётся бОльший id
++check("latest_by_id", 5 in by_id and 4 not in by_id,
++      "лист 10.02: осталась строка id=5")
++# Пустой sheet_number — обе строки остаются
++check("empty_sn_kept", 6 in by_id and 7 in by_id, "строки без номера не склеены")
++# Другой комплект — не склеился с K1
++check("cross_complex_kept", 8 in by_id, "K2 10.01 — отдельный лист")
++# Статус оставленной ревизии
++check("latest_status", by_id[3]["status"] == "A", "статус последней ревизии")
++# Порядок результата — по id
++check("sorted_by_id", [r["id"] for r in kept] == sorted(r["id"] for r in kept))
++
++df_kept = dedup_documents(pd.DataFrame(docs))
++check("df_wrapper_len", len(df_kept) == 5)
++check("df_wrapper_cols", list(df_kept.columns) == list(pd.DataFrame(docs).columns))
++check("df_empty_safe", len(dedup_documents(pd.DataFrame(
++    [dict(id=9, complex="X", sheet_number=None)]))) == 1)
++check("df_no_column", len(dedup_documents(pd.DataFrame(
++    [dict(id=1, complex="X")]))) == 1)  # нет sheet_number → без изменений
++
++# ------------------------------------------------------------------
++# 2. db_stats: sheets vs documents
++# ------------------------------------------------------------------
++stats = db.db_stats()
++check("db_stats_documents", stats["documents"] == 8, f"={stats['documents']}")
++check("db_stats_sheets", stats["sheets"] == 5, f"={stats['sheets']}")
++
++with db.get_conn() as conn:
++    per_cx = {
++        r["complex"]: r["n"]
++        for r in conn.execute(
++            f"SELECT d.complex AS complex, {sql_count_sheets('d')} AS n "
++            "FROM documents AS d GROUP BY d.complex"
++        )
++    }
++check("sql_per_complex", per_cx.get(K1) == 4 and per_cx.get(K2) == 1,
++      f"K1={per_cx.get(K1)}, K2={per_cx.get(K2)}")
++
++# ------------------------------------------------------------------
++# 3. Сводка по проекту: _load_documents → уникальные листы
++# ------------------------------------------------------------------
++import vitro.ui.summary as summary  # noqa: E402
++
++docs_df = summary._load_documents()
++check("summary_docs_deduped", len(docs_df) == 5, f"={len(docs_df)}")
++st_u = docs_df["status"].fillna("").astype(str).str.strip().str.upper()
++check("summary_statuses", (int((st_u == "A").sum()) == 2
++                           and int((st_u == "B").sum()) == 1
++                           and int((st_u == "C").sum()) == 2),
++      f"A={(st_u == 'A').sum()}, B={(st_u == 'B').sum()}, "
++      f"C={(st_u == 'C').sum()}")
++
++# Разрез по дисциплинам: АР = 4 листа (K1), КМ = 1 лист (K2)
++rows = summary._load_summary_by_discipline()
++ar = rows[rows["Код"] == "АР"].iloc[0]
++km = rows[rows["Код"] == "КМ"].iloc[0]
++check("summary_disc_docs", int(ar["docs_total"]) == 4,
++      f"АР docs_total={ar['docs_total']}")
++check("summary_disc_a", int(ar["doc_a"]) == 1, "АР: A=1 (10.01 после ревизий)")
++check("summary_disc_km", int(km["docs_total"]) == 1,
++      f"КМ docs_total={km['docs_total']}")
++
++# ------------------------------------------------------------------
++# 4. Экспорт: «Листов» = уникальные листы, замечания не теряются
++# ------------------------------------------------------------------
++import vitro.ui.export as export  # noqa: E402
++
++disc = export._load_discipline_summary()
++d_ar = disc[disc["Код"] == "АР"].iloc[0]
++check("export_disc_docs", int(d_ar["Листов"]) == 4,
++      f"АР Листов={d_ar['Листов']}")
++check("export_disc_remarks", int(d_ar["Всего замечаний"]) == 1,
++      f"АР Всего замечаний={d_ar['Всего замечаний']} (замечание у "
++      "старой ревизии не потеряно)")
++
++cx = export._load_complex_summary()
++c_k1 = cx[cx["Комплект"] == K1].iloc[0]
++c_k2 = cx[cx["Комплект"] == K2].iloc[0]
++check("export_cx_docs", int(c_k1["Листов"]) == 4, f"K1 Листов={c_k1['Листов']}")
++check("export_cx_a", int(c_k1["Статус A"]) == 1,
++      f"K1 Статус A={c_k1['Статус A']} (последняя ревизия 10.01)")
++check("export_cx_b", int(c_k1["Статус B"]) == 1,
++      f"K1 Статус B={c_k1['Статус B']} (10.02)")
++check("export_cx_c", int(c_k1["Статус C"]) == 2,
++      f"K1 Статус C={c_k1['Статус C']} (2 листа без номера)")
++check("export_cx_remarks", int(c_k1["Всего"]) == 1,
++      f"K1 Всего замечаний={c_k1['Всего']}")
++check("export_cx_km", int(c_k2["Листов"]) == 1, f"K2 Листов={c_k2['Листов']}")
++
++sect = export._load_section_summary()
++# Сводная по разделам группируется по (дисциплина, раздел):
++# «Корпус 1» → две строки: АР=4 листа, КМ=1 лист; суммарно 5.
++sect_rows = sect[sect["Раздел"] == "Корпус 1"]
++check("export_sect_docs", len(sect_rows) == 2
++      and int(sect_rows["Листов"].sum()) == 5,
++      f"Раздел «Корпус 1»: строк={len(sect_rows)}, "
++      f"Листов всего={int(sect_rows['Листов'].sum())} (4 АР + 1 КМ)")
++
++# ------------------------------------------------------------------
++# 5. xlsx_builder.compute_stats
++# ------------------------------------------------------------------
++import vitro.xlsx_builder as xb  # noqa: E402
++
++data = xb.load_all_data()
++check("xlsx_load_cols", all("sheet_number" in d for d in data["documents"]))
++st11 = xb.compute_stats(data["documents"], data["comments"])
++k1s = st11["by_complex"][K1]
++check("xlsx_cx_docs", k1s["docs_total"] == 4, f"K1 docs_total={k1s['docs_total']}")
++check("xlsx_cx_a", k1s["doc_a"] == 1, f"K1 doc_a={k1s['doc_a']}")
++check("xlsx_cx_remarks", k1s["total"] == 1,
++      f"K1 всего замечаний={k1s['total']} (не потеряно)")
++k2s = st11["by_complex"][K2]
++check("xlsx_cx_km_docs", k2s["docs_total"] == 1, f"K2 docs_total={k2s['docs_total']}")
++
++# ------------------------------------------------------------------
++# 6. Поиск: замечание у старой ревизии находится
++# ------------------------------------------------------------------
++import vitro.ui.search as search  # noqa: E402
++
++found = search._search_comments(query="Тест-замечание")
++check("search_old_revision_remark", len(found) == 1 and int(
++    found.iloc[0]["ID"]) == 101,
++    f"найдено={len(found)}")
++
++# ------------------------------------------------------------------
++# Итог
++# ------------------------------------------------------------------
++print()
++if FAILURES:
++    print(f"ПРОВАЛЕНО проверок: {len(FAILURES)}")
++    for f in FAILURES:
++        print(f"  - {f}")
++    sys.exit(1)
++print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")

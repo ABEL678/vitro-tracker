@@ -15,8 +15,10 @@ import pandas as pd
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
-from vitro.disciplines import discipline_name
+from vitro._cache import versioned_cache
+from vitro.sheets import unique_vitro_sheets
 from vitro.pdf_builder import build_pdf
+from vitro.ui._filters import render_standard_filters
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +38,7 @@ STATUSES = [
 # ---------------------------------------------------------------------------
 #  Единый источник активных
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_active_df() -> pd.DataFrame:
     """Активные замечания из deadlines._load_all_categorized."""
     from vitro.ui.deadlines import _load_all_categorized
@@ -47,83 +49,41 @@ def _load_active_df() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-#  Справочники
+#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_discipline_options() -> dict[str, str]:
-    with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
-            "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple[str, ...] = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        if disciplines:
-            placeholders = ",".join("?" * len(disciplines))
-            rows = conn.execute(f"""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({placeholders})
-                ORDER BY section
-            """, tuple(disciplines)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                ORDER BY section
-            """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple[str, ...] = (),
-                       sections: tuple[str, ...] = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        where = ["c.code IS NOT NULL"]
-        params: list = []
-        if disciplines:
-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-        if sections:
-            placeholders = ",".join("?" * len(sections))
-            where.append(f"""c.code IN (
-                SELECT DISTINCT complex FROM documents
-                WHERE section IN ({placeholders}) AND complex IS NOT NULL
-            )""")
-            params += list(sections)
-
-        rows = conn.execute(f"""
-            SELECT c.code, c.name FROM complexes c
-            WHERE {' AND '.join(where)}
-            ORDER BY c.code
-        """, tuple(params)).fetchall()
-    return {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
-            for r in rows}
 
 
 # ---------------------------------------------------------------------------
 #  Сводки через _load_all_categorized
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_discipline_summary() -> pd.DataFrame:
     """
     Сводка по дисциплинам:
       - Всего / Закрыто / Аннулировано — по всей базе
       - Активных + ответственные + категории — из _load_all_categorized
-      - Листов — из documents
+      - Листов — ЕДИНЫЙ СТАНДАРТ «Плана выдачи» (патч 14):
+        sheets.unique_vitro_sheets — дедуп ревизий, нормализация
+        шифров (в т.ч. латинских двойников), отсечение мусорных.
+        Раньше считали SQL-выражением sql_count_sheets — без
+        нормализации и отсечения, поэтому цифры расходились
+        с «Планом выдачи».
     """
     active = _load_active_df()
 
     with get_conn() as conn:
-        # ---- Общие цифры по всей базе ----
-        base = pd.read_sql("""
+        # ---- Листы: единый стандарт (дедуп + валидные шифры) ----
+        docs = pd.read_sql("""
+            SELECT id, discipline, complex, sheet_number
+            FROM documents
+            WHERE discipline IS NOT NULL
+        """, conn)
+
+        # ---- Замечания: считаем по ВСЕМ строкам documents (без дедупликации:
+        #      замечание, привязанное к старой ревизии, продолжает учитываться)
+        remarks = pd.read_sql("""
             SELECT
                 d.discipline AS discipline,
-                COUNT(DISTINCT d.complex) AS complexes,
-                COUNT(DISTINCT d.id) AS docs_total,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -134,6 +94,17 @@ def _load_discipline_summary() -> pd.DataFrame:
             WHERE d.discipline IS NOT NULL
             GROUP BY d.discipline
         """, conn)
+
+    kept = unique_vitro_sheets(docs.to_dict("records"))
+    if kept:
+        ddf = pd.DataFrame(kept)
+        base = (ddf.groupby("discipline", dropna=False)
+                .agg(complexes=("complex", "nunique"),
+                     docs_total=("id", "count"))
+                .reset_index())
+    else:
+        base = pd.DataFrame(columns=["discipline", "complexes",
+                                     "docs_total"])
 
     # ---- Активные по дисциплинам ----
     if not active.empty:
@@ -180,7 +151,10 @@ def _load_discipline_summary() -> pd.DataFrame:
             "closed_doc", "cat_1", "cat_2", "cat_3", "cat_4", "cat_none",
         ])
 
-    df = base.merge(active_disc, on="discipline", how="outer").fillna(0)
+    # base (листы) + remarks (замечания, docs-driven) + active_disc
+    df = (base.merge(remarks, on="discipline", how="outer")
+              .merge(active_disc, on="discipline", how="outer")
+              .fillna(0))
 
     df["pct_closed"] = df.apply(
         lambda r: round(r["closed"] / r["total"] * 100, 1)
@@ -216,21 +190,35 @@ def _load_discipline_summary() -> pd.DataFrame:
     })
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_complex_summary() -> pd.DataFrame:
-    """Сводка по комплектам."""
+    """Сводка по комплектам.
+
+    Патчи 11/14 — единый стандарт листов:
+      * Листы и статусы A/B/C/И — по УНИКАЛЬНЫМ листам (complex +
+        sheet_number), статус берётся с ПОСЛЕДНЕЙ ревизии листа;
+        sheets.unique_vitro_sheets — тот же код, что в «Плане
+        выдачи»: нормализация шифров (латинские двойники) +
+        отсечение мусорных.
+      * Замечания (Всего/Закрыто/Аннулировано) — по всем замечаниям
+        без дедупликации: замечание, привязанное к старой ревизии,
+        продолжает учитываться.
+    """
     active = _load_active_df()
 
     with get_conn() as conn:
-        base = pd.read_sql("""
+        # ---- Листы: дедуплицируются в pandas (нужен статус последней ревизии)
+        docs = pd.read_sql("""
+            SELECT id, discipline, complex, status, sheet_number, status_date
+            FROM documents
+            WHERE complex IS NOT NULL
+        """, conn)
+
+        # ---- Замечания: считаем по ВСЕМ строкам documents (без дедупликации)
+        remarks = pd.read_sql("""
             SELECT
                 d.discipline AS discipline,
                 d.complex AS complex,
-                COUNT(DISTINCT d.id) AS docs_total,
-                SUM(CASE WHEN UPPER(d.status) = 'A' THEN 1 ELSE 0 END) AS doc_a,
-                SUM(CASE WHEN UPPER(d.status) = 'B' THEN 1 ELSE 0 END) AS doc_b,
-                SUM(CASE WHEN UPPER(d.status) = 'C' THEN 1 ELSE 0 END) AS doc_c,
-                SUM(CASE WHEN d.status = 'И' THEN 1 ELSE 0 END) AS doc_info,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -241,6 +229,37 @@ def _load_complex_summary() -> pd.DataFrame:
             WHERE d.complex IS NOT NULL
             GROUP BY d.discipline, d.complex
         """, conn)
+
+    # Уникальные листы: одна строка = один лист (последняя ревизия,
+    # нормализованный шифр, только валидные комплекты)
+    kept = unique_vitro_sheets(docs.to_dict("records"))
+    if not kept:
+        docs = docs.iloc[0:0]
+    else:
+        docs = pd.DataFrame(kept).reindex(columns=docs.columns)
+
+    if docs.empty:
+        base = remarks.iloc[0:0].copy()
+        for c in ("docs_total", "doc_a", "doc_b", "doc_c", "doc_info"):
+            base[c] = 0
+    else:
+        st_u = docs["status"].fillna("").astype(str).str.strip().str.upper()
+        docs = docs.assign(
+            _st=st_u,
+            _info=(st_u == "И").astype(int),
+        )
+        base = (
+            docs.groupby(["discipline", "complex"], dropna=False)
+            .agg(
+                docs_total=("id", "count"),
+                doc_a=("_st", lambda s: int((s == "A").sum())),
+                doc_b=("_st", lambda s: int((s == "B").sum())),
+                doc_c=("_st", lambda s: int((s == "C").sum())),
+                doc_info=("_info", "sum"),
+            )
+            .reset_index()
+        )
+        base["doc_info"] = base["doc_info"].astype(int)
 
     if not active.empty:
         rows = []
@@ -273,7 +292,17 @@ def _load_complex_summary() -> pd.DataFrame:
             "ours", "waiting", "chronic", "closed_doc",
         ])
 
-    df = base.merge(active_cx, on=["discipline", "complex"],
+    # Ключи merge: groupby pandas по колонке из одних None даёт float64,
+    # а SQL/read_sql — object → выравниваем типы перед merge (иначе ValueError).
+    def _norm_cx_keys(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["discipline"] = out["discipline"].fillna("").astype(str)
+        out["complex"] = out["complex"].fillna("").astype(str)
+        return out
+
+    df = _norm_cx_keys(base).merge(
+        _norm_cx_keys(remarks), on=["discipline", "complex"], how="outer")
+    df = df.merge(_norm_cx_keys(active_cx), on=["discipline", "complex"],
                      how="outer").fillna(0)
 
     df["pct_closed"] = df.apply(
@@ -300,18 +329,29 @@ def _load_complex_summary() -> pd.DataFrame:
     })
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_section_summary() -> pd.DataFrame:
-    """Сводка по разделам."""
+    """Сводка по разделам.
+
+    Патч 14: листы — единый стандарт «Плана выдачи»
+    (sheets.unique_vitro_sheets) вместо SQL-выражения
+    sql_count_sheets (без нормализации шифров и отсечения мусорных).
+    """
     active = _load_active_df()
 
     with get_conn() as conn:
-        base = pd.read_sql("""
+        # ---- Листы: единый стандарт (дедуп + валидные шифры) ----
+        docs = pd.read_sql("""
+            SELECT id, discipline, section, complex, sheet_number
+            FROM documents
+            WHERE section IS NOT NULL AND section <> ''
+        """, conn)
+
+        # ---- Замечания: по всем строкам documents (без дедупликации)
+        remarks = pd.read_sql("""
             SELECT
                 d.discipline AS discipline,
                 d.section AS section,
-                COUNT(DISTINCT d.complex) AS complexes,
-                COUNT(DISTINCT d.id) AS docs_total,
                 COUNT(c.id) AS total,
                 SUM(CASE WHEN c.status = 'Закрыто'
                          THEN 1 ELSE 0 END) AS closed,
@@ -322,6 +362,17 @@ def _load_section_summary() -> pd.DataFrame:
             WHERE d.section IS NOT NULL AND d.section <> ''
             GROUP BY d.discipline, d.section
         """, conn)
+
+    kept = unique_vitro_sheets(docs.to_dict("records"))
+    if kept:
+        ddf = pd.DataFrame(kept)
+        base = (ddf.groupby(["discipline", "section"], dropna=False)
+                .agg(complexes=("complex", "nunique"),
+                     docs_total=("id", "count"))
+                .reset_index())
+    else:
+        base = pd.DataFrame(columns=["discipline", "section",
+                                     "complexes", "docs_total"])
 
     if not active.empty:
         rows = []
@@ -354,8 +405,11 @@ def _load_section_summary() -> pd.DataFrame:
             "ours", "waiting", "chronic", "closed_doc",
         ])
 
-    df = base.merge(active_sect, on=["discipline", "section"],
-                     how="outer").fillna(0)
+    # base (листы) + remarks (замечания, docs-driven) + active_sect
+    df = (base.merge(remarks, on=["discipline", "section"], how="outer")
+              .merge(active_sect, on=["discipline", "section"],
+                     how="outer")
+              .fillna(0))
 
     df["pct_closed"] = df.apply(
         lambda r: round(r["closed"] / r["total"] * 100, 1)
@@ -384,6 +438,7 @@ def _load_section_summary() -> pd.DataFrame:
 def _load_comments_filtered(query: str,
                              disciplines=(), sections=(), kits=(),
                              statuses=(), categories=(),
+                             block_codes=(), marka: str = "",
                              limit: int = 20000) -> pd.DataFrame:
     q = """
         SELECT
@@ -417,6 +472,17 @@ def _load_comments_filtered(query: str,
     if kits:
         q += f" AND d.complex IN ({','.join('?' * len(kits))})"
         params += list(kits)
+    if block_codes:
+        ors = []
+        for bc in block_codes:
+            ors.append("d.complex LIKE '%-" + str(bc) + "-%'")
+            ors.append("d.complex LIKE '%-" + str(bc).lower() + "-%'")
+        q += " AND (" + " OR ".join(ors) + ")"
+    if marka:
+        m = marka.strip().upper()
+        if m:
+            q += " AND d.complex LIKE ?"
+            params.append(f"%-{m}-%")
     if statuses:
         q += f" AND c.status IN ({','.join('?' * len(statuses))})"
         params += list(statuses)
@@ -434,7 +500,7 @@ def _load_comments_filtered(query: str,
 # ---------------------------------------------------------------------------
 #  Аналитика
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_authors_analytics() -> pd.DataFrame:
     """Аналитика по авторам — только активные."""
     active = _load_active_df()
@@ -503,10 +569,11 @@ def _load_authors_analytics() -> pd.DataFrame:
     }).sort_values("Активных", ascending=False)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_monthly_dynamics() -> pd.DataFrame:
     """
-    Динамика по месяцам: выдача / наши ответы / закрыто заказчиком.
+    Динамика по месяцам: выдача / выполнено АТП ТЛП /
+    закрыто заказчиком.
     """
     with get_conn() as conn:
         issue = pd.read_sql("""
@@ -520,7 +587,7 @@ def _load_monthly_dynamics() -> pd.DataFrame:
             SELECT substr(fix_date, 1, 7) AS ym, COUNT(*) AS our
             FROM comments
             WHERE fix_date IS NOT NULL AND fix_date <> ''
-              AND status IN ('Закрыто', 'Выполнено')
+              AND status = 'Выполнено'
             GROUP BY ym
         """, conn)
 
@@ -536,15 +603,16 @@ def _load_monthly_dynamics() -> pd.DataFrame:
         issue, our, on="ym", how="outer",
     ).merge(cust, on="ym", how="outer").fillna(0).sort_values("ym")
 
-    merged.columns = ["Месяц", "Выдано", "Наши ответы", "Закрыто заказчиком"]
-    for c in ["Выдано", "Наши ответы", "Закрыто заказчиком"]:
+    merged.columns = ["Месяц", "Выдано", "Выполнено", "Закрыто заказчиком"]
+    for c in ["Выдано", "Выполнено", "Закрыто заказчиком"]:
         merged[c] = merged[c].astype(int)
 
-    merged["Баланс (наш)"] = merged["Выдано"] - merged["Наши ответы"]
+    # Сколько замечаний мы ещё не выполнили (Выдано − Выполнено).
+    merged["Баланс (наш)"] = merged["Выдано"] - merged["Выполнено"]
     return merged
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_lagging_complexes(limit: int = 50) -> pd.DataFrame:
     """Комплекты с наибольшим числом просрочек АТП ТЛП."""
     active = _load_active_df()
@@ -712,62 +780,47 @@ def _render_comments_export():
         "в Excel или PDF."
     )
 
-    disc_options = _load_discipline_options()
+    # --- Единый стандарт фильтров (как в Сводке) ---
+    def _export_extra_row():
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            sel_category = st.multiselect(
+                "Категория", [CAT_1, CAT_2, CAT_3, CAT_4],
+                placeholder="Все категории", key="exp_category")
+        with c5:
+            query = st.text_input(
+                "Поиск по тексту",
+                placeholder="Оставьте пустым для всех",
+                key="exp_query")
+        with c6:
+            limit = st.number_input(
+                "Максимум строк", min_value=100, max_value=100000,
+                value=20000, step=1000, key="exp_limit",
+                help="При большом объёме выгрузка может занять время",
+            )
+        return {
+            "category": tuple(sel_category),
+            "query": query or "",
+            "limit": int(limit),
+        }
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        sel_disc_labels = st.multiselect(
-            "Дисциплина", options=list(disc_options.values()),
-            placeholder="Все дисциплины", key="exp_disc")
-        sel_disc = [code for code, label in disc_options.items()
-                    if label in sel_disc_labels]
-
-    section_options = _load_section_options(
-        tuple(sel_disc) if sel_disc else ())
-
-    with c2:
-        if section_options:
-            sel_section_labels = st.multiselect(
-                "Раздел", options=list(section_options.values()),
-                placeholder="Все разделы", key="exp_section")
-            sel_section = [code for code, label in section_options.items()
-                           if label in sel_section_labels]
-        else:
-            sel_section = []
-            st.multiselect("Раздел", options=[],
-                            placeholder="Разделы не применимы",
-                            disabled=True, key="exp_section_empty")
-
-    kit_options = _load_kit_options(
-        tuple(sel_disc) if sel_disc else (),
-        tuple(sel_section) if sel_section else ())
-
-    with c3:
-        sel_kit_labels = st.multiselect(
-            "Комплект", options=list(kit_options.values()),
-            placeholder="Все комплекты", key="exp_kit")
-        sel_kit = [code for code, label in kit_options.items()
-                    if label in sel_kit_labels]
-
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        sel_status = st.multiselect("Статус", STATUSES,
-                                     placeholder="Все статусы",
-                                     key="exp_status")
-    with c5:
-        sel_category = st.multiselect(
-            "Категория", [CAT_1, CAT_2, CAT_3, CAT_4],
-            placeholder="Все категории", key="exp_category")
-    with c6:
-        query = st.text_input("Поиск по тексту",
-                               placeholder="Оставьте пустым для всех",
-                               key="exp_query")
-
-    limit = st.number_input(
-        "Максимум строк", min_value=100, max_value=100000,
-        value=20000, step=1000, key="exp_limit",
-        help="При большом объёме выгрузка может занять время",
+    # Экспорт ищет также по «Закрыто» и «Аннулировано» — поэтому
+    # расширенный список статусов вместо стандартных пяти.
+    flt = render_standard_filters(
+        key_prefix="exp_",
+        expander_label="🎛 Фильтры",
+        remark_status_options=tuple(STATUSES),
+        extra_row=_export_extra_row,
     )
+
+    sel_disc = flt["disc"]
+    sel_section = flt["section"]
+    sel_kit = flt["kits"]
+    sel_marka = flt["marka"]
+    sel_status = flt["remark_statuses"]
+    sel_category = list(flt["extra"].get("category", ()))
+    query = flt["extra"].get("query", "")
+    limit = flt["extra"].get("limit", 20000)
 
     df = _load_comments_filtered(
         query=query,
@@ -776,6 +829,8 @@ def _render_comments_export():
         kits=tuple(sel_kit) if sel_kit else (),
         statuses=tuple(sel_status) if sel_status else (),
         categories=tuple(sel_category) if sel_category else (),
+        block_codes=flt["block_codes"],
+        marka=sel_marka,
         limit=int(limit),
     )
 
@@ -837,7 +892,7 @@ def _render_analytics():
         st.caption(f"Месяцев: **{len(df)}**")
         st.dataframe(df, use_container_width=True, hide_index=True)
         _make_download(df, "Динамика_по_месяцам", "monthly",
-                        subtitle="Динамика: выдача, ответы АТП ТЛП, "
+                        subtitle="Динамика: выдача, выполнено АТП ТЛП, "
                                   "закрытие заказчиком")
 
     with tab3:

@@ -1,3 +1,4 @@
 {
+  "$schema": "https://app.kilo.ai/config.json",
   "instructions": [".kilo/rules/vitro-rules.md"]
 }

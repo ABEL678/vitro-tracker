@@ -17,11 +17,12 @@ import pandas as pd
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
-from vitro.disciplines import discipline_name
+from vitro._cache import versioned_cache
 from vitro.ui._filters import (
-    SHEET_GROUP_OPTIONS,
+    _filter_by_blocks,
     _filter_by_marka,
     _sheet_groups_to_sql,
+    render_standard_filters,
 )
 from vitro.ui._urls import build_vitro_comment_url
 
@@ -43,67 +44,10 @@ STATUSES = [
 
 
 # ---------------------------------------------------------------------------
-#  Справочники
+#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты),
+#  авторы — локальный справочник поиска
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_discipline_options() -> dict[str, str]:
-    with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
-            "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple[str, ...] = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        if disciplines:
-            placeholders = ",".join("?" * len(disciplines))
-            rows = conn.execute(f"""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({placeholders})
-                ORDER BY section
-            """, tuple(disciplines)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                ORDER BY section
-            """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple[str, ...] = (),
-                      sections: tuple[str, ...] = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        where = ["c.code IS NOT NULL"]
-        params: list = []
-
-        if disciplines:
-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-
-        if sections:
-            placeholders = ",".join("?" * len(sections))
-            where.append(f"""c.code IN (
-                SELECT DISTINCT complex FROM documents
-                WHERE section IN ({placeholders}) AND complex IS NOT NULL
-            )""")
-            params += list(sections)
-
-        rows = conn.execute(f"""
-            SELECT c.code, c.name FROM complexes c
-            WHERE {' AND '.join(where)}
-            ORDER BY c.code
-        """, tuple(params)).fetchall()
-
-    return {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
-            for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
+@versioned_cache(600)
 def _load_author_options() -> list[str]:
     with get_conn() as conn:
         return [r["author"] for r in conn.execute("""
@@ -116,6 +60,7 @@ def _load_author_options() -> list[str]:
 # ---------------------------------------------------------------------------
 #  Основной поиск
 # ---------------------------------------------------------------------------
+@versioned_cache(300)   # повторный тот же запрос — мгновенно
 def _search_comments(query: str,
                      disciplines=(), sections=(), kits=(),
                      statuses=(), authors=(), categories=(),
@@ -254,114 +199,70 @@ def render():
         key="search_query",
     )
 
-    # --- Каскадные фильтры ---
-    disc_options = _load_discipline_options()
+    # --- Каскадные фильтры (единый стандарт) ---
     author_options = _load_author_options()
 
-    with st.expander("🎛 Фильтры", expanded=True):
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            sel_disc_labels = st.multiselect(
-                "Дисциплина",
-                options=list(disc_options.values()),
-                placeholder="Все дисциплины",
-                key="search_disc",
+    def _search_extra_row():
+        c_a1, c_a2, c_a3 = st.columns(3)
+        with c_a1:
+            complex_mask = st.text_input(
+                "Маска комплекта (поиск по подстроке)",
+                placeholder="например: -С- для стилобата, КЖ для конструкций",
+                key="search_complex_mask",
+                help="Показывает только комплекты, в шифре которых есть эта "
+                     "подстрока. Регистронезависимо.",
             )
-            sel_disc = [code for code, label in disc_options.items()
-                        if label in sel_disc_labels]
-
-        section_options = _load_section_options(
-            tuple(sel_disc) if sel_disc else ())
-
-        with c2:
-            if section_options:
-                sel_section_labels = st.multiselect(
-                    "Раздел",
-                    options=list(section_options.values()),
-                    placeholder="Все разделы",
-                    key="search_section",
-                )
-                sel_section = [code for code, label in section_options.items()
-                               if label in sel_section_labels]
-            else:
-                sel_section = []
-                st.multiselect(
-                    "Раздел", options=[],
-                    placeholder="Разделы не применимы",
-                    disabled=True,
-                    key="search_section_empty",
-                )
-
-        kit_options = _load_kit_options(
-            tuple(sel_disc) if sel_disc else (),
-            tuple(sel_section) if sel_section else (),
-        )
-
-        with c3:
-            sel_kit_labels = st.multiselect(
-                "Комплект",
-                options=list(kit_options.values()),
-                placeholder="Все комплекты",
-                key="search_kit",
-            )
-            sel_kit = [code for code, label in kit_options.items()
-                       if label in sel_kit_labels]
-
-        # ---- Строка маски комплекта ----
-        complex_mask = st.text_input(
-            "Маска комплекта (поиск по подстроке)",
-            placeholder="например: -С- для стилобата, КЖ для конструкций",
-            key="search_complex_mask",
-            help="Показывает только комплекты, в шифре которых есть эта "
-                 "подстрока. Регистронезависимо.",
-        )
-
-        # ---- Строка марки комплекта ----
-        sel_marka = st.text_input(
-            "Марка комплекта",
-            placeholder="например: КЖ1",
-            key="search_marka",
-            help="Точное совпадение 2-го блока шифра (марки). "
-                 "КЖ1 не найдёт КЖ11 или КЖ10. "
-                 "Работает вместе с маской (AND).",
-        )
-
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            sel_status = st.multiselect(
-                "Статус замечания", STATUSES,
-                placeholder="Все статусы", key="search_status")
-        with c5:
+        with c_a2:
             sel_author = st.multiselect(
                 "Автор", author_options,
                 placeholder="Все авторы", key="search_author")
-        with c6:
+        with c_a3:
             sel_category = st.multiselect(
                 "Категория", CATEGORIES,
                 placeholder="Все категории", key="search_category")
 
-        c7, c8, c9 = st.columns(3)
-        with c7:
-            sel_sheet_groups = st.multiselect(
-                "Статус листа", SHEET_GROUP_OPTIONS,
-                placeholder="Все статусы листов",
-                key="search_sheet_group")
-
-        c10, c11 = st.columns([1, 1])
-        with c10:
+        c_b1, c_b2 = st.columns(2)
+        with c_b1:
             limit = st.number_input(
                 "Лимит результатов", min_value=100, max_value=10000,
                 value=2000, step=100, key="search_limit",
                 help="Максимум строк, которые будут загружены для отображения",
             )
-        with c11:
-            # Показывать ли пустой поиск (без запроса)
+        with c_b2:
             show_all = st.checkbox(
                 "Показывать всё без запроса", value=False,
                 key="search_show_all",
-                help="Если выключено, результаты появятся только после ввода запроса",
+                help="Если выключено, результаты появятся только после "
+                     "ввода запроса",
             )
+        return {
+            "complex_mask": complex_mask or "",
+            "author": tuple(sel_author),
+            "category": tuple(sel_category),
+            "limit": int(limit),
+            "show_all": bool(show_all),
+        }
+
+    # Поиск ищет также по «Закрыто» и «Аннулировано» — поэтому расширенный
+    # список статусов замечаний вместо стандартных пяти.
+    flt = render_standard_filters(
+        key_prefix="search_",
+        expander_label="🎛 Фильтры",
+        remark_status_options=tuple(STATUSES),
+        extra_row=_search_extra_row,
+    )
+
+    sel_disc = flt["disc"]
+    sel_section = flt["section"]
+    sel_kit = flt["kits"]
+    sel_marka = flt["marka"]
+    sel_status = flt["remark_statuses"]
+    sel_sheet_groups = flt["sheet_groups"]
+    complex_mask = flt["extra"].get("complex_mask", "")
+    sel_author = list(flt["extra"].get("author", ()))
+    sel_category = list(flt["extra"].get("category", ()))
+    limit = flt["extra"].get("limit", 2000)
+    show_all = flt["extra"].get("show_all", False)
 
     # --- Условия запуска поиска ---
     if not query.strip() and not show_all:
@@ -382,6 +283,10 @@ def render():
             sheet_groups=tuple(sel_sheet_groups) if sel_sheet_groups else (),
             limit=int(limit),
         )
+
+    # Фильтр по расположению (4-й блок шифра) — в Python после SQL
+    if flt["block_codes"] and not df.empty:
+        df = _filter_by_blocks(df, flt["block_codes"])
 
     if df.empty:
         st.warning(f"Ничего не найдено по запросу «{query}» с текущими фильтрами.")

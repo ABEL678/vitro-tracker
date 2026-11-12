@@ -1,0 +1,1298 @@
+diff --git a/vitro/ui/dynamics.py b/b/vitro/ui/dynamics.py
+index d038bab..53228b1
+--- a/vitro/ui/dynamics.py
++++ b/vitro/ui/dynamics.py
+@@ -1,24 +1,25 @@
+ # vitro/ui/dynamics.py
+ """
+-📈 Динамика — объём выдачи, выполнение плана и соблюдение сроков.
++📈 Динамика — объём выдачи, выполнение плана и потоки замечаний.
+ 
+-Инструмент РП и Директора: сколько выдаётся, отвечаем, закрывается
+-и какой процент ответов уложился в SLA (10 рабочих дней).
++Инструмент РП и Директора: сколько выдаётся, выполняется,
++закрывается и как соотносится план выдачи с фактом.
+ Фильтры: дисциплина → раздел → расположение → комплект → марка
+ (через render_standard_filters).
+ Период: пресеты (1 неделя / 1 месяц / …) + календарь.
+ 
+ Блоки вкладки:
+-  1. «Прогресс за прошедшую неделю» — метрики за 7 дней (выдано
+-     замечаний, выполнено, закрыто заказчиком, выгружено
+-     комплектов и листов) + прогресс-бары «доля недели от общего
+-     объёма за всё время».
++  1. «Прогресс за прошедшую неделю» — 7 плиток за последние
++     7 дней: выдано замечаний, выполнено, закрыто заказчиком,
++     выгружено комплектов и листов, листов со статусом B,
++     листов со статусом A.
+      «Выгружено комплектов» — только комплекты, ПОЯВИВШИЕСЯ в
+      Витро впервые за период (минимальная дата статуса их листов
+      в периоде); повторные изменения статуса уже загруженных
+      комплектов счётчик не увеличивают.
+   2. «Общий объём за период» — замечания + впервые выгруженные
+-     комплекты / уникальные листы за выбранный период.
++     комплекты / уникальные листы за выбранный период + листы
++     со статусами B и A за период.
+   3. «Выполнение плана» — бублики против Ведомости комплектов
+      (plan_drawings / plan_kits): комплекты, листы + два бублика
+      по замечаниям за период («Выполнено / Осталось» и
+@@ -26,9 +27,6 @@
+      «Выполнено» — уникальные листы и комплекты в Витро по
+      sheets.unique_vitro_sheets — ЕДИНОМУ стандарту «Плана
+      выдачи», поэтому цифры совпадают (11 312 / 424).
+-  4. «Соблюдение сроков» (SLA) + сворачиваемые «Детали»:
+-     топ-5 проблемных комплектов и разрез по дисциплинам
+-     скрыты в st.expander, чтобы не отвлекали.
+ 
+ Все запросы к БД идут через @versioned_cache — кэш, инвалидируемый
+ по версии данных (последняя синхронизация), без st.cache_data.clear().
+@@ -64,6 +62,33 @@
+   замечания. «Выполнено» в Динамике шире, чем «со статусом
+   Выполнено» в Сводке: там часть замечаний со статусом
+   «Выполнено» уходит в «К листам A» и «К аннулированным».
++
++Патч 17 (сходимость со Сводкой, цвета, листы A/B, чистка):
++  1. «Выполнено» считается только по листам, которые НЕ
++     утверждены и НЕ аннулированы (JOIN documents,
++     COALESCE(UPPER(TRIM(d.status)), '') NOT IN ('A',
++     'АННУЛИРОВАНО')) — так же, как в Сводке, где doc_status
++     нормализуется .strip().upper(). Раньше часть «Выполнено»
++     сидела на листах A и аннулированных и завышала цифру
++     (в Динамике 17 166, в Сводке меньше).
++  2. Цвета как в Сводке: «Выполнено» — зелёный #2ca02c,
++     «Закрыто заказчиком» — серый #9E9E9E (бублики замечаний
++     и линия накопительного графика). Прогресс-бары «доля
++     недели от общего объёма» и подписи «N% от X всего» убраны
++     — 7 плиток в один ряд. Новые плитки «Листов B» (🟡) и
++     «Листов A» (🟢) за последние 7 дней; те же метрики добавлены
++     в «Общий объём за период» (уникальные листы с последней
++     ревизией в периоде и статусом B/A; дедуп
++     sheets.unique_vitro_sheets — как у «Выгружено листов»).
++  3. Удалены блок «Соблюдение сроков» (SLA), график «Доля
++     ответов по скорости закрытия», спойлеры «топ-5 проблемных
++     комплектов» и «Детали: по дисциплинам» — вместе с мёртвым
++     кодом: _render_sla_compliance, _load_closed_with_sla,
++     _closing_bucket, _filter_sla_frame, _shift_month,
++     _sla_on_time_share, _sla_monthly_pct, _render_by_discipline,
++     загрузчики _load_*_by_discipline, _load_totals_all (её
++     единственным потребителем были убранные прогресс-бары)
++     и неиспользуемый BLOCK_OPTIONS.
+ """
+ 
+ from datetime import date, timedelta
+@@ -75,27 +100,14 @@ import streamlit as st
+ 
+ from vitro.sqlite_db import get_conn
+ from vitro._cache import versioned_cache
+-from vitro.disciplines import discipline_name
+ from vitro.sheets import is_valid_kit_code, unique_vitro_sheets
+ from vitro.sheets import _norm_complex as _norm_kit_code
+-from vitro.workdays import workdays_between
+ from vitro.ui._filters import render_standard_filters
+ 
+ 
+ # ---------------------------------------------------------------------------
+ #  Расположение (4-й блок шифра)
+ # ---------------------------------------------------------------------------
+-BLOCK_OPTIONS = {
+-    "Корпус 1":                    "1",
+-    "Корпус 2":                    "2",
+-    "Общие":                       "0",
+-    "Стилобат":                    "С",
+-    "Газовая котельная":           "ГК",
+-    "Генплан":                     "ГП",
+-    "Автомобильные дороги (УДС)":  "А",
+-}
+-
+-
+ def _extract_4th_block(complex_code) -> str:
+     if not complex_code:
+         return ""
+@@ -120,11 +132,19 @@ def _load_weekly_stats(date_from: date, date_to: date) -> dict:
+     Ключи словаря:
+       issued      — выдано замечаний (comments.created);
+       our_answers — выполнено (comments.fix_date, статус
+-                    «Выполнено»; заказчик ещё не закрыл);
++                    «Выполнено» на листах, которые не A и не
++                    аннулированы; заказчик ещё не закрыл);
+       cust_closed — закрыто заказчиком (comments.fix_date, «Закрыто»);
+       kits        — комплекты, ПОЯВИВШИЕСЯ в Витро ВПЕРВЫЕ за период;
+       sheets      — уникальные листы, чья последняя ревизия
+-                    датирована периодом.
++                    датирована периодом;
++      sheets_b    — из них листы со статусом B (к сдаче);
++      sheets_a    — из них листы со статусом A (утверждён).
++
++    Патч 17: our_answers исключает замечания к листам A и
++    аннулированным (как в Сводке); sheets_b/sheets_a — тот же
++    дедуп unique_vitro_sheets, что у sheets, с нормализацией
++    статуса .strip().upper().
+ 
+     Патч 14:
+       * «Выгружено комплектов» — только комплекты, у которых
+@@ -148,11 +168,14 @@ def _load_weekly_stats(date_from: date, date_to: date) -> dict:
+                                   THEN 1 ELSE 0 END), 0) AS issued,
+                 COALESCE(SUM(CASE WHEN c.fix_date >= ? AND c.fix_date < ?
+                                    AND c.status = 'Выполнено'
++                                   AND COALESCE(UPPER(TRIM(d.status)), '')
++                                       NOT IN ('A', 'АННУЛИРОВАНО')
+                                   THEN 1 ELSE 0 END), 0) AS our_answers,
+                 COALESCE(SUM(CASE WHEN c.fix_date >= ? AND c.fix_date < ?
+                                    AND c.status = 'Закрыто'
+                                   THEN 1 ELSE 0 END), 0) AS cust_closed
+             FROM comments c
++            JOIN documents d ON c.doc_id = d.id
+         """, (lo, to_exclusive) * 3).fetchone()
+ 
+     # --- documents: единый стандарт «Плана выдачи» (без SQL COUNT) ---
+@@ -168,11 +191,18 @@ def _load_weekly_stats(date_from: date, date_to: date) -> dict:
+         kits = int(((first >= lo) & (first < to_exclusive)).sum())
+ 
+     # уникальные листы с датой последней ревизии в периоде:
+-    sheets = 0
++    sheets = sheets_b = sheets_a = 0
+     for r in unique_vitro_sheets(df.to_dict("records")):
+         day = str(r.get("status_date") or "")[:10]
+-        if day and lo <= day < to_exclusive:
+-            sheets += 1
++        if not (day and lo <= day < to_exclusive):
++            continue
++        sheets += 1
++        # Патч 17: разбивка по статусам — нормализация как в Сводке
++        sheet_status = str(r.get("status") or "").strip().upper()
++        if sheet_status == "B":
++            sheets_b += 1
++        elif sheet_status == "A":
++            sheets_a += 1
+ 
+     return {
+         "issued":      int(row["issued"] or 0),
+@@ -180,73 +210,40 @@ def _load_weekly_stats(date_from: date, date_to: date) -> dict:
+         "cust_closed": int(row["cust_closed"] or 0),
+         "kits":        kits,
+         "sheets":      sheets,
+-    }
+-
+-
+-@versioned_cache(ttl=600)
+-def _load_totals_all() -> dict:
+-    """Общий объём за всё время — база для долей в «Прогрессе недели».
+-
+-    sheets/kits — единый стандарт «Плана выдачи»
+-    (sheets.unique_vitro_sheets): листы = «Листов в Витро»,
+-    комплекты = валидные комплекты в Витро.
+-    """
+-    with get_conn() as conn:
+-        row = conn.execute("""
+-            SELECT COUNT(*) AS issued,
+-                   COALESCE(SUM(CASE WHEN c.fix_date IS NOT NULL
+-                                      AND c.fix_date <> ''
+-                                      AND c.status = 'Выполнено'
+-                                     THEN 1 ELSE 0 END), 0)
+-                       AS our_answers,
+-                   COALESCE(SUM(CASE WHEN c.fix_date IS NOT NULL
+-                                      AND c.fix_date <> ''
+-                                      AND c.status = 'Закрыто'
+-                                     THEN 1 ELSE 0 END), 0)
+-                       AS cust_closed
+-            FROM comments c
+-        """).fetchone()
+-
+-    uniq = _load_unique_documents()
+-    return {
+-        "issued":      int(row["issued"] or 0),
+-        "our_answers": int(row["our_answers"] or 0),
+-        "cust_closed": int(row["cust_closed"] or 0),
+-        "kits":        int(uniq["complex"].nunique()) if not uniq.empty else 0,
+-        "sheets":      int(len(uniq)) if not uniq.empty else 0,
++        "sheets_b":    sheets_b,
++        "sheets_a":    sheets_a,
+     }
+ 
+ 
+ def _render_weekly_progress():
+     """Блок «Прогресс за прошедшую неделю» — в самом верху вкладки.
+ 
+-    Метрики + прогресс-бары: сколько за неделю сделано от общего
+-    объёма за всё время (в %) — патч 14.
++    Патч 17: 7 плиток в один ряд; прогресс-бары «доля недели от
++    общего объёма за всё время» и подписи «N% от X всего» убраны.
++    Добавлены плитки «Листов B» и «Листов A» (последняя ревизия
++    листа датирована последними 7 днями).
+     """
+     st.markdown("### 🗓 Прогресс за прошедшую неделю")
+-    st.caption(
+-        "Статистика по всему проекту за последние 7 дней. "
+-        "Полосы под метриками — доля недели от общего объёма "
+-        "за всё время (%)."
+-    )
++    st.caption("Статистика по всему проекту за последние 7 дней.")
+ 
+     today = date.today()
+     stats = _load_weekly_stats(today - timedelta(days=7), today)
+-    totals = _load_totals_all()
+ 
+-    c1, c2, c3, c4, c5 = st.columns(5)
++    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+     c1.metric(
+         "📤 Выдано замечаний", _fmt(stats["issued"]),
+         help="Замечания заказчика, созданные за последние 7 дней.",
+     )
+     c2.metric(
+-        "🟠 Выполнено", _fmt(stats["our_answers"]),
++        "🟢 Выполнено", _fmt(stats["our_answers"]),
+         help="Замечания, которые АТП ТЛП выполнил и направил "
+              "заказчику на согласование (статус «Выполнено») "
+-             "за последние 7 дней. Заказчик их ещё не закрыл.",
++             "за последние 7 дней. Заказчик их ещё не закрыл. "
++             "Замечания к утверждённым (A) и аннулированным листам "
++             "не считаются.",
+     )
+     c3.metric(
+-        "🟢 Закрыто заказчиком", _fmt(stats["cust_closed"]),
++        "⚪ Закрыто заказчиком", _fmt(stats["cust_closed"]),
+         help="Замечания, формально закрытые заказчиком "
+              "за последние 7 дней.",
+     )
+@@ -262,21 +259,16 @@ def _render_weekly_progress():
+         help="Уникальные листы РД (последняя ревизия, дедуп как в "
+              "«Плане выдачи»), датированные последними 7 днями.",
+     )
+-
+-    bars = [
+-        (c1, stats["issued"], totals["issued"]),
+-        (c2, stats["our_answers"], totals["our_answers"]),
+-        (c3, stats["cust_closed"], totals["cust_closed"]),
+-        (c4, stats["kits"], totals["kits"]),
+-        (c5, stats["sheets"], totals["sheets"]),
+-    ]
+-    for col, done, total in bars:
+-        frac = (done / total) if total else 0.0
+-        try:
+-            col.progress(min(max(frac, 0.0), 1.0))
+-        except Exception:
+-            pass
+-        col.caption(f"{frac:.1%} от {_fmt(total)} всего")
++    c6.metric(
++        "🟡 Листов B", _fmt(stats["sheets_b"]),
++        help="Из «Выгружено листов»: листы, чья последняя ревизия "
++             "за последние 7 дней имеет статус B (к сдаче).",
++    )
++    c7.metric(
++        "🟢 Листов A", _fmt(stats["sheets_a"]),
++        help="Из «Выгружено листов»: листы, чья последняя ревизия "
++             "за последние 7 дней имеет статус A (утверждён).",
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -358,6 +350,14 @@ def _load_our_answers_stats(disciplines: tuple, sections: tuple,
+                               kits: tuple, block_codes: tuple,
+                               date_from: date, date_to: date,
+                               marka: str = "") -> pd.DataFrame:
++    """Помесячно «Выполнено» (fix_date) с учётом фильтров.
++
++    Патч 17: исключены замечания к листам A и аннулированным —
++    как в Сводке, где doc_status нормализуется .strip().upper()
++    (COALESCE(UPPER(TRIM(d.status)), '') NOT IN ('A',
++    'АННУЛИРОВАНО')). «Выполнено» в KPI сходится с «со статусом
++    Выполнено» в Сводке («Замечания на стороне Заказчика»).
++    """
+     where, params = _build_filter_sql(
+         disciplines, sections, kits, block_codes,
+         date_from, date_to, "c.fix_date", marka=marka)
+@@ -367,6 +367,8 @@ def _load_our_answers_stats(disciplines: tuple, sections: tuple,
+         JOIN documents d ON c.doc_id = d.id
+         WHERE c.fix_date IS NOT NULL AND c.fix_date <> ''
+           AND c.status = 'Выполнено'
++          AND COALESCE(UPPER(TRIM(d.status)), '')
++              NOT IN ('A', 'АННУЛИРОВАНО')
+           {where}
+         GROUP BY ym ORDER BY ym
+     """
+@@ -414,17 +416,22 @@ def _load_doc_volume(disciplines: tuple, sections: tuple,
+         по дате последней ревизии. Учитывает каскадные фильтры.
+         Листы без даты статуса в период не попадают
+         (их невозможно датировать).
++
++    Патч 17: добавлены sheets_b / sheets_a — из них листы со
++    статусом B (к сдаче) и A (утверждён): уникальные листы,
++    чья последняя ревизия датирована периодом (тот же дедуп
++    unique_vitro_sheets, нормализация статуса .strip().upper()).
+     """
+     df = _load_document_rows()
+     df = _filter_doc_frame(df, disciplines, sections, kits, block_codes)
+     if df.empty:
+-        return {"kits": 0, "sheets": 0}
++        return {"kits": 0, "sheets": 0, "sheets_b": 0, "sheets_a": 0}
+ 
+     lo = date_from.isoformat() if date_from else ""
+     hi = date_to.isoformat() if date_to else ""
+ 
+     # --- листы: уникальные (последняя ревизия), датированные периодом
+-    sheets = 0
++    sheets = sheets_b = sheets_a = 0
+     for r in unique_vitro_sheets(df.to_dict("records")):
+         day = str(r.get("status_date") or "")[:10]
+         if not day:
+@@ -434,6 +441,12 @@ def _load_doc_volume(disciplines: tuple, sections: tuple,
+         if hi and day > hi:
+             continue
+         sheets += 1
++        # Патч 17: разбивка по статусам — нормализация как в Сводке
++        sheet_status = str(r.get("status") or "").strip().upper()
++        if sheet_status == "B":
++            sheets_b += 1
++        elif sheet_status == "A":
++            sheets_a += 1
+ 
+     # --- комплекты: впервые появившиеся в Витро в периоде
+     dated = df[(df["status_day"] != "")
+@@ -447,78 +460,8 @@ def _load_doc_volume(disciplines: tuple, sections: tuple,
+             in_period = in_period & (first >= lo)
+         kits = int(in_period.sum())
+ 
+-    return {"kits": kits, "sheets": sheets}
+-
+-
+-# ---------------------------------------------------------------------------
+-#  По дисциплинам
+-# ---------------------------------------------------------------------------
+-@st.cache_data(ttl=3600, show_spinner=False)
+-def _load_issue_by_discipline(disciplines: tuple, sections: tuple,
+-                                kits: tuple, block_codes: tuple,
+-                                date_from: date, date_to: date,
+-                                marka: str = "") -> pd.DataFrame:
+-    where, params = _build_filter_sql(
+-        disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.created", marka=marka)
+-    q = f"""
+-        SELECT substr(c.created, 1, 7) AS ym,
+-               d.discipline AS discipline, COUNT(*) AS n
+-        FROM comments c
+-        JOIN documents d ON c.doc_id = d.id
+-        WHERE c.created IS NOT NULL AND c.created <> ''
+-          AND d.discipline IS NOT NULL
+-          {where}
+-        GROUP BY ym, d.discipline ORDER BY ym, d.discipline
+-    """
+-    with get_conn() as conn:
+-        return pd.read_sql(q, conn, params=params)
+-
+-
+-@st.cache_data(ttl=3600, show_spinner=False)
+-def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
+-                                      kits: tuple, block_codes: tuple,
+-                                      date_from: date, date_to: date,
+-                                      marka: str = "") -> pd.DataFrame:
+-    where, params = _build_filter_sql(
+-        disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.fix_date", marka=marka)
+-    q = f"""
+-        SELECT substr(c.fix_date, 1, 7) AS ym,
+-               d.discipline AS discipline, COUNT(*) AS n
+-        FROM comments c
+-        JOIN documents d ON c.doc_id = d.id
+-        WHERE c.fix_date IS NOT NULL AND c.fix_date <> ''
+-          AND c.status = 'Выполнено'
+-          AND d.discipline IS NOT NULL
+-          {where}
+-        GROUP BY ym, d.discipline ORDER BY ym, d.discipline
+-    """
+-    with get_conn() as conn:
+-        return pd.read_sql(q, conn, params=params)
+-
+-
+-@st.cache_data(ttl=3600, show_spinner=False)
+-def _load_customer_closed_by_discipline(disciplines: tuple, sections: tuple,
+-                                          kits: tuple, block_codes: tuple,
+-                                          date_from: date, date_to: date,
+-                                          marka: str = "") -> pd.DataFrame:
+-    where, params = _build_filter_sql(
+-        disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.fix_date", marka=marka)
+-    q = f"""
+-        SELECT substr(c.fix_date, 1, 7) AS ym,
+-               d.discipline AS discipline, COUNT(*) AS n
+-        FROM comments c
+-        JOIN documents d ON c.doc_id = d.id
+-        WHERE c.fix_date IS NOT NULL AND c.fix_date <> ''
+-          AND c.status = 'Закрыто'
+-          AND d.discipline IS NOT NULL
+-          {where}
+-        GROUP BY ym, d.discipline ORDER BY ym, d.discipline
+-    """
+-    with get_conn() as conn:
+-        return pd.read_sql(q, conn, params=params)
++    return {"kits": kits, "sheets": sheets,
++            "sheets_b": sheets_b, "sheets_a": sheets_a}
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -540,6 +483,9 @@ def _render_kpi(issue: pd.DataFrame,
+     датами. Патч 15 добавляет подпись с ФАКТИЧЕСКИМ периодом — чтобы
+     расхождение «пресет vs цифры» было видно сразу (раньше радио
+     показывало «Всё время», а запросы шли за 12 месяцев).
++
++    Патч 17: добавлены «Листов со статусом B» и «Листов со статусом
++    A» за выбранный период (doc_volume: sheets_b / sheets_a).
+     """
+     total_issue = int(issue["n"].sum()) if not issue.empty else 0
+     total_our = int(our_answers["n"].sum()) if not our_answers.empty else 0
+@@ -571,7 +517,7 @@ def _render_kpi(issue: pd.DataFrame,
+         help="Сколько замечаний заказчик формально закрыл за период.",
+     )
+ 
+-    k1, k2 = st.columns(2)
++    k1, k2, k3, k4 = st.columns(4)
+     k1.metric(
+         "🏗 Выгружено комплектов", _fmt(doc_volume["kits"]),
+         help="Комплекты, ПОЯВИВШИЕСЯ в Витро впервые за выбранный "
+@@ -584,6 +530,18 @@ def _render_kpi(issue: pd.DataFrame,
+         help="Уникальные листы РД (последняя ревизия, дедуп как в "
+              "«Плане выдачи»), датированные выбранным периодом.",
+     )
++    k3.metric(
++        "🟡 Листов со статусом B", _fmt(doc_volume["sheets_b"]),
++        help="Из «Выгружено листов»: уникальные листы, чья последняя "
++             "ревизия датирована выбранным периодом и имеет статус "
++             "B (к сдаче).",
++    )
++    k4.metric(
++        "🟢 Листов со статусом A", _fmt(doc_volume["sheets_a"]),
++        help="Из «Выгружено листов»: уникальные листы, чья последняя "
++             "ревизия датирована выбранным периодом и имеет статус "
++             "A (утверждён).",
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -920,6 +878,9 @@ def _render_remark_donuts(remark_totals: dict | None):
+     «Выполнено / Осталось» и «Закрыто заказчиком / Осталось» —
+     от общего числа выданных за период замечаний, процент в центре.
+     Не зависят от Ведомости — рисуются даже если план не задан.
++
++    Патч 17: цвета как в Сводке — «Выполнено» зелёный #2ca02c,
++    «Закрыто заказчиком» серый #9E9E9E.
+     """
+     issued_total = int((remark_totals or {}).get("issued") or 0)
+     if issued_total <= 0:
+@@ -943,7 +904,7 @@ def _render_remark_donuts(remark_totals: dict | None):
+             our_total, issued_total,
+             done_label="Выполнено",
+             over_label="Сверх периода",
+-            done_color="#F9A825",
++            done_color="#2ca02c",
+         )
+         st.plotly_chart(fig, use_container_width=True,
+                         key="dyn_donut_our")
+@@ -970,7 +931,7 @@ def _render_remark_donuts(remark_totals: dict | None):
+             cust_total, issued_total,
+             done_label="Закрыто заказчиком",
+             over_label="Сверх периода",
+-            done_color="#2E7D32",
++            done_color="#9E9E9E",
+         )
+         st.plotly_chart(fig, use_container_width=True,
+                         key="dyn_donut_cust")
+@@ -1084,245 +1045,6 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
+     _render_remark_donuts(remark_totals)
+ 
+ 
+-# ---------------------------------------------------------------------------
+-#  Соблюдение сроков (SLA)
+-# ---------------------------------------------------------------------------
+-SLA_ON_TIME_DAYS = 10   # ≤10 р.д. — ответ дан в срок
+-SLA_LATE_DAYS = 30      # 10–30 р.д. — опоздание; >30 — критично
+-
+-SLA_MIN_MONTH_N = 5     # мин. закрытых за месяц, чтобы считать тренд
+-SLA_MIN_KIT_N = 3       # мин. закрытых по комплекту для топ-5
+-
+-SLA_BUCKET_ORDER = ["В срок", "Опоздание", "Критично"]
+-
+-SLA_BUCKET_COLORS = {
+-    "В срок":    "#2E7D32",   # зелёный
+-    "Опоздание": "#F9A825",   # жёлтый
+-    "Критично":  "#C62828",   # красный
+-}
+-
+-
+-def _closing_bucket(created_d, fix_d):
+-    """Бакет скорости нашего ответа по факту закрытия.
+-
+-    Пороги те же, что у our_bucket из _load_all_categorized
+-    (SLA 10 р.д.): ≤10 — «В срок», ≤30 — «Опоздание», >30 —
+-    «Критично» (бакеты 30–90 и >90 слиты).
+-    """
+-    if not created_d or not fix_d:
+-        return None
+-    wd = workdays_between(created_d, fix_d)
+-    if wd <= SLA_ON_TIME_DAYS:
+-        return "В срок"
+-    if wd <= SLA_LATE_DAYS:
+-        return "Опоздание"
+-    return "Критично"
+-
+-
+-@st.cache_data(ttl=3600, show_spinner=False)
+-def _load_closed_with_sla() -> pd.DataFrame:
+-    """Закрытые нами замечания («Выполнено») с бакетом скорости ответа.
+-
+-    База — единый источник _load_all_categorized() из deadlines.py
+-    (кэш 3600 c): новых запросов к БД вкладка не делает.
+-    """
+-    from vitro.ui.deadlines import _load_all_categorized as _src
+-    base = _src()
+-
+-    if base.empty:
+-        return pd.DataFrame(
+-            columns=["ym", "complex", "discipline", "section", "bucket"])
+-
+-    closed = base[
+-        (base["status"] == "Выполнено")
+-        & base["fix_date_d"].notna()
+-        & (base["holder"] != "annulled")
+-    ]
+-
+-    out = pd.DataFrame({
+-        "ym": closed["created_d"].map(
+-            lambda d: d.strftime("%Y-%m") if d else None),
+-        "complex": closed["complex"],
+-        "discipline": closed["discipline"],
+-        "section": closed["section"],
+-    })
+-    out["bucket"] = [
+-        _closing_bucket(c, f)
+-        for c, f in zip(closed["created_d"], closed["fix_date_d"])
+-    ]
+-    return out.dropna(subset=["ym"]).reset_index(drop=True)
+-
+-
+-def _filter_sla_frame(df: pd.DataFrame,
+-                      disc_t: tuple, sect_t: tuple,
+-                      kit_t: tuple, block_codes: tuple) -> pd.DataFrame:
+-    """Фильтры Дисциплина → Раздел → Комплект → Расположение (в pandas)."""
+-    out = df
+-    if out.empty:
+-        return out
+-    if disc_t:
+-        out = out[out["discipline"].isin(disc_t)]
+-    if sect_t:
+-        out = out[out["section"].isin(sect_t)]
+-    if kit_t:
+-        out = out[out["complex"].isin(kit_t)]
+-    if block_codes:
+-        blocks = out["complex"].apply(_extract_4th_block)
+-        out = out[blocks.isin(block_codes)]
+-    return out
+-
+-
+-def _shift_month(d: date, k: int) -> date:
+-    """Первый день месяца со сдвигом k месяцев от месяца даты d."""
+-    y = d.year + (d.month - 1 + k) // 12
+-    m = (d.month - 1 + k) % 12 + 1
+-    return date(y, m, 1)
+-
+-
+-def _sla_on_time_share(df: pd.DataFrame):
+-    """Доля «В срок» среди закрытых замечаний (или None)."""
+-    if df.empty:
+-        return None
+-    return float((df["bucket"] == "В срок").mean())
+-
+-
+-def _sla_monthly_pct(df: pd.DataFrame) -> pd.DataFrame:
+-    """Доля «В срок» и число закрытых по месяцам выдачи."""
+-    g = (df.groupby("ym")
+-           .agg(n=("bucket", "size"),
+-                ontime=("bucket", lambda b: int((b == "В срок").sum())))
+-           .sort_index())
+-    g["pct"] = g["ontime"] / g["n"]
+-    return g
+-
+-
+-def _render_sla_compliance(disc_t: tuple, sect_t: tuple,
+-                           kit_t: tuple, block_codes: tuple,
+-                           date_from: date, date_to: date):
+-    """Блок «Соблюдение сроков»: главный показатель + тренд,
+-    100%-столбцы по месяцам выдачи и топ-5 проблемных комплектов."""
+-    st.markdown("### ⏱ Соблюдение сроков")
+-    st.caption(
+-        "«В срок» — ответ за ≤10 р.д., «Опоздание» — 10–30 р.д., "
+-        "«Критично» — >30 р.д. Учитываются замечания, по которым "
+-        "АТП ТЛП уже дал ответ (статус «Выполнено»)."
+-    )
+-
+-    base = _load_closed_with_sla()
+-    sdf = _filter_sla_frame(base, disc_t, sect_t, kit_t, block_codes)
+-
+-    if sdf.empty:
+-        st.info("Нет закрытых замечаний с учётом фильтров.")
+-        return
+-
+-    today = date.today()
+-    ym_3m = _shift_month(today, -2).strftime("%Y-%m")
+-    recent = sdf[sdf["ym"] >= ym_3m]
+-
+-    # ===== 1. Главный показатель + тренд =====
+-    pct3 = _sla_on_time_share(recent)
+-
+-    delta = None
+-    monthly = _sla_monthly_pct(sdf)
+-    solid = monthly[monthly["n"] >= SLA_MIN_MONTH_N]
+-    if len(solid) >= 2:
+-        delta = (solid["pct"].iloc[-1] - solid["pct"].iloc[-2]) * 100
+-
+-    st.metric(
+-        "Закрыто в срок (≤10 р.д.) за последние 3 месяца",
+-        f"{pct3:.0%}" if pct3 is not None else "—",
+-        delta=round(delta, 1) if delta is not None else None,
+-        help="Среди замечаний, выданных за последние 3 месяца "
+-             "и уже закрытых («Выполнено»). Тренд — изменение доли "
+-             "«в срок» в процентных пунктах к предыдущему месяцу "
+-             f"(месяцы с ≥{SLA_MIN_MONTH_N} закрытыми замечаниями).",
+-    )
+-
+-    # ===== 2. Столбцы с накоплением по месяцам (100%) =====
+-    st.markdown("#### Доля ответов по скорости закрытия")
+-    st.caption("По месяцу выдачи замечания, 0–100%.")
+-
+-    win = sdf[(sdf["ym"] >= date_from.strftime("%Y-%m"))
+-              & (sdf["ym"] <= date_to.strftime("%Y-%m"))]
+-    if win.empty:
+-        st.info("Нет закрытых замечаний за выбранный период.")
+-    else:
+-        counts = (win.groupby(["ym", "bucket"]).size()
+-                  .unstack(fill_value=0)
+-                  .reindex(columns=SLA_BUCKET_ORDER, fill_value=0))
+-        shares = counts.div(counts.sum(axis=1), axis=0)
+-
+-        plot_df = shares.reset_index().melt(
+-            id_vars="ym", var_name="Скорость ответа",
+-            value_name="share")
+-        plot_df = plot_df[plot_df["share"] > 0]
+-
+-        fig = px.bar(
+-            plot_df, x="ym", y="share", color="Скорость ответа",
+-            barmode="stack", text_auto=".0%",
+-            category_orders={"Скорость ответа": SLA_BUCKET_ORDER},
+-            color_discrete_map=SLA_BUCKET_COLORS,
+-            labels={"ym": "Месяц выдачи замечания",
+-                    "share": "Доля закрытых"},
+-        )
+-        fig.update_layout(
+-            height=450,
+-            xaxis_tickangle=-45,
+-            yaxis_tickformat=".0%",
+-            legend=dict(
+-                orientation="h", yanchor="bottom", y=1.02,
+-                xanchor="right", x=1,
+-            ),
+-        )
+-        st.plotly_chart(fig, use_container_width=True,
+-                        key="dyn_sla_monthly")
+-
+-    # ===== 3. Топ-5 проблемных комплектов (Детали, патч 14) =====
+-    # Неинформативен на основном экране (показывает в основном
+-    # комплекты со 100% критичных) — спрятан в сворачиваемый expander.
+-    with st.expander("🚩 Детали: топ-5 проблемных комплектов",
+-                     expanded=False):
+-        st.caption(
+-            "Наибольшая доля ответов позже 30 р.д. среди закрытых "
+-            f"за последние 3 месяца (от {SLA_MIN_KIT_N} закрытых)."
+-        )
+-
+-        if recent.empty:
+-            st.info("Нет закрытых замечаний за последние 3 месяца.")
+-            return
+-
+-        kits_df = recent.copy()
+-        kits_df["complex"] = kits_df["complex"].fillna("(без комплекта)")
+-        kit_stats = (kits_df.groupby("complex")
+-                     .agg(total=("bucket", "size"),
+-                          late=("bucket",
+-                                lambda b: int((b == "Критично").sum()))))
+-        kit_stats = kit_stats[kit_stats["total"] >= SLA_MIN_KIT_N]
+-        if kit_stats.empty:
+-            st.info("Недостаточно данных: нет комплектов с "
+-                    f"{SLA_MIN_KIT_N}+ закрытыми замечаниями за 3 месяца.")
+-            return
+-
+-        kit_stats["share_late"] = kit_stats["late"] / kit_stats["total"]
+-        kit_stats = (kit_stats.sort_values(["share_late", "total"],
+-                                           ascending=False)
+-                     .head(5).reset_index())
+-
+-        st.dataframe(
+-            kit_stats,
+-            column_config={
+-                "complex": st.column_config.TextColumn("Комплект"),
+-                "total": st.column_config.NumberColumn("Закрыто"),
+-                "late": st.column_config.NumberColumn("Критично (>30 р.д.)"),
+-                "share_late": st.column_config.ProgressColumn(
+-                    "Доля критичных", min_value=0.0, max_value=1.0,
+-                    format="percent"),
+-            },
+-            hide_index=True,
+-            use_container_width=True,
+-        )
+-
+-
+ # ---------------------------------------------------------------------------
+ #  Накопительно
+ # ---------------------------------------------------------------------------
+@@ -1362,15 +1084,15 @@ def _render_cumulative(issue: pd.DataFrame,
+     if "Выполнено" in merged.columns:
+         fig.add_trace(go.Scatter(
+             x=merged["ym"], y=merged["Выполнено"],
+-            mode="lines", name="🟠 Выполнено",
+-            line=dict(color="#F9A825", width=3),
++            mode="lines", name="🟢 Выполнено",
++            line=dict(color="#2ca02c", width=3),
+         ))
+ 
+     if "Закрыто заказчиком" in merged.columns:
+         fig.add_trace(go.Scatter(
+             x=merged["ym"], y=merged["Закрыто заказчиком"],
+-            mode="lines", name="🟢 Закрыто заказчиком",
+-            line=dict(color="#2E7D32", width=3),
++            mode="lines", name="⚪ Закрыто заказчиком",
++            line=dict(color="#9E9E9E", width=3),
+         ))
+ 
+     fig.update_layout(
+@@ -1388,83 +1110,6 @@ def _render_cumulative(issue: pd.DataFrame,
+     st.plotly_chart(fig, use_container_width=True)
+ 
+ 
+-# ---------------------------------------------------------------------------
+-#  По дисциплинам
+-# ---------------------------------------------------------------------------
+-def _render_by_discipline(disciplines: tuple, sections: tuple,
+-                            kits: tuple, block_codes: tuple,
+-                            date_from: date, date_to: date,
+-                            marka: str = ""):
+-    """Разрез по дисциплинам — «Детали» (патч 14).
+-
+-    Перегруженный (9 цветов, стек по месяцам) и не отвечает на вопрос
+-    «Успеваем ли мы?» — на основном экране не нужен: рендерится
+-    внутри сворачиваемого expander из render().
+-    """
+-    st.markdown("#### 🏷 По дисциплинам")
+-
+-    tab_issue, tab_our, tab_cust = st.tabs([
+-        "📤 Выдача", "🟠 Выполнено", "🟢 Закрыто заказчиком"
+-    ])
+-
+-    with tab_issue:
+-        df = _load_issue_by_discipline(
+-            disciplines, sections, kits, block_codes, date_from, date_to,
+-            marka=marka)
+-        if df.empty:
+-            st.info("Нет данных.")
+-        else:
+-            df["label"] = df["discipline"].apply(
+-                lambda c: f"{c} — {discipline_name(c)}")
+-            fig = px.bar(
+-                df, x="ym", y="n", color="label",
+-                barmode="stack",
+-                labels={"ym": "Месяц", "n": "Выдано",
+-                        "label": "Дисциплина"},
+-            )
+-            fig.update_layout(height=500, xaxis_tickangle=-45,
+-                                legend_title_text="")
+-            st.plotly_chart(fig, use_container_width=True)
+-
+-    with tab_our:
+-        df = _load_our_answers_by_discipline(
+-            disciplines, sections, kits, block_codes, date_from, date_to,
+-            marka=marka)
+-        if df.empty:
+-            st.info("Нет данных.")
+-        else:
+-            df["label"] = df["discipline"].apply(
+-                lambda c: f"{c} — {discipline_name(c)}")
+-            fig = px.bar(
+-                df, x="ym", y="n", color="label",
+-                barmode="stack",
+-                labels={"ym": "Месяц", "n": "Выполнено",
+-                        "label": "Дисциплина"},
+-            )
+-            fig.update_layout(height=500, xaxis_tickangle=-45,
+-                                legend_title_text="")
+-            st.plotly_chart(fig, use_container_width=True)
+-
+-    with tab_cust:
+-        df = _load_customer_closed_by_discipline(
+-            disciplines, sections, kits, block_codes, date_from, date_to,
+-            marka=marka)
+-        if df.empty:
+-            st.info("Нет данных.")
+-        else:
+-            df["label"] = df["discipline"].apply(
+-                lambda c: f"{c} — {discipline_name(c)}")
+-            fig = px.bar(
+-                df, x="ym", y="n", color="label",
+-                barmode="stack",
+-                labels={"ym": "Месяц", "n": "Закрыто",
+-                        "label": "Дисциплина"},
+-            )
+-            fig.update_layout(height=500, xaxis_tickangle=-45,
+-                                legend_title_text="")
+-            st.plotly_chart(fig, use_container_width=True)
+-
+-
+ # ---------------------------------------------------------------------------
+ #  Фильтр периода
+ # ---------------------------------------------------------------------------
+@@ -1598,8 +1243,7 @@ def _render_period_filter() -> tuple[date, date]:
+ def render():
+     st.header("📈 Динамика")
+     st.caption(
+-        "Объём выдачи, выполнение плана, потоки замечаний "
+-        "и соблюдение сроков ответа."
++        "Объём выдачи, выполнение плана и потоки замечаний."
+     )
+ 
+     # ===== Прогресс за прошедшую неделю =====
+@@ -1652,19 +1296,4 @@ def render():
+ 
+     st.divider()
+ 
+-    _render_sla_compliance(disc_t, sect_t, kit_t, block_codes,
+-                           date_from, date_to)
+-
+-    st.divider()
+-
+     _render_cumulative(issue, our_answers, cust_closed)
+-
+-    st.divider()
+-
+-    # ===== Детали: по дисциплинам (патч 14) =====
+-    # Перегруженный разрез (9 цветов, стек по месяцам) спрятан в
+-    # сворачиваемый expander, чтобы не отвлекал от основного экрана.
+-    with st.expander("🏷 Детали: по дисциплинам", expanded=False):
+-        _render_by_discipline(
+-            disc_t, sect_t, kit_t, block_codes, date_from, date_to,
+-            marka=marka_t)
+\ No newline at end of file
+diff --git a/vitro/ui/plan.py b/b/vitro/ui/plan.py
+index b415505..dd3780d
+--- a/vitro/ui/plan.py
++++ b/vitro/ui/plan.py
+@@ -13,32 +13,38 @@
+     латинские двойники в шифрах).
+ 
+ Структура вкладки (сверху вниз):
+-  0. 📥 Вводные данные — импорт ведомостей Excel (свёрнут, без шаблонов).
+   1. Фильтры — единый стандарт (как в «Сводке по проекту»).
+   2. 📆 Период «с / по» — сразу под фильтрами; применяется к сводной
+      таблице (по «Сроку готовности» комплекта) и к детальному плану
+      по листам (по «Плановой дате» листа).
+   3. 🎯 Бублики — сразу после фильтров и периода, ДО таблиц
+      (патч 10): «Комплектов всего/план» и «Листов всего/план» по
+-     всему отфильтрованному отбору (без периода). «Листов всего» =
+-     max(листов по плану, УНИКАЛЬНЫХ листов в Витро) — листы
+-     комплектов без ведомостей не теряются; при превышении
+-     показывается «сверх плана».
++     всему отфильтрованному отбору (без периода). Патч 17: стиль
++     Сводки — слева бублик без легенды, справа список с маркерами
++     и числами; загруженные листы разбиты по статусам A/B/C/Другие.
++     «Листов всего» = max(листов по плану, УНИКАЛЬНЫХ листов в
++     Витро) — листы комплектов без ведомостей не теряются; при
++     превышении показывается «сверх плана».
+   4. 📋 «Сводный план готовности комплектов и количества выданных
+      листов» (патч 10 — переименована): группировка
+      «Дисциплина → Раздел» строками-заголовками (как в Сводке),
+-     внутри групп — комплекты; колонки: шифр, наименование, общий
+-     статус, листов в Витро, листов (план), срок готовности
+-     (редактируемый); внизу — строка «ИТОГО» с суммами.
++     внутри групп — комплекты; колонки: шифр, наименование,
++     дисциплина, раздел (патч 17), общий статус, листов в Витро,
++     листов (план), срок готовности (редактируемый); внизу — строка
++     «ИТОГО» с суммами.
+   5. 🗓 Детальный план по листам комплекта — позиции plan_drawings:
+      дисциплина, раздел, комплект, номер и ПОЛНЫЙ ШИФР листа (патч 12:
+      «Шифр листа» = шифр комплекта + номер, например
+      АТ-РД-СМИК-0-00-10), наименование, плановая дата, фактическая
+      дата (из Витро) и статус выдачи («Выдан» — есть фактическая
+      дата, «Планируется» — нет).
+-  6. 📥 Выгрузка в Excel — кнопка в самом низу: лист «Листы»
++  6. 📥 Выгрузка в Excel — кнопка: лист «Листы»
+      (таблица выше) + «Параметры выгрузки», с учётом фильтров
+      и выбранного периода.
++  7. 📥 Вводные данные — импорт ведомостей Excel (свёрнут),
++     «⚠️ Замечания последней загрузки» и «📜 Журнал загрузок» —
++     в самом низу вкладки (патч 17), чтобы не отодвигали рабочие
++     бублики и таблицы.
+ 
+ Импорт (с патча 12): шифры комплектов перед записью в plan_kits
+ нормализуются и валидируются (_kit_code_of); чекбокс «🔄 Заменить
+@@ -66,6 +72,19 @@ sheet_number — отдельные листы (пример СМИК: 44, а н
+   5. «📜 ЖУРНАЛ ЗАГРУЗОК»: последние события plan_import/plan_clear
+      из таблицы log (дата, строки, сообщение) — переживает F5.
+ 
++Патч 17 (компоновка и бублики как в Сводке):
++  1. «📥 Вводные данные», «⚠️ Замечания последней загрузки» и
++     «📜 Журнал загрузок» перенесены в самый низ вкладки.
++  2. Бублики «Комплектов и листов»: слева бублик, справа список
++     с маркерами и числами (как в Сводке). Загруженные листы
++     разбиты по статусам A/B/C/Другие — новый загрузчик
++     _vitro_sheet_status_counts на том же дедупе
++     sheets.unique_vitro_sheets, что и «Листов в Витро»:
++     A + B + C + Другие = «Листов в Витро» по отбору.
++  3. В «Сводный план готовности» добавлены колонки «Дисциплина»
++     и «Раздел» — значения видны в каждой строке; группировка
++     «Дисциплина → Раздел» строками-заголовками сохранена.
++
+ Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
+ """
+ 
+@@ -121,11 +140,22 @@ KIT_STATUS_COLORS = {
+     "Только в Витро":          "#1f77b4",
+ }
+ 
+-# Колонки сводной таблицы (требование ревизии: без «Дисциплина»/«Раздел» —
+-# они стали заголовками групп).
++# Цвета бублика «Листы» (патч 17): статусы A/B/C — как в Сводке
++# (summary.py SHEET_COLORS); «Другие» и «Осталось по плану» — служебные.
++SHEET_STATUS_COLORS = {
++    "Статус A — утверждён": "#2ca02c",
++    "Статус B — к сдаче":   "#ffdd57",
++    "Статус C — в работе":  "#ff7f0e",
++    "Другие статусы":       "#17becf",
++    "Осталось по плану":    "#9467bd",
++}
++
++# Колонки сводной таблицы. Патч 17: «Дисциплина» и «Раздел» возвращены
++# как обычные колонки (значение в каждой строке) — при этом остаются
++# и заголовками групп.
+ OVERVIEW_COLUMNS = [
+-    "Шифр комплекта", "Наименование комплекта", "Общий статус",
+-    "Листов в Витро", "Листов (план)", "Срок готовности",
++    "Шифр комплекта", "Наименование комплекта", "Дисциплина", "Раздел",
++    "Общий статус", "Листов в Витро", "Листов (план)", "Срок готовности",
+ ]
+ 
+ # Детальный план по листам комплекта — единственная детальная таблица
+@@ -183,6 +213,34 @@ def _vitro_sheet_counts() -> dict[str, int]:
+     return counts
+ 
+ 
++@versioned_cache(600)
++def _vitro_sheet_status_counts() -> dict[str, dict[str, int]]:
++    """{шифр комплекта: {"A": n, "B": n, "C": n, "other": n}} —
++    разбивка УНИКАЛЬНЫХ листов в Витро по статусам (патч 17).
++
++    Тот же дедуп sheets.unique_vitro_sheets, что и в
++    _vitro_sheet_counts, поэтому A + B + C + other по комплектам
++    отбора сходится с колонкой «Листов в Витро». Статус
++    нормализуется .strip().upper() — как в Сводке; «other» — все
++    не-A/B/C (И, на согласовании, готовится к загрузке,
++    аннулированные, прочие).
++    """
++    with get_conn() as conn:
++        rows = conn.execute("""
++            SELECT id, complex, sheet_number, status, status_date
++            FROM documents
++            WHERE complex IS NOT NULL
++        """).fetchall()
++    counts: dict[str, dict[str, int]] = {}
++    for r in unique_vitro_sheets([dict(x) for x in rows]):
++        code = str(r.get("complex") or "")
++        status_raw = str(r.get("status") or "").strip().upper()
++        bucket = status_raw if status_raw in ("A", "B", "C") else "other"
++        per = counts.setdefault(code, {"A": 0, "B": 0, "C": 0, "other": 0})
++        per[bucket] += 1
++    return counts
++
++
+ @versioned_cache(600)
+ def _vitro_kit_meta() -> dict[str, dict]:
+     """{шифр: {name, discipline, section}} — справочник комплектов Витро."""
+@@ -357,8 +415,9 @@ def _overview_to_grouped_display(df: pd.DataFrame
+         …
+         ИТОГО                             (суммы по всему отбору)
+ 
+-    Колонки — только OVERVIEW_COLUMNS («Дисциплина»/«Раздел» стали
+-    заголовками групп). Срок готовности — тип date (для DateColumn).
++    Колонки — OVERVIEW_COLUMNS (с патча 17 включают «Дисциплину» и
++    «Раздел»: они и заголовки групп, и значения в строках).
++    Срок готовности — тип date (для DateColumn).
+ 
+     Возвращает (display_df, valid_codes) — valid_codes нужен
+     _save_due_dates, чтобы служебные строки (📁… / ИТОГО) не попадали
+@@ -388,6 +447,8 @@ def _overview_to_grouped_display(df: pd.DataFrame
+             "Шифр комплекта":
+                 f"{_GROUP_MARK} {disc_label} · {sect_label}",
+             "Наименование комплекта": f"комплектов: {len(sub)}",
++            "Дисциплина": disc_label,
++            "Раздел": sect_label,
+             "Общий статус": "",
+             "Листов в Витро": int(sub["sheets_vitro"].astype(int).sum()),
+             "Листов (план)": int(sub["sheets_plan"].astype(int).sum()),
+@@ -400,6 +461,8 @@ def _overview_to_grouped_display(df: pd.DataFrame
+             out_rows.append({
+                 "Шифр комплекта": r["code"],
+                 "Наименование комплекта": r["name"] or "",
++                "Дисциплина": str(r["discipline"] or ""),
++                "Раздел": str(r["section"] or ""),
+                 "Общий статус": r["status"] or "",
+                 "Листов в Витро": int(r["sheets_vitro"]),
+                 "Листов (план)": int(r["sheets_plan"]),
+@@ -409,6 +472,8 @@ def _overview_to_grouped_display(df: pd.DataFrame
+     out_rows.append({
+         "Шифр комплекта": _TOTAL_MARK,
+         "Наименование комплекта": f"всего комплектов: {len(valid_codes)}",
++        "Дисциплина": "",
++        "Раздел": "",
+         "Общий статус": "",
+         "Листов в Витро": sum_vitro,
+         "Листов (план)": sum_plan,
+@@ -503,6 +568,8 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
+             "Шифр комплекта": st.column_config.TextColumn(width="medium"),
+             "Наименование комплекта": st.column_config.TextColumn(
+                 width="large"),
++            "Дисциплина": st.column_config.TextColumn(width="small"),
++            "Раздел": st.column_config.TextColumn(width="small"),
+             "Общий статус": st.column_config.TextColumn(width="small"),
+             "Листов в Витро": st.column_config.NumberColumn(width="small"),
+             "Листов (план)": st.column_config.NumberColumn(width="small"),
+@@ -515,7 +582,8 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
+             ),
+         },
+         disabled=[
+-            "Шифр комплекта", "Наименование комплекта", "Общий статус",
++            "Шифр комплекта", "Наименование комплекта",
++            "Дисциплина", "Раздел", "Общий статус",
+             "Листов в Витро", "Листов (план)",
+         ],
+         key="plan_overview_editor",
+@@ -751,8 +819,14 @@ def _plan_totals(overview_filtered: pd.DataFrame) -> dict:
+ #  Бублики
+ # ---------------------------------------------------------------------------
+ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
+-           key: str, center_total: str) -> None:
+-    """Бублик в стиле Сводки: без легенды, проценты внутри."""
++           key: str, center_total: str,
++           color_map: dict | None = None) -> None:
++    """Бублик в стиле Сводки: без легенды, проценты внутри.
++
++    Патч 17: легенда убрана — подписи сегментов даёт список
++    справа от бублика; цветовая карта задаётся параметром
++    color_map (по умолчанию — статусы комплектов).
++    """
+     if fig_data.empty or int(fig_data[values_col].sum()) == 0:
+         st.caption("Нет данных для диаграммы.")
+         return
+@@ -762,7 +836,7 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
+         values=values_col,
+         hole=0.45,
+         color=names_col,
+-        color_discrete_map=KIT_STATUS_COLORS,
++        color_discrete_map=color_map or KIT_STATUS_COLORS,
+     )
+     fig.update_traces(
+         textposition="inside",
+@@ -770,11 +844,9 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
+         textfont_size=11,
+     )
+     fig.update_layout(
+-        showlegend=True,
+-        legend=dict(orientation="h", yanchor="bottom", y=-0.15,
+-                    xanchor="center", x=0.5, font=dict(size=11)),
++        showlegend=False,
+         margin=dict(l=5, r=5, t=5, b=5),
+-        height=220,
++        height=200,
+         annotations=[dict(
+             text=center_total,
+             showarrow=False,
+@@ -785,13 +857,26 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
+     st.plotly_chart(fig, use_container_width=True, key=key)
+ 
+ 
++def _fmt_num(n) -> str:
++    """Число с пробелами-разделителями тысяч: 12 880."""
++    try:
++        return f"{int(n):,}".replace(",", " ")
++    except (TypeError, ValueError):
++        return str(n)
++
++
+ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
+     """Секция 3. Бублики «Комплектов всего/план» и «Листов всего/план»
+     — сразу после фильтров и периода, до таблиц (патч 10).
+ 
+-    Числа — из _plan_totals: по всему отфильтрованному отбору
+-    (без периода), включая комплекты «Только в Витро». «Листов всего»
+-    = max(план, УНИКАЛЬНЫХ листов в Витро) — см. патчи 09–10.
++    Патч 17: стиль Сводки — слева бублик без легенды, справа список
++    с маркерами и числами. Загруженные листы разбиты по статусам
++    A/B/C/Другие (_vitro_sheet_status_counts — тот же дедуп
++    sheets.unique_vitro_sheets, что и у «Листов в Витро», поэтому
++    A + B + C + Другие = «Листов в Витро» по отбору). Числа — из
++    _plan_totals: по всему отфильтрованному отбору (без периода),
++    включая комплекты «Только в Витро». «Листов всего» = max(план,
++    УНИКАЛЬНЫХ листов в Витро) — см. патчи 09–10.
+     """
+     st.markdown("##### 🎯 Комплектов и листов: всего / план")
+ 
+@@ -811,38 +896,102 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
+     ])
+     kits_data = kits_data[kits_data["Количество"] > 0]
+ 
+-    # ---- ЛИСТЫ: «всего» = max(план ведомостей, фактически в Витро) ----
+-    # Листы комплектов без ведомостей чертежей и превышения плана
+-    # (повторы, извещения) не теряются: при преимуществе Витро показываем
++    st.markdown("###### Комплекты")
++    k_left, k_right = st.columns([2, 3])
++    with k_left:
++        st.caption(f"Комплектов всего: **{n_total}**")
++        _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
++               center_total=f"{n_total}")
++    with k_right:
++        st.metric(
++            "🟢 Загружено в Витро", _fmt_num(n_loaded),
++            help="Комплекты, у которых есть хотя бы один лист в Витро "
++                 "(включая «Только в Витро» — отсутствующие в "
++                 "ведомостях).",
++        )
++        st.metric(
++            "🟣 План к загрузке", _fmt_num(n_plan),
++            help="Комплекты из ведомостей, которых ещё нет в Витро.",
++        )
++        st.caption(
++            f"Арифметика: {_fmt_num(n_loaded)} + {_fmt_num(n_plan)} = "
++            f"**{_fmt_num(n_total)}**."
++        )
++
++    # ---- ЛИСТЫ: разбивка загруженных по статусам A/B/C/Другие ----
++    # «всего» = max(план ведомостей, фактически в Витро): листы
++    # комплектов без ведомостей и превышения плана (повторы,
++    # извещения) не теряются — при преимуществе Витро показываем
+     # «сверх плана», при преимуществе плана — «осталось по плану».
++    n_a = n_b = n_c = n_other = 0
++    if not overview_filtered.empty:
++        status_counts = _vitro_sheet_status_counts()
++        for code in overview_filtered["code"]:
++            per = status_counts.get(code)
++            if per:
++                n_a += per["A"]
++                n_b += per["B"]
++                n_c += per["C"]
++                n_other += per["other"]
++
+     sheets_total = totals["sheets_total"]
+-    sheets_done = totals["sheets_done"]
++    sheets_vitro = totals["sheets_vitro"]
++    sheets_plan = totals["sheets_plan"]
+     sheets_remaining = totals["sheets_remaining"]
+     sheets_excess = totals["sheets_excess"]
+ 
+     sheets_data = pd.DataFrame([
+-        {"Группа": "Выдано (в Витро)", "Количество": sheets_done},
+-        {"Группа": "Осталось по плану", "Количество": sheets_remaining},
++        {"Группа": "Статус A — утверждён", "Количество": n_a},
++        {"Группа": "Статус B — к сдаче",   "Количество": n_b},
++        {"Группа": "Статус C — в работе",  "Количество": n_c},
++        {"Группа": "Другие статусы",       "Количество": n_other},
++        {"Группа": "Осталось по плану",    "Количество": sheets_remaining},
+     ])
+     sheets_data = sheets_data[sheets_data["Количество"] > 0]
+ 
+-    col1, col2 = st.columns(2)
+-    with col1:
+-        st.caption(
+-            f"Комплектов всего: **{n_total}** · "
+-            f"загружено **{n_loaded}** · план **{n_plan}**"
+-        )
+-        _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
+-               center_total=f"{n_total}")
+-    with col2:
++    st.markdown("###### Листы")
++    s_left, s_right = st.columns([2, 3])
++    with s_left:
+         cap = (f"Листов всего: **{sheets_total}** · "
+-               f"в Витро: **{totals['sheets_vitro']}** · "
+-               f"в плане: **{totals['sheets_plan']}**")
++               f"в Витро: **{sheets_vitro}** · "
++               f"в плане: **{sheets_plan}**")
+         if sheets_excess:
+             cap += f" · сверх плана: **{sheets_excess}**"
+         st.caption(cap)
+         _donut(sheets_data, "Группа", "Количество", "plan_pie_sheets",
+-               center_total=f"{sheets_total}")
++               center_total=f"{sheets_total}",
++               color_map=SHEET_STATUS_COLORS)
++    with s_right:
++        st.metric(
++            "🟢 Статус A — утверждён", _fmt_num(n_a),
++            help="Уникальные листы в Витро со статусом A "
++                 "(последняя ревизия, дедуп как в Сводке).",
++        )
++        st.metric(
++            "🟡 Статус B — к сдаче", _fmt_num(n_b),
++            help="Уникальные листы в Витро со статусом B.",
++        )
++        st.metric(
++            "🟠 Статус C — в работе", _fmt_num(n_c),
++            help="Уникальные листы в Витро со статусом C.",
++        )
++        st.metric(
++            "⚪ Другие статусы", _fmt_num(n_other),
++            help="Статус И, «на согласовании Заказчика», «готовится "
++                 "к загрузке», аннулированные и прочие листы в Витро.",
++        )
++        if sheets_remaining > 0:
++            st.metric(
++                "🟣 Осталось по плану", _fmt_num(sheets_remaining),
++                help="План ведомостей минус листы в Витро.",
++            )
++        elif sheets_excess > 0:
++            st.metric(
++                "➕ Сверх плана", _fmt_num(sheets_excess),
++                help="Листов в Витро больше планового количества "
++                     "(комплекты без ведомостей чертежей, повторы, "
++                     "извещения, приложения).",
++            )
+ 
+     if sheets_excess:
+         st.caption(
+@@ -1542,17 +1691,6 @@ def render():
+         "Данные плана общие для всех пользователей приложения."
+     )
+ 
+-    # ---- 0. Вводные данные ----
+-    _render_import_block()
+-
+-    # ---- Патч 13: замечания последней загрузки (переживают рераны) ----
+-    _render_last_warnings()
+-
+-    # ---- Патч 13: журнал загрузок (переживает F5, данные из БД) ----
+-    _render_import_log()
+-
+-    st.divider()
+-
+     # ---- 1. Фильтры (единый стандарт) ----
+     flt = _render_filters()
+ 
+@@ -1594,5 +1732,17 @@ def render():
+ 
+     st.divider()
+ 
+-    # ---- 6. Выгрузка в Excel — в самом низу (патч 10) ----
++    # ---- 6. Выгрузка в Excel ----
+     _render_export_button(sheets_table, period_label)
++
++    st.divider()
++
++    # ---- 7. Вводные данные + журнал загрузок — в самом низу (патч 17):
++    #         служебные блоки не отодвигают рабочие таблицы ----
++    _render_import_block()
++
++    # ---- Патч 13: замечания последней загрузки (переживают рераны) ----
++    _render_last_warnings()
++
++    # ---- Патч 13: журнал загрузок (переживает F5, данные из БД) ----
++    _render_import_log()

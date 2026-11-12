@@ -54,7 +54,14 @@ def _render_db_stats():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Комплектов", stats["complexes"])
-    c2.metric("Листов РД", f"{stats['documents']:,}".replace(",", " "))
+    c2.metric(
+        "Листов РД", f"{stats['sheets']:,}".replace(",", " "),
+        help="Уникальные листы — единый стандарт «Плана выдачи» "
+             "(патчи 11/14): ревизии и повторные выгрузки одного листа "
+             "считаются один раз, мусорные шифры отсекаются — число "
+             "совпадает с «Листов в Витро» в «Плане выдачи». "
+             f"Строк (файлов) в documents: {stats['documents']:,}".replace(",", " "),
+    )
     c3.metric("Замечаний", f"{stats['comments']:,}".replace(",", " "))
     c4.metric("С категорией", f"{stats['categorized']:,}".replace(",", " "))
     c5.metric("Снимков истории", stats["history_snapshots"])
@@ -94,7 +101,8 @@ def _run_sync():
 
             st.success(
                 f"✅ Синхронизация завершена\n\n"
-                f"- Листов: **{result['documents']:,}**\n"
+                f"- Файлов (строк documents): "
+                f"**{result['documents']:,}**\n".replace(",", " ") +
                 f"- Замечаний: **{result['comments']:,}**\n"
                 f"- Комплектов: **{result['complexes']:,}**\n"
                 f"- Время: **{result['elapsed']} сек**"
@@ -182,6 +190,8 @@ def _render_danger_zone():
         if st.button("Очистить журнал", key="btn_clear_log"):
             with get_conn() as conn:
                 conn.execute("DELETE FROM log")
+            # Аудит опасных операций
+            log_event("admin_clear", "Очищен журнал операций (log)")
             st.success("Журнал очищен")
             st.cache_data.clear()
 
@@ -192,6 +202,8 @@ def _render_danger_zone():
         if st.button("Очистить историю", key="btn_clear_activity"):
             with get_conn() as conn:
                 conn.execute("DELETE FROM users_activity")
+            log_event("admin_clear",
+                      "Очищена история изменений категорий (users_activity)")
             st.success("История очищена")
             st.cache_data.clear()
 
@@ -205,6 +217,7 @@ def _render_danger_zone():
                                 key="confirm_delete")
         if st.button("🗑 Удалить всё", key="btn_clear_all",
                      disabled=confirm != "DELETE"):
+            who = st.session_state.get("user", "") or "не указан"
             with get_conn() as conn:
                 conn.execute("DELETE FROM comments")
                 conn.execute("DELETE FROM documents")
@@ -213,6 +226,10 @@ def _render_danger_zone():
                 conn.execute("DELETE FROM history_summary")
                 conn.execute("DELETE FROM log")
                 conn.execute("DELETE FROM users_activity")
+            # Аудит опасной операции: лог пишется ПОСЛЕ очистки, но
+            # фиксирует факт и инициатора.
+            log_event("admin_clear",
+                      f"Полная очистка БД выполнена. Пользователь: {who}")
             st.success("База очищена. Запустите синхронизацию заново.")
             st.cache_data.clear()
 
@@ -237,7 +254,9 @@ def _render_admin_tab():
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_logs(limit: int = 500) -> pd.DataFrame:
     with get_conn() as conn:
-        df = pd.read_sql(f"""
+        # LIMIT — через плейсхолдер (?), не через f-строку:
+        # параметризация защищает от SQL-инъекций при любом входе.
+        df = pd.read_sql("""
             SELECT timestamp AS "Время",
                    event AS "Событие",
                    message AS "Сообщение",
@@ -245,8 +264,8 @@ def _load_logs(limit: int = 500) -> pd.DataFrame:
                    status AS "Статус"
             FROM log
             ORDER BY timestamp DESC
-            LIMIT {limit}
-        """, conn)
+            LIMIT ?
+        """, conn, params=(int(limit),))
     # Маппинг событий → человеческие названия
     if not df.empty:
         df["Событие"] = df["Событие"].apply(_event_label)
@@ -257,7 +276,7 @@ def _load_logs(limit: int = 500) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_user_activity(limit: int = 500) -> pd.DataFrame:
     with get_conn() as conn:
-        df = pd.read_sql(f"""
+        df = pd.read_sql("""
             SELECT
                 timestamp AS "Время",
                 user AS "Пользователь",
@@ -266,8 +285,8 @@ def _load_user_activity(limit: int = 500) -> pd.DataFrame:
                 new_cat AS "Стало"
             FROM users_activity
             ORDER BY timestamp DESC
-            LIMIT {limit}
-        """, conn)
+            LIMIT ?
+        """, conn, params=(int(limit),))
     if not df.empty:
         df["Время"] = df["Время"].apply(fmt_msk)
     return df

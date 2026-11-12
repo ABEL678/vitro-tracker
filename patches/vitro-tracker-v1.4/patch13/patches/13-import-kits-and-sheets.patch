@@ -1,0 +1,612 @@
+diff --git a/vitro/plan_xlsx.py b/vitro/plan_xlsx.py
+index 79b9d29..e540463 100644
+--- a/vitro/plan_xlsx.py
++++ b/vitro/plan_xlsx.py
+@@ -109,11 +109,21 @@ _HOMOGLYPHS = str.maketrans({
+ })
+ 
+ 
+-def _is_valid_kit_code(code: str) -> bool:
+-    """True, если строка похожа на шифр комплекта (АТ-РД-КЖ1-1-00)."""
++def is_valid_kit_code(code: str) -> bool:
++    """True, если строка похожа на шифр комплекта (АТ-РД-КЖ1-1-00).
++
++    Публичная точка проверки для фильтрации мусорных шифров (патч 13):
++    фильтр применяется и к комплектам из ведомостей, и к комплектам
++    из Витро (в т. ч. исторический мусор в plan_kits — шифры
++    с запятыми/точками вида «АТ-РД-КЖ1,2-С-П2.3.ВР»).
++    """
+     return bool(_KIT_CODE_PATTERN.match(code)) if code else False
+ 
+ 
++# Обратная совместимость (патчи 10–12 использовали приватное имя):
++_is_valid_kit_code = is_valid_kit_code
++
++
+ def _kit_code_of(value) -> str:
+     """Шифр комплекта из ячейки: нормализация + СТРОГАЯ валидация.
+ 
+@@ -125,7 +135,71 @@ def _kit_code_of(value) -> str:
+     Единственная точка входа для обоих парсеров.
+     """
+     code = _norm_complex_code(value)
+-    return code if _is_valid_kit_code(code) else ""
++    return code if is_valid_kit_code(code) else ""
++
++
++def _kit_from_row_cells(row, skip_cols: set = frozenset()
++                        ) -> tuple[str, str, int]:
++    """Поиск шифра комплекта ПО ВСЕЙ строке (патч 13).
++
++    Реестры ТХ/ЭС/АК оформлены иначе, чем ОВ/АР/ВК: шапка комплекта
++    может стоять не в колонке «Шифр», а в колонке «Название листа»
++    («АТ-РД-ТХ1-С-00 Система ТХ…»), а шифр — в отдельной колонке без
++    распознанного заголовка. Парсер не находил такие шапки, и все
++    строки до первой узнанной шапки отбрасывались («не найден шифр
++    комплекта»).
++
++    Сканирует ячейки слева направо (пропуская skip_cols — колонку
++    шифра уже проверил вызывающий): каждая ячейка делится на первое
++    слово и остаток; если первое слово — валидный шифр комплекта,
++    возвращает (шифр, остаток-название, индекс колонки). Иначе
++    ('', '', -1).
++
++    Ложные срабатывания практически исключены: полный шифр листа
++    («АТ-РД-ОВ1-С-00-10») и марки («ВР», «СО») строгую регулярку
++    не проходят, названия чертежей не начинаются с трёх-четырёх
++    блоков через дефис.
++    """
++    for j, v in enumerate(row):
++        if j in skip_cols or v is None:
++            continue
++        s = " ".join(str(v).split())
++        if not s:
++            continue
++        first, _, rest = s.partition(" ")
++        code = _kit_code_of(first)
++        if code:
++            return code, rest.strip(), j
++    return "", "", -1
++
++
++def _looks_like_drawing_row(row, cols: dict, c_full, c_no,
++                            found_col: int) -> bool:
++    """Строка с найденным шифром — чертёж или шапка комплекта (патч 13)?
++
++    Чертёж: есть собственный номер листа (полный шифр или колонка
++    «Номер») ЛИБО непустое название в СВОЕЙ колонке (не в той ячейке,
++    из которой мы забрали шапку), не похожее на строку-раздел.
++    Иначе это шапка комплекта — данные листа у неё свои.
++    """
++    full = _norm_complex_code(_cell_local(row, c_full)) \
++        if c_full is not None else ""
++    if full and "-" in full and full.rsplit("-", 1)[-1]:
++        return True
++    if c_no is not None and _fmt_sheet_no(_cell_local(row, c_no)):
++        return True
++    t = " ".join(_clean_str(_cell_local(row, cols.get("title"))).split())
++    if t and found_col != cols.get("title") \
++            and not _looks_like_section_header(t):
++        return True
++    return False
++
++
++def _cell_local(row, j):
++    """Ячейка строки по индексу (None за границей) — хелпер патча 13."""
++    if j is None or j < 0 or len(row) <= j:
++        return None
++    return row[j]
+ 
+ 
+ def _norm_header(value) -> str:
+@@ -499,6 +573,13 @@ def parse_drawings_workbook(
+         наследует текущий комплект;
+       - метки «Приложение 1» в колонке шифра комплектом НЕ считаются.
+ 
++    Патч 13 (реестры ТХ/ЭС/АК): если в колонке шифра комплекта шапки
++    нет, строка-шапка ищется по ВСЕЙ строке — в колонке «Название
++    листа» («АТ-РД-ТХ1-С-00 Система ТХ…») или в отдельной колонке без
++    распознанного заголовка (шифр отдельной ячейкой = смена комплекта).
++    Это убирает «N строк пропущено — не найден шифр комплекта» в
++    начале листов ТХ/ЭС/АК.
++
+     Номер листа берётся из ПОЛНОГО шифра листа (последний блок после дефиса —
+     в реальных регистрах он каноничен: «АТ-РД-АР1-С-00-2.1.0»), а если той
+     колонки нет — из колонки «Номер листа».
+@@ -601,6 +682,26 @@ def parse_drawings_workbook(
+                 # строка ниже всё ещё может быть чертежом
+                 current_kit = kit_norm
+                 kits.setdefault(current_kit, "")
++            else:
++                # ---- патч 13: шапки ТХ/ЭС/АК ----
++                # В колонке шифра комплекта нет. Ищем шапку/шифр
++                # по всей строке (в названии листа или отдельной
++                # колонке без распознанного заголовка).
++                f_code, f_name, f_col = _kit_from_row_cells(
++                    row, skip_cols={c_kit} if c_kit is not None else set())
++                if f_code:
++                    current_kit = f_code
++                    if f_name:
++                        # «АТ-РД-ТХ1-С-00 Система ТХ…» в другой колонке
++                        current_kit_name = f_name
++                        if not kits.get(current_kit):
++                            kits[current_kit] = current_kit_name
++                    else:
++                        # шифр отдельной ячейкой — смена комплекта
++                        kits.setdefault(current_kit, "")
++                    if not _looks_like_drawing_row(
++                            row, cols, c_full, c_no, f_col):
++                        continue  # это шапка комплекта, не чертёж
+             # иначе в колонке шифра метка («Приложение 1», «Подземная
+             # часть», «Прилагаемые документы») — комплект НЕ сменяем.
+ 
+diff --git a/vitro/sheets.py b/vitro/sheets.py
+index 49e2f3c..3def017 100644
+--- a/vitro/sheets.py
++++ b/vitro/sheets.py
+@@ -28,6 +28,14 @@
+      отдельная сущность со своим ID. Дедупликация применяется только
+      к подсчёту ЛИСТОВ; замечание, привязанное к старой ревизии,
+      продолжает учитываться.
++  6. ШИФР КОМПЛЕКТА НОРМАЛИЗУЕТСЯ (патч 13): trim + верхний регистр +
++     латинские двойники → кириллица. Синк пишет complex как есть
++     (из имён папок SharePoint), поэтому один комплект мог храниться
++     под несколькими написаниями («АТ-РД-ОВ2-C-00» латиницей и
++     «АТ-РД-ОВ2-С-00» кириллицей, хвостовой пробел) — группировка
++     делила его листы: СМИК показывал 33 вместо 44, а фантомные
++     варианты раздували «Комплектов всего». После нормализации
++     варианты склеиваются и в Сводке, и в Плане выдачи.
+ 
+ Инструменты модуля:
+   * sheet_key(row)          — ключ уникальности листа для строки.
+@@ -43,6 +51,27 @@
+ # ---------------------------------------------------------------------------
+ #  Нормализация значений
+ # ---------------------------------------------------------------------------
++# Латинские двойники кириллицы (появляются при копировании шифров
++# из CAD/Word и в именах папок SharePoint). Тот же набор, что в
++# plan_xlsx._HOMOGLYPHS; дублируется намеренно: sheets.py — базовый
++# модуль (его импортирует sqlite_db), тянуть туда plan_xlsx со
++# Streamlit нельзя.
++_LAT2CYR = str.maketrans({
++    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К",
++    "M": "М", "O": "О", "P": "Р", "T": "Т", "X": "Х",
++})
++
++
++def _norm_complex(v) -> str:
++    """Нормализация шифра комплекта (патч 13): строка, trim (включая
++    неразрывный пробел \xa0), верхний регистр, латинские двойники →
++    кириллица. None/NaN → ''."""
++    s = _s(v)
++    if not s:
++        return ""
++    return s.upper().translate(_LAT2CYR)
++
++
+ def _s(v) -> str:
+     """None/NaN → '', остальное → str без пробелов по краям."""
+     if v is None:
+@@ -73,11 +102,15 @@ def sheet_key(row: dict) -> tuple:
+ 
+     sheet_number заполнен → ('sheet', complex, sheet_number);
+     sheet_number пустой   → ('row', id) — файл сам себе лист (fallback).
++
++    Патч 13: complex нормализуется (_norm_complex) — варианты написания
++    шифра (латиница, пробелы) дают ОДИН ключ, листы комплекта
++    не делятся между фантомными написаниями.
+     """
+     sn = _s(row.get("sheet_number"))
+     if not sn:
+         return ("row", _int(row.get("id")))
+-    return ("sheet", _s(row.get("complex")), sn)
++    return ("sheet", _norm_complex(row.get("complex")), sn)
+ 
+ 
+ def _rev_order(row: dict) -> tuple:
+@@ -102,6 +135,12 @@ def dedup_document_rows(rows) -> list:
+     Без этого аннулированная ревизия проигрывала последней живой
+     по (status_date, id) и лист «переставал быть аннулированным»:
+     в Сводке «Аннулировано» падало в 0 вместо реальных значений.
++
++    Патч 13: у оставленных строк нормализуется complex (_norm_complex):
++    группировки дальше по сырым значениям (разрез «По комплектам»
++    в Сводке, GROUP BY в Плане выдачи) больше не делят комплект
++    между вариантами написания шифра (латиница/пробелы).
++    Входные dict'ы не мутируются.
+     """
+     best: dict[tuple, dict] = {}
+     annulled_keys: set[tuple] = set()
+@@ -121,7 +160,17 @@ def dedup_document_rows(rows) -> list:
+             row = dict(row)
+             row["status"] = "АННУЛИРОВАНО"
+             best[key] = row
+-    return sorted(best.values(), key=lambda r: _int(r.get("id")))
++    kept = []
++    for r in best.values():
++        raw_cx = r.get("complex")
++        cx_norm = _norm_complex(raw_cx)
++        # копия — если сырое значение отличается от нормализованного
++        # (пробелы, регистр, латиница); входные dict'ы не мутируем
++        if cx_norm and (raw_cx is None or str(raw_cx) != cx_norm):
++            r = dict(r)
++            r["complex"] = cx_norm
++        kept.append(r)
++    return sorted(kept, key=lambda r: _int(r.get("id")))
+ 
+ 
+ def dedup_documents(df):
+@@ -151,12 +200,21 @@ def sql_count_sheets(alias: str = "d") -> str:
+     Ключ — (complex, sheet_number); строки с пустым sheet_number
+     считаются поодиночке (по id). COALESCE(complex,'') защищает от
+     потери строк с NULL-комплектом (NULL || x = NULL в SQLite).
++
++    Патч 13: перед TRIM табуляция (CHAR 9) и неразрывный пробел
++    (CHAR 160) заменяются обычным пробелом — иначе SQL TRIM (он
++    снимает только пробел 0x20) расходился с pandas-дедупликацией
++    (_s снимает \xa0): номер «10\xa0» в SQL считался отдельным листом,
++    а в Сводке приклеивался к «10».
+     """
+     a = alias
+     return (
+         f"COUNT(DISTINCT CASE "
+-        f"WHEN TRIM(COALESCE({a}.sheet_number, '')) != '' "
+-        f"THEN COALESCE({a}.complex, '') || '||' "
+-        f"|| TRIM({a}.sheet_number) "
++        f"WHEN TRIM(REPLACE(REPLACE(COALESCE({a}.sheet_number, ''), "
++        f"CHAR(9), ' '), CHAR(160), ' ')) != '' "
++        f"THEN TRIM(REPLACE(REPLACE(COALESCE({a}.complex, ''), "
++        f"CHAR(9), ' '), CHAR(160), ' ')) || '||' "
++        f"|| TRIM(REPLACE(REPLACE({a}.sheet_number, "
++        f"CHAR(9), ' '), CHAR(160), ' ')) "
+         f"ELSE 'row:' || {a}.id END)"
+     )
+diff --git a/vitro/ui/plan.py b/vitro/ui/plan.py
+index d7ca83b..3d96287 100644
+--- a/vitro/ui/plan.py
++++ b/vitro/ui/plan.py
+@@ -45,9 +45,26 @@
+ план» удаляет комплекты (и их чертежи), которых нет в загружаемой
+ ведомости, — старые записи не смешиваются с новыми (бублик
+ «Комплектов всего» больше не раздувается 541 вместо 471).
+-Бублик «Листов» считает «в Витро» тем же выражением, что и Сводка
+-(sheets.sql_count_sheets): файлы с пустым sheet_number — отдельные
+-листы (пример СМИК: 44, а не 33).
++Бублик «Листов» считает «в Витро» тем же кодом дедупликации, что
++и Сводка (с патча 13 — sheets.dedup_document_rows): файлы с пустым
++sheet_number — отдельные листы (пример СМИК: 44, а не 33).
++
++Патч 13:
++  1. МУСОРНЫЕ КОМПЛЕКТЫ отсекаются и со стороны Витро: _build_overview
++     пропускает шифры, не проходящие is_valid_kit_code («АТ-РД-КЖ1,2-С-П2.3.ВР»
++     с запятыми/точками больше не попадают в таблицу и бублик как
++     «Только в Витро»); _prune_plan_kits удаляет такой исторический
++     мусор из plan_kits даже без «Заменить план».
++  2. СЧЁТ ЛИСТОВ ОДИН НА ВСЮ ВКЛАДКУ: _vitro_sheet_counts считает
++     через sheets.dedup_document_rows (тот же код, что и Сводка) —
++     варианты написания шифра из Витро (латиница/пробелы) склеиваются,
++     СМИК = 44, а не 33; _vitro_sheet_dates нормализует ключи.
++  3. ЗАМЕЧАНИЯ ПАРСЕРА не пропадают: список хранится в
++     st.session_state (блок «⚠️ Замечания последней загрузки» над
++     вкладкой) и пишется в журнал (log) при сохранении.
++  4. ШАПКИ ТХ/ЭС/АК: см. plan_xlsx.parse_drawings_workbook.
++  5. «📜 ЖУРНАЛ ЗАГРУЗОК»: последние события plan_import/plan_clear
++     из таблицы log (дата, строки, сообщение) — переживает F5.
+ 
+ Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
+ """
+@@ -68,7 +85,7 @@ from vitro.sqlite_db import (
+     clear_plan,
+     log_event,
+ )
+-from vitro.sheets import sql_count_sheets
++from vitro.sheets import dedup_document_rows
+ from vitro._cache import versioned_cache
+ from vitro.ui._auth import ensure_user
+ from vitro.ui._filters import (
+@@ -80,9 +97,11 @@ from vitro.ui._filters import (
+ from vitro.plan_xlsx import (
+     MIME_XLSX,
+     build_plan_export,
++    is_valid_kit_code,
+     parse_drawings_workbook,
+     parse_kits_workbook,
+     _kit_code_of,
++    _norm_complex_code,
+ )
+ 
+ # ---------------------------------------------------------------------------
+@@ -137,29 +156,30 @@ MAX_DETAIL_ROWS = 2000  # строки детальных таблиц свер
+ def _vitro_sheet_counts() -> dict[str, int]:
+     """{шифр комплекта: количество УНИКАЛЬНЫХ листов в Витро}.
+ 
+-    Патч 12: тем же выражением, что во всём приложении
+-    (sheets.sql_count_sheets — стандарт патчей 11–12):
++    Патч 13: тот же код, что и в Сводке — sheets.dedup_document_rows
++    (единый стандарт патчей 11–13):
+       * ревизии/повторы листа с номером считаются ОДИН раз
+         (ключ complex + sheet_number);
+       * файлы с ПУСТЫМ sheet_number — самостоятельные листы
+-        (fallback по id).
+-    Раньше здесь был COUNT(DISTINCT sheet_number) без учёта пустых:
+-    комплект, у которого 33 файла с номерами и 11 файлов без номера,
+-    получал 33 вместо 44 — бублик «Листов» расходился со Сводкой
+-    (пример СМИК: «в Витро: 33» при реальных 44).
++        (fallback по id);
++      * complex НОРМАЛИЗУЕТСЯ (trim, регистр, латинские двойники):
++        синк пишет complex как есть из папок SharePoint, поэтому
++        один комплект мог храниться под несколькими написаниями —
++        группировка делила его листы (пример СМИК: 33 вместо 44,
++        фантомный дубль в «Только в Витро» раздувал бублик).
+     """
+     with get_conn() as conn:
+-        rows = conn.execute(f"""
+-            SELECT complex,
+-                   {sql_count_sheets('documents')} AS n_sheets
++        rows = conn.execute("""
++            SELECT id, complex, sheet_number, status, status_date
+             FROM documents
+             WHERE complex IS NOT NULL
+-            GROUP BY complex
+         """).fetchall()
+-    return {
+-        r["complex"]: int(r["n_sheets"])
+-        for r in rows if r["complex"]
+-    }
++    counts: dict[str, int] = {}
++    for r in dedup_document_rows([dict(x) for x in rows]):
++        code = str(r.get("complex") or "").strip()
++        if code:
++            counts[code] = counts.get(code, 0) + 1
++    return counts
+ 
+ 
+ @versioned_cache(600)
+@@ -200,6 +220,10 @@ def _vitro_sheet_dates() -> dict[tuple[str, str], str]:
+     {(шифр комплекта, номер листа): дата статуса в Витро} — фактическая
+     дата загрузки листа (MAX по ревизиям). Для колонки «Фактическая дата»
+     таблицы Б.
++    Патч 13: ключ шифра НОРМАЛИЗУЕТСЯ — план_drawings хранит уже
++    нормализованные шифры, а documents.complex мог быть с пробелами/
++    латиницей; без нормализации «Фактическая дата» не находилась и
++    лист ошибочно считался «Планируется».
+     """
+     with get_conn() as conn:
+         rows = conn.execute("""
+@@ -212,7 +236,8 @@ def _vitro_sheet_dates() -> dict[tuple[str, str], str]:
+             GROUP BY complex, sheet_number
+         """).fetchall()
+     return {
+-        (r["complex"], str(r["sheet_number"]).strip()): str(r["d"])
++        (_norm_complex_code(r["complex"]),
++         str(r["sheet_number"]).strip()): str(r["d"])
+         for r in rows if r["d"]
+     }
+ 
+@@ -244,6 +269,13 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
+     Одна строка = один комплект: план (ведомости) + Витро.
+     Общий статус вычисляется: Загружен в Витро / Загружается (частично) /
+     План (не загружен) / Только в Витро.
++
++    Патч 13: комплекты с шифрами, не проходящими is_valid_kit_code
++    (мусор с запятыми/точками вида «АТ-РД-КЖ1,2-С-П2.3.ВР» и прочие
++    не-шифры), НЕ попадают в таблицу и бублик, даже если пришли
++    из Витро (статус «Только в Витро») или лежат в plan_kits с
++    старых загрузок. Без фильтра «Комплектов всего» оставалось 541
++    вместо реальных 421.
+     """
+     plan = load_plan_kits()
+     drawings = load_plan_drawings()
+@@ -256,6 +288,8 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
+     if not plan.empty:
+         for _, r in plan.iterrows():
+             code = r["code"]
++            if not is_valid_kit_code(code):
++                continue  # исторический мусор в plan_kits (патч 13)
+             in_vitro = code in vitro_counts
+             sheets_vitro = vitro_counts.get(code, 0)
+             sheets_plan = int(plan_qty.get(code, 0))
+@@ -282,9 +316,12 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
+ 
+     if include_vitro_only:
+         meta = _vitro_kit_meta()
++        known = set(r["code"] for r in rows)
+         for code in sorted(vitro_counts):
+-            if code in set(r["code"] for r in rows):
++            if code in known:
+                 continue
++            if not is_valid_kit_code(code):
++                continue  # мусорный шифр из папок Витро (патч 13)
+             info = meta.get(code, {})
+             rows.append({
+                 "code": code,
+@@ -1047,12 +1084,18 @@ def _prune_plan_kits(keep_codes: set[str]) -> int:
+     и бублик «Комплектов всего» показывал 541 вместо 471.
+     Сначала удаляются чертежи (FK plan_drawings.kit_code), затем сами
+     комплекты. Возвращает число удалённых комплектов.
++
++    Патч 13: шифры, не проходящие is_valid_kit_code, удаляются
++    ВСЕГДА (даже если вдруг попали в keep) — исторический мусор
++    («АТ-РД-КЖ1,2-С-П2.3.ВР») не должен переживать пересохранение.
+     """
+-    keep = {c for c in (keep_codes or set()) if c}
++    keep = {c for c in (keep_codes or set())
++            if c and is_valid_kit_code(c)}
+     with get_conn() as conn:
+         existing = [r["code"] for r in
+                     conn.execute("SELECT code FROM plan_kits")]
+-        stale = [c for c in existing if c not in keep]
++        stale = [c for c in existing
++                 if c not in keep or not is_valid_kit_code(c)]
+         if not stale:
+             return 0
+         ph = ",".join("?" * len(stale))
+@@ -1183,9 +1226,17 @@ def _render_import_block() -> None:
+                             if removed:
+                                 msg += f" · удалено устаревших: {removed}"
+                             st.success(msg)
++                            files_str = ", ".join(f.name for f in up_kits)
+                             log_event("plan_import",
+-                                      f"Ведомость комплектов: {n} строк "
+-                                      f"(файлов: {len(up_kits)})", rows=n)
++                                      f"Ведомость комплектов: {n} строк; "
++                                      f"файлы: {files_str}", rows=n)
++                            save_warns = kits_warnings + norm_warns
++                            if save_warns:
++                                log_event(
++                                    "plan_import",
++                                    "Замечания разбора (комплекты):\n• "
++                                    + "\n• ".join(save_warns),
++                                    rows=n, status="WARN")
+                             st.rerun()
+                         except Exception as e:
+                             st.error(f"ОШИБКА БД при сохранении комплектов: {e}")
+@@ -1260,9 +1311,17 @@ def _render_import_block() -> None:
+                             n_kits = len({r["kit_code"] for r in drawings_rows})
+                             st.success(f"✅ Сохранено листов: {n} "
+                                        f"({n_kits} компл.)")
++                            files_str = ", ".join(f.name for f in up_drawings)
+                             log_event("plan_import",
+-                                      f"Ведомости чертежей: {n} листов "
+-                                      f"(файлов: {len(up_drawings)})", rows=n)
++                                      f"Ведомости чертежей: {n} листов; "
++                                      f"файлы: {files_str}", rows=n)
++                            save_warns = drawings_warnings + stub_warns
++                            if save_warns:
++                                log_event(
++                                    "plan_import",
++                                    "Замечания разбора (чертежи):\n• "
++                                    + "\n• ".join(save_warns),
++                                    rows=n, status="WARN")
+                             st.rerun()
+                         except Exception as e:
+                             st.error(f"ОШИБКА БД при сохранении чертежей: {e}")
+@@ -1270,14 +1329,20 @@ def _render_import_block() -> None:
+             else:
+                 st.info("Строки чертежей не распознаны.")
+ 
+-        # ---- Предупреждения разбора ----
++        # ---- Предупреждения разбора (патч 13) ----
++        # Сохраняем в session_state: блок «⚠️ Замечания последней
++        # загрузки» отображается СНАРУЖИ экспандера «Вводные данные»
++        # и переживает любые рераны вкладки. Полная история — в журнале.
+         all_warnings = kits_warnings + drawings_warnings
+         if all_warnings:
+-            with st.expander(
+-                    f"⚠️ Замечания по файлам ({len(all_warnings)})",
+-                    expanded=False):
+-                for w in all_warnings[:50]:
+-                    st.write(f"- {w}")
++            st.session_state["plan_import_warnings"] = {
++                "time": datetime.now().strftime("%d.%m.%Y %H:%M"),
++                "items": all_warnings,
++            }
++            st.caption(
++                f"⚠️ Замечаний разбора: {len(all_warnings)} — см. блок "
++                "«⚠️ Замечания последней загрузки» под панелью вводных."
++            )
+ 
+         # ---- Опасная зона ----
+         st.divider()
+@@ -1298,6 +1363,88 @@ def _render_import_block() -> None:
+                 st.rerun()
+ 
+ 
++# ---------------------------------------------------------------------------
++#  Патч 13: замечания последней загрузки + журнал загрузок
++# ---------------------------------------------------------------------------
++def _render_last_warnings() -> None:
++    """Блок «⚠️ Замечания последней загрузки» (патч 13).
++
++    Раньше st.warning от парсера жил только до следующего рерана,
++    а при F5 исчезал вместе с загруженными файлами — пользователь
++    не мог прочитать, ЧТО было отброшено. Список предупреждений
++    теперь хранится в st.session_state (переживает рераны) и
++    отображается отдельным блоком вне экспандера «Вводные данные».
++    После F5 (новая сессия) историю можно посмотреть в «📜 Журнал
++    загрузок» — предупреждения пишутся в таблицу log при сохранении.
++    """
++    w = st.session_state.get("plan_import_warnings") or {}
++    items = w.get("items") or []
++    if not items:
++        return
++    with st.expander(
++            f"⚠️ Замечания последней загрузки ({len(items)})",
++            expanded=True):
++        st.caption(
++            f"Загрузка от {w.get('time', '—')}. Блок остаётся до "
++            "следующей загрузки; полная история — в «📜 Журнал загрузок»."
++        )
++        for x in items[:50]:
++            st.write(f"- {x}")
++
++
++def _render_import_log() -> None:
++    """Блок «📜 Журнал загрузок» (патч 13): последние события
++    plan_import / plan_clear из таблицы log.
++
++    Показывает: дату (МСК), имя файла/сообщение, число распознанных
++    строк и предупреждения (отдельные записи со статусом WARN).
++    В отличие от st.warning и session_state журнал хранится в БД
++    и переживает перезагрузку страницы (F5) и перезапуск приложения.
++    """
++    try:
++        with get_conn() as conn:
++            rows = conn.execute("""
++                SELECT timestamp, event, message, rows, status
++                FROM log
++                WHERE event IN ('plan_import', 'plan_clear')
++                ORDER BY rowid DESC
++                LIMIT 30
++            """).fetchall()
++    except Exception:
++        return  # таблицы log ещё нет (старая БД без init_db) — молча
++    data = [{
++        "Дата (МСК)": r["timestamp"] or "",
++        "Событие": ("Очистка плана" if r["event"] == "plan_clear"
++                    else "Загрузка ведомости"),
++        "Строк": r["rows"] if r["rows"] else "",
++        "Статус": r["status"] or "OK",
++        "Сообщение": str(r["message"] or "").replace("\n", " · "),
++    } for r in rows]
++    with st.expander(
++            f"📜 Журнал загрузок (последние {len(data) or 0} записей)",
++            expanded=False):
++        if not data:
++            st.caption("Записей ещё нет — загрузите ведомости.")
++            return
++        st.dataframe(
++            pd.DataFrame(data),
++            use_container_width=True, hide_index=True,
++            height=min(max(len(data) * 36 + 40, 200), 420),
++            column_config={
++                "Дата (МСК)": st.column_config.TextColumn(width="medium"),
++                "Событие": st.column_config.TextColumn(width="small"),
++                "Строк": st.column_config.NumberColumn(width="small"),
++                "Статус": st.column_config.TextColumn(width="small"),
++                "Сообщение": st.column_config.TextColumn(width="large"),
++            },
++        )
++        st.caption(
++            "Записи создаются при сохранении ведомостей и очистке плана; "
++            "предупреждения парсера пишутся отдельными строками "
++            "(Статус = WARN). Переживает F5 и перезапуск приложения."
++        )
++
++
+ # ===========================================================================
+ #  Точка входа
+ # ===========================================================================
+@@ -1312,6 +1459,12 @@ def render():
+     # ---- 0. Вводные данные ----
+     _render_import_block()
+ 
++    # ---- Патч 13: замечания последней загрузки (переживают рераны) ----
++    _render_last_warnings()
++
++    # ---- Патч 13: журнал загрузок (переживает F5, данные из БД) ----
++    _render_import_log()
++
+     st.divider()
+ 
+     # ---- 1. Фильтры (единый стандарт) ----

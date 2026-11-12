@@ -1,0 +1,6 @@
+fix(sheets): increase tail block length limit from 4 to 12 chars
+
+_KIT_CODE_PATTERN now allows up to 12 characters in tail blocks
+(?:-[A-ZА-ЯЁ0-9.]{1,12}) instead of {1,4}. This allows 3 previously
+rejected kits to pass: ГИС-РД-СБ-ССООИ-0-00, АТ-РД-АПТ-ГК.00, and
+the base part of дробный шифр ГИС-РД-СБ-ССООИ-0-00/10511.25.01-ССООИ.

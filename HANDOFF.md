@@ -4,11 +4,19 @@
 
 ### Последняя работа
 
-**Документация обновлена** после серии из 11 задач (см. ниже).
+**Ветка:** `release/1.4-plan`
+**Последний коммит:** 0a53529 (после патча 17)
+
+**Документация обновлена** после серии из 17 задач (см. ниже).
 
 ### Что сделано за последние заходы
 
-1. **Второй ряд фильтров в Сводке** — «Статус замечания» (5 сырых) + «Статус листа» (8 групп). DISPLAY_LIMIT убран — все строки разреза видны.
+1. **Единый источник листов** — `vitro/sheets.py` → `unique_vitro_sheets(rows)`, 11 312 уникальных листов.
+2. **Вкладка «План выдачи»** — 424 комплекта, ведомости Excel, бублики «всего/план», детальная таблица.
+3. **Единые фильтры** — `vitro/ui/_filters.py` → `render_standard_filters()` во всех вкладках.
+4. **SLA в «Динамике»** — блок «Соблюдение сроков» (≤10 р.д., 10–30 р.д., >30 р.д.), топ-5 проблемных комплектов.
+5. **Патч 17**: сходимость "Выполнено" со Сводкой (исключены листы A и аннулированные), редизайн Динамики (7 плиток, удаление SLA и разрезов), новые метрики листов A/B, редизайн Плана выдачи (бублики как в Сводке, колонки Дисциплина/Раздел, перенос вводных вниз).
+6. **Второй ряд фильтров в Сводке** — «Статус замечания» (5 сырых) + «Статус листа» (8 групп). DISPLAY_LIMIT убран — все строки разреза видны.
 2. **Ссылки на Витро** — колонка «Витро» в трёх местах (Авторы drilldown, Сроки список, Поиск результаты). URL: `https://pdm-lakhta.ru/okhta/_layouts/15/Vitro/Viewer/PDF/web/Viewer.aspx?Id={guid}&version={v}&noteId={id}`.
 3. **Рефакторинг `_filters.py`** — вынос общих фильтров (статусы листов, статусы замечаний, марка комплекта).
 4. **`_urls.py`** — хелперы для URL Витро.
@@ -23,6 +31,11 @@
 ### Последние коммиты (main)
 
 ```
+0a53529 feat(dynamics,plan): patch 17 — converge Выполнено with Summary, A/B sheet metrics, Summary-style donuts, layout cleanup
+27d3391 add patch17_dynamics_plan.patch for next application
+e18cbcf fix(dynamics,export): separate 'Выполнено' and 'Закрыто заказчиком', drop 'Наши ответы' (patch 16)
+dd2ef51 docs: update CONTEXT.md, HANDOFF.md, README.md after patches 1-15
+dfb2666 fix: apply patch15 — period sync, plan 424, summary arithmetic
 2ed75ab fix(time): show UTC timestamps in MSK (+3) across all tabs
 8079662 feat(auth): on-demand user dialog + version in footer
 140da6f feat(categories,search): add marka (block 2) filter — strict match
@@ -53,6 +66,12 @@ ce612c1 fix(summary): fixed column widths and freeze header
 - `.gigacode/` — файлы планов
 
 ## Критические детали
+
+### `vitro/sheets.py` — единый источник листов
+
+- `unique_vitro_sheets(rows)` — дедуп ревизий: последняя по `(complex, leaf)`.
+- `dedup_document_rows(rows)` — обёртка для pandas/списка.
+- Используется в: `dynamics.py` (_load_unique_documents), `summary.py`, `export.py`, `plan.py`.
 
 ### `vitro/ui/_filters.py` — общие фильтры
 
@@ -126,9 +145,13 @@ ce612c1 fix(summary): fixed column widths and freeze header
 - Расширен ключами `sheet_groups`, `remark_status`, `marka` — хранит выбранные фильтры.
 - Передаётся в `_filter_key()` для кэширования.
 
-### `_build_summary_rows`
+### `vitro/ui/dynamics.py` — план и бублики
 
-- Использует `our_status` (не `status`): `"new"`, `"in_work"`, `"rejected"`, `"discussion"`.
+- `_load_plan(disciplines, sections, kits, block_codes)` — план из `plan_drawings` + `plan_kits` с фильтрами.
+- `_load_doc_totals(disciplines, sections, kits, block_codes)` — уникальные листы через `unique_vitro_sheets`.
+- `_render_progress_donuts()` — бублики «выполнено/план» с учётом фильтров.
+
+### `_build_summary_rows`
 - `n_customer = len(customer)` где `customer = sub[sub["holder"] == "customer"]`.
 - `active_total = n_new + n_in_work + n_rejected + n_discussion + n_customer`.
 
@@ -172,11 +195,18 @@ Vitro_tracker/
         ├── dynamics.py        # Динамика (потоки по месяцам)
         ├── authors.py         # Авторы замечаний
         ├── deadlines.py       # Сроки + единый источник
+        ├── plan.py            # План выдачи комплектов
         ├── categories.py      # Категории (ручная разметка)
         ├── search.py          # Поиск по тексту
         ├── export.py          # Экспорт
         └── admin.py           # Управление + Логи
 ```
+
+## Патч 18 (в работе)
+
+- Светофор в KPI Динамики
+- Детализация бубликов замечаний по логике Сводки
+- Перенос вкладки План выдачи на 1-е место
 
 ## Команды
 

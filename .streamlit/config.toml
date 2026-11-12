@@ -1,8 +1,10 @@
 [server]
 headless = true
 
+# Не показывать пользователю полные traceback'ы (утечка путей и кода).
+# Для отладки локально — временно включить.
 [client]
-showErrorDetails = true
+showErrorDetails = false
 
 [browser]
 gatherUsageStats = false

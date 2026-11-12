@@ -44,7 +44,11 @@ def refresh_data(verbose: bool = True) -> dict:
 
     def log(msg):
         if verbose:
-            print(msg)
+            try:
+                print(msg)
+            except UnicodeEncodeError:
+                # Windows cp1251 не поддерживает эмодзи — выводим без них
+                print(msg.encode('ascii', 'replace').decode('ascii'))
 
     # 1. Документы
     log("📄 Загрузка документов из SharePoint...")
@@ -94,6 +98,17 @@ def refresh_data(verbose: bool = True) -> dict:
     elapsed = round(time.time() - t0, 1)
     log_event("refresh", f"Загружено {len(comments)} замечаний", rows=len(comments))
     log(f"\n✅ Готово за {elapsed} сек")
+
+    # PATCH-06: сброс кэшей Streamlit, если синк вызван из приложения
+    # (кнопка в «Управлении») — данные на вкладках обновятся мгновенно.
+    # Для синка из отдельного процесса (sync_runner.py) кэши приложения
+    # сбрасывает версионный штамп vitro/_cache.py (см. versioned_cache).
+    try:
+        import streamlit as st
+        st.cache_data.clear()
+        log("   Кэши Streamlit сброшены")
+    except Exception:
+        pass  # bare-режим (запуск вне Streamlit) — не критично
 
     return {
         "documents": n_docs,

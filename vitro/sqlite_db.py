@@ -17,6 +17,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from vitro.sheets import unique_vitro_sheets
 from vitro.time_utils import msk_now_str
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -132,6 +133,39 @@ def init_db() -> None:
             new_cat    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_users_activity_user ON users_activity(user);
+
+        -- План выдачи комплектов (вкладка «План выдачи»)
+        -- Ведомость основных комплектов: одна строка = один комплект.
+        CREATE TABLE IF NOT EXISTS plan_kits (
+            code         TEXT PRIMARY KEY,   -- шифр комплекта
+            name         TEXT,               -- наименование
+            discipline   TEXT,
+            section      TEXT,
+            plan_status  TEXT,               -- ручной статус из ведомости (опц.)
+            due_date     TEXT,               -- срок готовности, ISO (редактируется в UI)
+            due_comment  TEXT,               -- пояснение (опц.)
+            updated_at   TEXT,
+            updated_by   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_kits_disc ON plan_kits(discipline);
+
+        -- Ведомости чертежей: одна строка = один лист (позиция).
+        CREATE TABLE IF NOT EXISTS plan_drawings (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            kit_code     TEXT NOT NULL,      -- шифр комплекта (FK → plan_kits.code)
+            sheet_no     TEXT,               -- номер листа («10.01», «СО»…)
+            title        TEXT,               -- наименование чертежа
+            discipline   TEXT,
+            section      TEXT,
+            qty          INTEGER DEFAULT 1,  -- количество чертежей (план)
+            planned_date TEXT,               -- плановая дата выдачи, ISO (опц.)
+            source       TEXT DEFAULT 'excel',
+            source_file  TEXT,
+            uploaded_at  TEXT,
+            uploaded_by  TEXT,
+            FOREIGN KEY (kit_code) REFERENCES plan_kits(code)
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_drawings_kit ON plan_drawings(kit_code);
         """)
 
         # Мягкая миграция: если БД была создана старой версией — добавим колонки
@@ -151,6 +185,12 @@ def init_db() -> None:
         ]:
             if col not in doc_cols:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {ddl}")
+
+        # Мягкая миграция plan_drawings — колонка «номер листа»
+        # (добавлена в v1.4.1 для реальных регистров «Комплекты чертежей»)
+        dr_cols = {r["name"] for r in conn.execute("PRAGMA table_info(plan_drawings)")}
+        if "sheet_no" not in dr_cols:
+            conn.execute("ALTER TABLE plan_drawings ADD COLUMN sheet_no TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -476,8 +516,22 @@ def log_event(event: str, message: str = "", rows: int = 0, status: str = "OK") 
 # ---------------------------------------------------------------------------
 def db_stats() -> dict:
     with get_conn() as conn:
+        # Уникальные листы — ЕДИНЫЙ СТАНДАРТ «Плана выдачи» (патч 14):
+        # sheets.unique_vitro_sheets (дедуп ревизий по complex +
+        # sheet_number, нормализация шифров, отсечение мусорных).
+        # Раньше считали SQL-выражением sql_count_sheets — без
+        # нормализации латинских двойников и без отсечения мусорных
+        # шифров, поэтому «Листов РД» в Управлении расходилось
+        # с «Планом выдачи».
+        doc_rows = conn.execute(
+            "SELECT id, complex, sheet_number FROM documents "
+            "WHERE complex IS NOT NULL"
+        ).fetchall()
         return {
             "documents":         conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+            # Уникальные листы (патчи 11/14): стандарт «Плана выдачи».
+            "sheets":            len(unique_vitro_sheets(
+                                    [dict(r) for r in doc_rows])),
             "comments":          conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
             "categorized":       conn.execute(
                                     "SELECT COUNT(*) FROM comments "
@@ -499,3 +553,159 @@ def clear_all() -> None:
         conn.execute("DELETE FROM history_summary")
         conn.execute("DELETE FROM log")
         conn.execute("DELETE FROM users_activity")
+
+
+# ===========================================================================
+#  План выдачи комплектов (вкладка «План выдачи»)
+# ===========================================================================
+def upsert_plan_kits(rows: list[dict], user: str = "") -> int:
+    """
+    Добавляет/обновляет комплекты плана по шифру (INSERT OR REPLACE).
+    Редактированные в UI сроки готовности (due_date) при повторной
+    загрузке ведомости НЕ перезаписываются пустым значением:
+    если в новой строке дата не заполнена — остаётся прежняя.
+    Возвращает число обработанных строк.
+    """
+    if not rows:
+        return 0
+    now = msk_now_str()
+    with get_conn() as conn:
+        for r in rows:
+            code = str(r.get("code") or "").strip()
+            if not code:
+                continue
+            new_due = r.get("due_date") or None
+            conn.execute("""
+                INSERT INTO plan_kits
+                    (code, name, discipline, section, plan_status,
+                     due_date, due_comment, updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    -- Пустая строка в ведомости НЕ затирает ранее
+                    -- сохранённое значение (NULLIF '' → NULL → COALESCE):
+                    name        = COALESCE(NULLIF(excluded.name, ''),
+                                           plan_kits.name, ''),
+                    discipline  = COALESCE(NULLIF(excluded.discipline, ''),
+                                           plan_kits.discipline, ''),
+                    section     = COALESCE(NULLIF(excluded.section, ''),
+                                           plan_kits.section, ''),
+                    plan_status = COALESCE(NULLIF(excluded.plan_status, ''),
+                                           plan_kits.plan_status, ''),
+                    due_date    = COALESCE(excluded.due_date,
+                                           plan_kits.due_date),
+                    due_comment = COALESCE(NULLIF(excluded.due_comment, ''),
+                                           plan_kits.due_comment, ''),
+                    updated_at  = excluded.updated_at,
+                    updated_by  = excluded.updated_by
+            """, (
+                code,
+                r.get("name") or "",
+                r.get("discipline") or "",
+                r.get("section") or "",
+                r.get("plan_status") or "",
+                new_due,
+                r.get("due_comment") or "",
+                now,
+                user,
+            ))
+    return len(rows)
+
+
+def replace_plan_drawings_for_kits(rows: list[dict], user: str = "") -> int:
+    """
+    Заменяет чертежи тех комплектов, которые присутствуют в загруженных
+    строках (DELETE по затронутым шифрам + INSERT). Комплекты, которых
+    нет в plan_kits, создаются минимальной записью (один шифр).
+    Возвращает число вставленных строк.
+    """
+    if not rows:
+        return 0
+    now = msk_now_str()
+    kit_codes = sorted({str(r["kit_code"]).strip() for r in rows
+                        if r.get("kit_code")})
+    if not kit_codes:
+        return 0
+    with get_conn() as conn:
+        # Комплекты, отсутствующие в плане, добавим заглушками,
+        # чтобы сработал внешний ключ и комплект был виден в общей таблице.
+        for code in kit_codes:
+            conn.execute("""
+                INSERT OR IGNORE INTO plan_kits (code, updated_at, updated_by)
+                VALUES (?, ?, ?)
+            """, (code, now, user))
+        ph = ",".join("?" * len(kit_codes))
+        conn.execute(
+            f"DELETE FROM plan_drawings WHERE kit_code IN ({ph})",
+            tuple(kit_codes))
+        conn.executemany("""
+            INSERT INTO plan_drawings
+                (kit_code, sheet_no, title, discipline, section, qty,
+                 planned_date, source, source_file, uploaded_at, uploaded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'excel', ?, ?, ?)
+        """, [(
+            str(r["kit_code"]).strip(),
+            r.get("sheet_no") or "",
+            r.get("title") or "",
+            r.get("discipline") or "",
+            r.get("section") or "",
+            int(r.get("qty") or 1),
+            r.get("planned_date"),
+            r.get("source_file") or "",
+            now,
+            user,
+        ) for r in rows])
+    return len(rows)
+
+
+def update_plan_due_dates(changes: dict[str, str], user: str = "") -> int:
+    """
+    Обновляет сроки готовности (due_date) комплектов плана.
+    changes — {шифр: ISO-дата или None}. Возвращает число обновлённых строк.
+    """
+    if not changes:
+        return 0
+    now = msk_now_str()
+    with get_conn() as conn:
+        n = 0
+        for code, iso in changes.items():
+            cur = conn.execute("""
+                UPDATE plan_kits
+                SET due_date = ?, updated_at = ?, updated_by = ?
+                WHERE code = ?
+            """, (iso, now, user, code))
+            n += cur.rowcount
+    return n
+
+
+def load_plan_kits():
+    """Все комплекты плана (без кэша — данные меняются кнопками вкладки)."""
+    import pandas as pd
+
+    with get_conn() as conn:
+        return pd.read_sql("""
+            SELECT code, name, discipline, section, plan_status,
+                   due_date, due_comment, updated_at, updated_by
+            FROM plan_kits
+            ORDER BY code
+        """, conn)
+
+
+def load_plan_drawings():
+    """Все позиции чертежей плана (без кэша)."""
+    import pandas as pd
+
+    with get_conn() as conn:
+        return pd.read_sql("""
+            SELECT id, kit_code, sheet_no, title, discipline, section, qty,
+                   planned_date, source, source_file,
+                   uploaded_at, uploaded_by
+            FROM plan_drawings
+            ORDER BY kit_code, id
+        """, conn)
+
+
+def clear_plan() -> None:
+    """Полностью очищает план выдачи (комплекты + чертежи)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM plan_drawings")
+        conn.execute("DELETE FROM plan_kits")

@@ -1,0 +1,2510 @@
+diff --git a/vitro/ui/_filters.py b/vitro/ui/_filters.py
+index 7239644..99a4540 100644
+--- a/vitro/ui/_filters.py
++++ b/vitro/ui/_filters.py
+@@ -2,15 +2,29 @@
+ """
+ Общие фильтры для вкладок Vitro-tracker.
+ 
+-Содержит:
+-  - Статусы листов (группы + обратный маппинг в сырые значения).
+-  - Хелперы для SQL-фильтрации по группам.
++Состав:
++  - Статусы листов (группы + обратный маппинг в сырые значения) и хелперы SQL.
++  - Статусы замечаний.
++  - Справочник «Расположение» (4-й блок шифра комплекта) — BLOCK_OPTIONS.
++  - Общие справочники для каскадных фильтров (дисциплины / разделы /
++    комплекты) — до версии 1.4 они дублировались в каждой вкладке.
++  - Фильтрация DataFrame по стандартному набору фильтров (apply_df_filters).
++  - ЕДИНЫЙ СТАНДАРТ БЛОКА ФИЛЬТРОВ — render_standard_filters().
++    Эталон — блок фильтров вкладки «Сводка по проекту»:
++      Ряд 1 (каскад): Дисциплина → Раздел → Расположение → Комплект → Марка.
++      Ряд 2: Статус замечания + Статус листа.
+ 
+-Используется в:
+-  - vitro/ui/summary.py (Сводка по проекту)
+-  - vitro/ui/search.py (Поиск по замечаниям)
++Используется во всех вкладках (summary, dynamics, authors, deadlines,
++categories, search, export, plan).
+ """
+ 
++import pandas as pd
++import streamlit as st
++
++from vitro.disciplines import discipline_name
++from vitro.sqlite_db import get_conn
++
++
+ # ---------------------------------------------------------------------------
+ #  Статусы листов
+ # ---------------------------------------------------------------------------
+@@ -59,7 +73,99 @@ REMARK_STATUS_OPTIONS = [
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Хелперы
++#  Расположение (4-й блок шифра комплекта)
++#  Единый справочник — до версии 1.4 дублировался в 4 вкладках.
++# ---------------------------------------------------------------------------
++BLOCK_OPTIONS = {
++    "Корпус 1":                    "1",
++    "Корпус 2":                    "2",
++    "Общие":                       "0",
++    "Стилобат":                    "С",
++    "Газовая котельная":           "ГК",
++    "Генплан":                     "ГП",
++    "Автомобильные дороги (УДС)":  "А",
++}
++
++
++# ---------------------------------------------------------------------------
++#  Хелперы: блоки шифра
++# ---------------------------------------------------------------------------
++def _complex_col(df: pd.DataFrame) -> str:
++    """
++    Возвращает имя колонки с шифром комплекта в DataFrame:
++    'complex' (служебные DataFrame) или 'Комплект' (результаты SQL
++    с русскими алиасами, например в Поиске и Экспорте).
++    """
++    for c in ("complex", "Комплект"):
++        if c in df.columns:
++            return c
++    return ""
++
++
++def _extract_2nd_block(complex_code) -> str:
++    """
++    Вытащить 2-й блок шифра комплекта (марку).
++    Пример: АТ-РД-КЖ1-1-00 → КЖ1.
++    Возвращает верхний регистр или пустую строку.
++    """
++    if not complex_code:
++        return ""
++    parts = str(complex_code).split("-")
++    if len(parts) >= 3:
++        return parts[2].strip().upper()
++    return ""
++
++
++def _extract_4th_block(complex_code) -> str:
++    """
++    Вытащить 4-й блок шифра комплекта (расположение).
++    Пример: АТ-РД-КЖ1-1-00 → 00.
++    """
++    if not complex_code:
++        return ""
++    parts = str(complex_code).split("-")
++    if len(parts) >= 4:
++        return parts[3].strip().upper()
++    return ""
++
++
++def _filter_by_marka(df, marka: str):
++    """
++    Строгий фильтр DataFrame по 2-му блоку шифра комплекта (марке).
++    marka='КЖ1' → оставит только комплекты, у которых блок 2 = 'КЖ1'.
++    Не найдёт КЖ11, КЖ10, КЖ1.2.
++    Если marka пустая или df пустой — возвращает df без изменений.
++    Работает и с колонкой 'complex', и с колонкой 'Комплект'.
++    """
++    if marka is None or df is None or df.empty:
++        return df
++    m = marka.strip().upper()
++    if not m:
++        return df
++    col = _complex_col(df)
++    if not col:
++        return df
++    mask = df[col].apply(_extract_2nd_block) == m
++    return df[mask]
++
++
++def _filter_by_blocks(df: pd.DataFrame,
++                       block_codes: tuple = ()) -> pd.DataFrame:
++    """
++    Фильтр DataFrame по 4-му блоку шифра (расположению).
++    Работает и с колонкой 'complex', и с колонкой 'Комплект'.
++    """
++    if df is None or df.empty or not block_codes:
++        return df
++    col = _complex_col(df)
++    if not col:
++        return df
++    blocks = df[col].apply(_extract_4th_block)
++    return df[blocks.isin(block_codes)]
++
++
++# ---------------------------------------------------------------------------
++#  Хелперы: SQL по группам статусов листов
+ # ---------------------------------------------------------------------------
+ def _doc_status_group(raw) -> str:
+     """Сырой doc_status → группа (как в бублике Секции 2 Сводки)."""
+@@ -120,31 +226,332 @@ def _sheet_groups_to_sql(sheet_groups: tuple, doc_alias: str = "d"):
+     return " AND (" + " OR ".join(conditions) + ")", params
+ 
+ 
+-def _extract_2nd_block(complex_code) -> str:
++def _sheet_groups_to_sql_or(sheet_groups: tuple, doc_alias: str = "d"):
+     """
+-    Вытащить 2-й блок шифра комплекта (марку).
+-    Пример: АТ-РД-КЖ1-1-00 → КЖ1.
+-    Возвращает верхний регистр или пустую строку.
++    Вариант _sheet_groups_to_sql, где группы соединяются через OR
++    и условие НЕ начинается с " AND " — для вставки внутрь
++    уже открытой скобки (например, внутри "(... OR ...)").
++    Возвращает (sql_fragment, params) либо ("", []).
+     """
+-    if not complex_code:
+-        return ""
+-    parts = str(complex_code).split("-")
+-    if len(parts) >= 3:
+-        return parts[2].strip().upper()
+-    return ""
++    cond, params = _sheet_groups_to_sql(sheet_groups, doc_alias)
++    if not cond:
++        return "", []
++    # _sheet_groups_to_sql возвращает " AND ( ... )" — отрезаем " AND "
++    return "(" + cond[len(" AND ("):], params
+ 
+ 
+-def _filter_by_marka(df, marka: str):
++# ---------------------------------------------------------------------------
++#  Общие справочники для каскадных фильтров
++#  До версии 1.4 эти три функции дублировались в каждой вкладке.
++# ---------------------------------------------------------------------------
++@st.cache_data(ttl=600, show_spinner=False)
++def load_discipline_options() -> dict[str, str]:
++    """{код дисциплины: 'код — название'} из таблицы documents."""
++    with get_conn() as conn:
++        codes = [r["discipline"] for r in conn.execute(
++            "SELECT DISTINCT discipline FROM documents "
++            "WHERE discipline IS NOT NULL ORDER BY discipline")]
++    return {c: f"{c} — {discipline_name(c)}" for c in codes}
++
++
++@st.cache_data(ttl=600, show_spinner=False)
++def load_section_options(disciplines: tuple = ()) -> dict[str, str]:
++    """{раздел: раздел} с каскадом по дисциплинам."""
++    with get_conn() as conn:
++        if disciplines:
++            ph = ",".join("?" * len(disciplines))
++            rows = conn.execute(f"""
++                SELECT DISTINCT section FROM documents
++                WHERE section IS NOT NULL AND section <> ''
++                  AND discipline IN ({ph})
++                ORDER BY section
++            """, tuple(disciplines)).fetchall()
++        else:
++            rows = conn.execute("""
++                SELECT DISTINCT section FROM documents
++                WHERE section IS NOT NULL AND section <> ''
++                ORDER BY section
++            """).fetchall()
++    return {r["section"]: r["section"] for r in rows}
++
++
++@st.cache_data(ttl=600, show_spinner=False)
++def load_kit_options(disciplines: tuple = (),
++                     sections: tuple = (),
++                     block_codes: tuple = ()) -> dict[str, str]:
++    """{шифр: 'шифр — название'} с каскадом по дисциплинам, разделам
++    и расположению (4-й блок)."""
++    with get_conn() as conn:
++        where = ["c.code IS NOT NULL"]
++        params: list = []
++
++        if disciplines:
++            where.append(
++                f"c.discipline IN ({','.join('?' * len(disciplines))})")
++            params += list(disciplines)
++
++        if sections:
++            ph = ",".join("?" * len(sections))
++            where.append(f"""c.code IN (
++                SELECT DISTINCT complex FROM documents
++                WHERE section IN ({ph}) AND complex IS NOT NULL
++            )""")
++            params += list(sections)
++
++        rows = conn.execute(f"""
++            SELECT c.code, c.name FROM complexes c
++            WHERE {' AND '.join(where)}
++            ORDER BY c.code
++        """, tuple(params)).fetchall()
++
++    result = {r["code"]: f"{r['code']} — {r['name']}"
++                       if r["name"] else r["code"]
++              for r in rows}
++
++    # Фильтр по расположению (4-й блок) — в Python
++    if block_codes:
++        filtered = {}
++        for code, label in result.items():
++            block = _extract_4th_block(code)
++            if block in block_codes:
++                filtered[code] = label
++        return filtered
++    return result
++
++
++# ---------------------------------------------------------------------------
++#  Фильтрация DataFrame по стандартному набору фильтров
++#  Тот же порядок условий, что в Сводке по проекту (_filter_active).
++# ---------------------------------------------------------------------------
++def apply_df_filters(df: pd.DataFrame,
++                     disciplines: tuple = (),
++                     sections: tuple = (),
++                     kits: tuple = (),
++                     block_codes: tuple = (),
++                     remark_statuses: tuple = (),
++                     sheet_groups: tuple = (),
++                     marka: str = "",
++                     sheet_status_col: str = "doc_status",
++                     remark_status_col: str = "status") -> pd.DataFrame:
+     """
+-    Строгий фильтр DataFrame по 2-му блоку шифра комплекта (марке).
+-    marka='КЖ1' → оставит только комплекты, у которых блок 2 = 'КЖ1'.
+-    Не найдёт КЖ11, КЖ10, КЖ1.2.
+-    Если marka пустая или df пустой — возвращает df без изменений.
++    Универсальный фильтр DataFrame по стандартным фильтрам вкладок.
++
++    sheet_status_col  — колонка с сырым статусом листа (по умолчанию
++                        'doc_status', как в _load_all_categorized).
++    remark_status_col — колонка со статусом замечания
++                        ('status' в _load_all_categorized,
++                         'Статус' в результатах Поиска/Экспорта).
+     """
+-    if marka is None or df is None or df.empty:
+-        return df
+-    m = marka.strip().upper()
+-    if not m:
++    if df is None or df.empty:
+         return df
+-    mask = df["complex"].apply(_extract_2nd_block) == m
+-    return df[mask]
++    out = df
++    if disciplines:
++        out = out[out["discipline"].isin(disciplines)]
++    if sections:
++        out = out[out["section"].isin(sections)]
++    if kits:
++        col = _complex_col(out)
++        if col:
++            out = out[out[col].isin(kits)]
++    if block_codes:
++        out = _filter_by_blocks(out, block_codes)
++    if remark_statuses and remark_status_col in out.columns:
++        out = out[out[remark_status_col].isin(remark_statuses)]
++    if sheet_groups and sheet_status_col in out.columns:
++        out = out[out[sheet_status_col]
++                  .apply(_doc_status_group).isin(sheet_groups)]
++    if marka:
++        out = _filter_by_marka(out, marka)
++    return out
++
++
++# ===========================================================================
++#  ЕДИНЫЙ СТАНДАРТ ФИЛЬТРОВ (эталон — «Сводка по проекту»)
++# ===========================================================================
++def render_standard_filters(
++    key_prefix: str = "",
++    expander_label: str = "Фильтры",
++    expanded: bool = True,
++    show_remark_status: bool = True,
++    show_sheet_status: bool = True,
++    remark_status_options: tuple = tuple(REMARK_STATUS_OPTIONS),
++    kit_options_fn=None,
++    row1_extra=None,
++    extra_row=None,
++) -> dict:
++    """
++    Единый блок фильтров для всех вкладок.
++
++    Структура (эталон — «Сводка по проекту»):
++      Ряд 1 (5 колонок, каскад):
++        Дисциплина → Раздел → Расположение → Комплект → Марка комплекта.
++        row1_extra(col, kits) — необязательная 6-я колонка
++        (например, «Лист» на вкладке «Сроки»).
++      Ряд 2 (2 колонки):
++        Статус замечания + Статус листа
++        (отключается флагами show_remark_status / show_sheet_status).
++      extra_row() -> dict — необязательный 3-й ряд с вкладко-специфичными
++        фильтрами (автор, категория, лимит строк, период...).
++
++    Параметры:
++      key_prefix             — префикс ключей виджетов
++                               ('sum_', 'dyn_', 'dl_' ...). Сохраняет
++                               прежние ключи каждой вкладки, поэтому
++                               выбранные фильтры не сбрасываются.
++      kit_options_fn         — функция (disc, sect, block_codes) -> dict
++                               для опций «Комплект». По умолчанию —
++                               load_kit_options (справочник из Витро).
++                               Вкладка «План выдачи» подаёт свою,
++                               объединяющую Витро и ведомости.
++      remark_status_options  — переопределение списка статусов замечаний
++                               (например, Поиск и Экспорт показывают
++                               также «Закрыто» и «Аннулировано»).
++
++    Возвращает dict:
++      disc             — tuple выбранных кодов дисциплин
++      section          — tuple выбранных разделов
++      kits             — tuple выбранных шифров комплектов
++      block_codes      — tuple кодов расположения (4-й блок)
++      marka            — строка марки (2-й блок) или ""
++      remark_statuses  — tuple статусов замечаний или ()
++      sheet_groups     — tuple групп статусов листов или ()
++      extra            — dict, который вернул extra_row (или {})
++    """
++    if kit_options_fn is None:
++        kit_options_fn = load_kit_options
++
++    result: dict = {
++        "disc": (), "section": (), "kits": (), "block_codes": (),
++        "marka": "", "remark_statuses": (), "sheet_groups": (),
++        "extra": {},
++    }
++
++    with st.expander(expander_label, expanded=expanded):
++        # ------- Ряд 1: каскад + марка (+ опциональная 6-я колонка) -------
++        if row1_extra is not None:
++            c1, c2, c3, c4, c5, c6 = st.columns(6)
++        else:
++            c1, c2, c3, c4, c5 = st.columns(5)
++
++        # 1. Дисциплина
++        with c1:
++            disc_options = load_discipline_options()
++            sel_disc_labels = st.multiselect(
++                "Дисциплина",
++                options=list(disc_options.values()),
++                placeholder="Все",
++                key=f"{key_prefix}disc",
++            )
++            sel_disc = [code for code, label in disc_options.items()
++                        if label in sel_disc_labels]
++
++        # 2. Раздел (зависит от дисциплины)
++        section_options = load_section_options(
++            tuple(sel_disc) if sel_disc else ())
++        with c2:
++            if section_options:
++                sel_section_labels = st.multiselect(
++                    "Раздел",
++                    options=list(section_options.values()),
++                    placeholder="Все",
++                    key=f"{key_prefix}section",
++                )
++                sel_section = [
++                    code for code, label in section_options.items()
++                    if label in sel_section_labels
++                ]
++            else:
++                sel_section = []
++                st.multiselect(
++                    "Раздел", options=[],
++                    placeholder="—",
++                    disabled=True, key=f"{key_prefix}section_empty",
++                )
++
++        # 3. Расположение
++        with c3:
++            sel_blocks = st.multiselect(
++                "Расположение",
++                options=list(BLOCK_OPTIONS.keys()),
++                placeholder="Все",
++                key=f"{key_prefix}blocks",
++            )
++            block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
++
++        # 4. Комплект (зависит от всех трёх)
++        kit_options = kit_options_fn(
++            tuple(sel_disc) if sel_disc else (),
++            tuple(sel_section) if sel_section else (),
++            block_codes,
++        )
++        with c4:
++            sel_kit_labels = st.multiselect(
++                "Комплект",
++                options=list(kit_options.values()),
++                placeholder="Все",
++                key=f"{key_prefix}kit",
++            )
++            sel_kit = [code for code, label in kit_options.items()
++                       if label in sel_kit_labels]
++
++        # 5. Марка комплекта (блок 2 шифра)
++        with c5:
++            sel_marka = st.text_input(
++                "Марка комплекта",
++                placeholder="например: КЖ1",
++                key=f"{key_prefix}marka",
++                help="Точное совпадение 2-го блока шифра (марки). "
++                     "КЖ1 не найдёт КЖ11 или КЖ10.",
++            )
++
++        # 6. Необязательная вкладко-специфичная колонка ряда 1
++        kits_t = tuple(sel_kit)
++        if row1_extra is not None:
++            extra1 = row1_extra(c6, kits_t) or {}
++            if extra1:
++                result["extra"].update(extra1)
++
++        # ------- Ряд 2: статусы -------
++        sel_remark_statuses = []
++        sel_sheet_groups = []
++        if show_remark_status or show_sheet_status:
++            st.write("")
++            col_a, col_b = st.columns(2)
++            if show_remark_status:
++                with col_a:
++                    sel_remark_statuses = st.multiselect(
++                        "Статус замечания",
++                        options=list(remark_status_options),
++                        placeholder="Все",
++                        key=f"{key_prefix}remark_status",
++                    )
++            if show_sheet_status:
++                # если показываем только статус листа — ставим в левую колонку
++                with (col_b if show_remark_status else col_a):
++                    sel_sheet_groups = st.multiselect(
++                        "Статус листа",
++                        options=SHEET_GROUP_OPTIONS,
++                        placeholder="Все",
++                        key=f"{key_prefix}sheet_group",
++                    )
++
++        # ------- Ряд 3: вкладко-специфичные фильтры -------
++        if extra_row is not None:
++            extra = extra_row() or {}
++            if extra:
++                result["extra"].update(extra)
++
++    result["disc"] = tuple(sel_disc)
++    result["section"] = tuple(sel_section)
++    result["kits"] = kits_t
++    result["block_codes"] = tuple(block_codes)
++    result["marka"] = (sel_marka or "").strip()
++    result["remark_statuses"] = (
++        tuple(sel_remark_statuses)
++        if show_remark_status and sel_remark_statuses else ()
++    )
++    result["sheet_groups"] = (
++        tuple(sel_sheet_groups)
++        if show_sheet_status and sel_sheet_groups else ()
++    )
++    return result
+diff --git a/vitro/ui/authors.py b/vitro/ui/authors.py
+index 6944b46..db6c43d 100644
+--- a/vitro/ui/authors.py
++++ b/vitro/ui/authors.py
+@@ -19,14 +19,14 @@ import pandas as pd
+ import plotly.express as px
+ import streamlit as st
+ 
+-from vitro.sqlite_db import get_conn, update_category_safe
++from vitro.sqlite_db import update_category_safe
+ from vitro.disciplines import discipline_name
+ from vitro.ui._auth import ensure_user
+ from vitro.ui._filters import (
+-    REMARK_STATUS_OPTIONS,
+-    SHEET_GROUP_OPTIONS,
+     _doc_status_group,
++    _filter_by_blocks,
+     _filter_by_marka,
++    render_standard_filters,
+ )
+ from vitro.ui._urls import build_vitro_comment_url
+ 
+@@ -63,16 +63,7 @@ _CAT_PREFIX_MAP = {
+     CAT_4: f"🔴 {CAT_4}",
+ }
+ 
+-# ---- Расположение (4-й блок шифра) ----
+-BLOCK_OPTIONS = {
+-    "Корпус 1":                    "1",
+-    "Корпус 2":                    "2",
+-    "Общие":                       "0",
+-    "Стилобат":                    "С",
+-    "Газовая котельная":           "ГК",
+-    "Генплан":                     "ГП",
+-    "Автомобильные дороги (УДС)":  "А",
+-}
++# ---- Расположение (4-й блок шифра) — единый справочник в _filters.py ----
+ 
+ ALL_AUTHORS = "— Все авторы —"
+ 
+@@ -86,23 +77,6 @@ def _strip_prefix(display_value: str) -> str:
+     return display_value.strip()
+ 
+ 
+-def _extract_4th_block(complex_code) -> str:
+-    if not complex_code:
+-        return ""
+-    parts = str(complex_code).split("-")
+-    if len(parts) >= 4:
+-        return parts[3].strip().upper()
+-    return ""
+-
+-
+-def _filter_by_blocks(df: pd.DataFrame,
+-                       block_codes: tuple = ()) -> pd.DataFrame:
+-    if df.empty or not block_codes:
+-        return df
+-    blocks = df["complex"].apply(_extract_4th_block)
+-    return df[blocks.isin(block_codes)]
+-
+-
+ def _collapse_repeats(df: pd.DataFrame,
+                        cols: list) -> pd.DataFrame:
+     """Скрывает повторяющиеся значения в колонках."""
+@@ -127,65 +101,8 @@ def _load_all_categorized() -> pd.DataFrame:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Справочники
++#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты)
+ # ---------------------------------------------------------------------------
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_discipline_options() -> dict[str, str]:
+-    with get_conn() as conn:
+-        codes = [r["discipline"] for r in conn.execute(
+-            "SELECT DISTINCT discipline FROM documents "
+-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        if disciplines:
+-            ph = ",".join("?" * len(disciplines))
+-            rows = conn.execute(f"""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                  AND discipline IN ({ph}) ORDER BY section
+-            """, tuple(disciplines)).fetchall()
+-        else:
+-            rows = conn.execute("""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                ORDER BY section
+-            """).fetchall()
+-    return {r["section"]: r["section"] for r in rows}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_kit_options(disciplines: tuple = (),
+-                       sections: tuple = (),
+-                       block_codes: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        where = ["c.code IS NOT NULL"]
+-        params: list = []
+-        if disciplines:
+-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
+-            params += list(disciplines)
+-        if sections:
+-            ph = ",".join("?" * len(sections))
+-            where.append(f"""c.code IN (
+-                SELECT DISTINCT complex FROM documents
+-                WHERE section IN ({ph}) AND complex IS NOT NULL)""")
+-            params += list(sections)
+-        rows = conn.execute(f"""
+-            SELECT c.code, c.name FROM complexes c
+-            WHERE {' AND '.join(where)} ORDER BY c.code
+-        """, tuple(params)).fetchall()
+-
+-    result = {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
+-              for r in rows}
+-
+-    # Фильтр по расположению (4-й блок) — в Python
+-    if block_codes:
+-        result = {code: label for code, label in result.items()
+-                  if _extract_4th_block(code) in block_codes}
+-    return result
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -197,7 +114,8 @@ def _filter_by_hierarchy(df: pd.DataFrame,
+                           kits: tuple = (),
+                           sheet_groups: tuple = (),
+                           remark_statuses: tuple = (),
+-                          marka: str = "") -> pd.DataFrame:
++                          marka: str = "",
++                          block_codes: tuple = ()) -> pd.DataFrame:
+     if df.empty:
+         return df
+     out = df
+@@ -207,6 +125,8 @@ def _filter_by_hierarchy(df: pd.DataFrame,
+         out = out[out["section"].isin(sections)]
+     if kits:
+         out = out[out["complex"].isin(kits)]
++    if block_codes:
++        out = _filter_by_blocks(out, block_codes)
+     if sheet_groups:
+         out = out[
+             out["doc_status"].apply(_doc_status_group).isin(sheet_groups)
+@@ -281,10 +201,12 @@ def _load_authors(disciplines: tuple = (), sections: tuple = (),
+                    kits: tuple = (),
+                    sheet_groups: tuple = (),
+                    remark_statuses: tuple = (),
+-                   marka: str = "") -> pd.DataFrame:
++                   marka: str = "",
++                   block_codes: tuple = ()) -> pd.DataFrame:
+     df = _load_all_categorized()
+     df = _filter_by_hierarchy(df, disciplines, sections, kits,
+-                               sheet_groups, remark_statuses, marka)
++                               sheet_groups, remark_statuses, marka,
++                               block_codes)
+ 
+     if df.empty:
+         return pd.DataFrame()
+@@ -693,7 +615,8 @@ def _render_drilldown(df: pd.DataFrame, df_ours: pd.DataFrame):
+ # ---------------------------------------------------------------------------
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_waiting_review(disciplines=None, kits=None,
+-                          sections=None, authors=None) -> pd.DataFrame:
++                          sections=None, authors=None,
++                          block_codes=None, marka: str = "") -> pd.DataFrame:
+     df = _load_all_categorized()
+     if df.empty:
+         return df
+@@ -710,6 +633,10 @@ def _load_waiting_review(disciplines=None, kits=None,
+         df = df[df["complex"].isin(kits)]
+     if authors:
+         df = df[df["author"].isin(authors)]
++    if block_codes:
++        df = _filter_by_blocks(df, tuple(block_codes))
++    if marka:
++        df = _filter_by_marka(df, marka)
+ 
+     df = df.copy()
+     df["fix_date"] = df["fix_date"].fillna("")
+@@ -734,53 +661,33 @@ def _render_waiting_review():
+     else:
+         _authors = []
+ 
+-    disc_options = _load_discipline_options()
+-    with st.expander("🎛 Фильтры", expanded=False):
+-        c1, c2, c3, c4 = st.columns(4)
+-        with c1:
+-            sel_disc_labels = st.multiselect(
+-                "Дисциплина", options=list(disc_options.values()),
+-                placeholder="Все дисциплины", key="wait_disc",
+-            )
+-            sel_disc = [c for c, l in disc_options.items()
+-                         if l in sel_disc_labels]
+-        section_options = _load_section_options(
+-            tuple(sel_disc) if sel_disc else ())
+-        with c2:
+-            if section_options:
+-                sel_section_labels = st.multiselect(
+-                    "Раздел", options=list(section_options.values()),
+-                    placeholder="Все разделы", key="wait_section",
+-                )
+-                sel_section = [c for c, l in section_options.items()
+-                                if l in sel_section_labels]
+-            else:
+-                sel_section = []
+-                st.multiselect("Раздел", options=[],
+-                                placeholder="Не применимы",
+-                                disabled=True, key="wait_section_empty")
+-        kit_options = _load_kit_options(
+-            tuple(sel_disc) if sel_disc else (),
+-            tuple(sel_section) if sel_section else ())
+-        with c3:
+-            sel_kit_labels = st.multiselect(
+-                "Комплект", options=list(kit_options.values()),
+-                placeholder="Все комплекты", key="wait_kit",
+-            )
+-            sel_kit = [c for c, l in kit_options.items()
+-                        if l in sel_kit_labels]
++    def _wait_extra_row():
++        c4 = st.columns(1)[0]
+         with c4:
+             sel_author_labels = st.multiselect(
+                 "Автор (заказчик)", options=_authors,
+                 placeholder="Все авторы", key="wait_author",
+             )
+-            sel_author = sel_author_labels
++        return {"author": tuple(sel_author_labels)}
++
++    # Единый стандарт фильтров (как в Сводке) + автор в 3-м ряду
++    flt = render_standard_filters(
++        key_prefix="wait_",
++        expander_label="🎛 Фильтры",
++        expanded=False,
++        show_remark_status=False,
++        show_sheet_status=False,
++        extra_row=_wait_extra_row,
++    )
++    sel_author = list(flt["extra"].get("author", ()))
+ 
+     df = _load_waiting_review(
+-        disciplines=tuple(sel_disc) if sel_disc else None,
+-        kits=tuple(sel_kit) if sel_kit else None,
+-        sections=tuple(sel_section) if sel_section else None,
+-        authors=tuple(sel_author) if sel_author else None,
++        disciplines=flt["disc"] or None,
++        kits=flt["kits"] or None,
++        sections=flt["section"] or None,
++        authors=sel_author or None,
++        block_codes=flt["block_codes"] or None,
++        marka=flt["marka"],
+     )
+ 
+     if df.empty:
+@@ -953,7 +860,8 @@ def _render_waiting_review():
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_customer_a_annulled(disciplines=None, kits=None,
+                                 sections=None,
+-                                block_codes=None) -> pd.DataFrame:
++                                block_codes=None,
++                                marka: str = "") -> pd.DataFrame:
+     """
+     Замечания к листам A и к аннулированным листам.
+     holder IN ('customer_a', 'annulled').
+@@ -974,6 +882,8 @@ def _load_customer_a_annulled(disciplines=None, kits=None,
+         df = df[df["complex"].isin(kits)]
+     if block_codes:
+         df = _filter_by_blocks(df, tuple(block_codes))
++    if marka:
++        df = _filter_by_marka(df, marka)
+ 
+     return df
+ 
+@@ -1102,54 +1012,21 @@ def _render_customer_a_annulled():
+         "Ожидаем снятия от заказчика."
+     )
+ 
+-    disc_options = _load_discipline_options()
+-    with st.expander("🎛 Фильтры", expanded=False):
+-        c1, c2, c3, c4 = st.columns(4)
+-        with c1:
+-            sel_disc_labels = st.multiselect(
+-                "Дисциплина", options=list(disc_options.values()),
+-                placeholder="Все дисциплины", key="ca_disc",
+-            )
+-            sel_disc = [c for c, l in disc_options.items()
+-                         if l in sel_disc_labels]
+-        section_options = _load_section_options(
+-            tuple(sel_disc) if sel_disc else ())
+-        with c2:
+-            if section_options:
+-                sel_section_labels = st.multiselect(
+-                    "Раздел", options=list(section_options.values()),
+-                    placeholder="Все разделы", key="ca_section",
+-                )
+-                sel_section = [c for c, l in section_options.items()
+-                                if l in sel_section_labels]
+-            else:
+-                sel_section = []
+-                st.multiselect("Раздел", options=[],
+-                                placeholder="Не применимы",
+-                                disabled=True, key="ca_section_empty")
+-        with c3:
+-            sel_blocks = st.multiselect(
+-                "Расположение", options=list(BLOCK_OPTIONS.keys()),
+-                placeholder="Все", key="ca_blocks",
+-            )
+-            block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
+-        kit_options = _load_kit_options(
+-            tuple(sel_disc) if sel_disc else (),
+-            tuple(sel_section) if sel_section else (),
+-            block_codes)
+-        with c4:
+-            sel_kit_labels = st.multiselect(
+-                "Комплект", options=list(kit_options.values()),
+-                placeholder="Все комплекты", key="ca_kit",
+-            )
+-            sel_kit = [c for c, l in kit_options.items()
+-                        if l in sel_kit_labels]
++    # Единый стандарт фильтров (как в Сводке).
++    flt = render_standard_filters(
++        key_prefix="ca_",
++        expander_label="🎛 Фильтры",
++        expanded=False,
++        show_remark_status=False,
++        show_sheet_status=False,
++    )
+ 
+     df = _load_customer_a_annulled(
+-        disciplines=tuple(sel_disc) if sel_disc else None,
+-        kits=tuple(sel_kit) if sel_kit else None,
+-        sections=tuple(sel_section) if sel_section else None,
+-        block_codes=block_codes if block_codes else None,
++        disciplines=flt["disc"] or None,
++        kits=flt["kits"] or None,
++        sections=flt["section"] or None,
++        block_codes=flt["block_codes"] or None,
++        marka=flt["marka"],
+     )
+ 
+     if df.empty:
+@@ -1268,90 +1145,29 @@ def _render_customer_a_annulled():
+ #  Точка входа
+ # ---------------------------------------------------------------------------
+ def _render_analytics_tab():
+-    disc_options = _load_discipline_options()
+-
+-    c1, c2, c3 = st.columns(3)
+-    with c1:
+-        sel_disc_labels = st.multiselect(
+-            "Дисциплина", options=list(disc_options.values()),
+-            placeholder="Все дисциплины", key="authors_disc",
+-        )
+-        sel_disc = [c for c, l in disc_options.items()
+-                    if l in sel_disc_labels]
+-
+-    section_options = _load_section_options(
+-        tuple(sel_disc) if sel_disc else ())
+-
+-    with c2:
+-        if section_options:
+-            sel_section_labels = st.multiselect(
+-                "Раздел", options=list(section_options.values()),
+-                placeholder="Все разделы", key="authors_section",
+-            )
+-            sel_section = [c for c, l in section_options.items()
+-                            if l in sel_section_labels]
+-        else:
+-            sel_section = []
+-            st.multiselect("Раздел", options=[],
+-                            placeholder="Разделы не применимы",
+-                            disabled=True, key="authors_section_empty")
+-
+-    kit_options = _load_kit_options(
+-        tuple(sel_disc) if sel_disc else (),
+-        tuple(sel_section) if sel_section else ())
+-
+-    with c3:
+-        sel_kit_labels = st.multiselect(
+-            "Комплект", options=list(kit_options.values()),
+-            placeholder="Все комплекты", key="authors_kit",
+-        )
+-        sel_kit = [c for c, l in kit_options.items()
+-                    if l in sel_kit_labels]
+-
+-    # Второй ряд: Марка + Статус замечания + Статус листа
+-    st.write("")
+-    c4, c5, c6 = st.columns(3)
+-    with c4:
+-        sel_marka = st.text_input(
+-            "Марка комплекта",
+-            placeholder="например: КЖ1",
+-            key="authors_marka",
+-            help="Точное совпадение 2-го блока шифра (марки). "
+-                 "КЖ1 не найдёт КЖ11 или КЖ10.",
+-        )
+-    with c5:
+-        sel_remark_statuses = st.multiselect(
+-            "Статус замечания",
+-            options=REMARK_STATUS_OPTIONS,
+-            placeholder="Все статусы",
+-            key="authors_remark_status",
+-            help="Выполнено, Закрыто, Аннулировано не участвуют в аналитике авторов.",
+-        )
+-    with c6:
+-        sel_sheet_groups = st.multiselect(
+-            "Статус листа",
+-            options=SHEET_GROUP_OPTIONS,
+-            placeholder="Все статусы листов",
+-            key="authors_sheet_group",
+-        )
+-
+-    disc_t = tuple(sel_disc) if sel_disc else ()
+-    sect_t = tuple(sel_section) if sel_section else ()
+-    kit_t = tuple(sel_kit) if sel_kit else ()
+-    sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
+-    remark_statuses_t = tuple(sel_remark_statuses) if sel_remark_statuses else ()
+-    marka_t = (sel_marka or "").strip()
++    # Единый стандарт фильтров (как в Сводке):
++    # ряд 1 — Дисциплина → Раздел → Расположение → Комплект → Марка,
++    # ряд 2 — Статус замечания + Статус листа.
++    flt = render_standard_filters(key_prefix="authors_")
++
++    disc_t = flt["disc"]
++    sect_t = flt["section"]
++    kit_t = flt["kits"]
++    block_codes = flt["block_codes"]
++    sheet_groups_t = flt["sheet_groups"]
++    remark_statuses_t = flt["remark_statuses"]
++    marka_t = flt["marka"]
+ 
+     df_all = _load_all_categorized()
+     df_all = _filter_by_hierarchy(df_all, disc_t, sect_t, kit_t,
+                                    sheet_groups_t, remark_statuses_t,
+-                                   marka_t)
++                                   marka_t, block_codes)
+     df_ours = df_all[df_all["holder"] == "ours"]
+ 
+     _render_kpi(df_all, df_ours)
+ 
+     df = _load_authors(disc_t, sect_t, kit_t, sheet_groups_t,
+-                        remark_statuses_t, marka_t)
++                        remark_statuses_t, marka_t, block_codes)
+     if df.empty:
+         st.info("Нет данных по авторам с учётом фильтров.")
+         return
+diff --git a/vitro/ui/categories.py b/vitro/ui/categories.py
+index c5f8a9c..38897b6 100644
+--- a/vitro/ui/categories.py
++++ b/vitro/ui/categories.py
+@@ -25,10 +25,12 @@ from vitro.sqlite_db import (
+     update_category_safe,
+     update_category_force,
+ )
+-from vitro.disciplines import discipline_name
+ from vitro.time_utils import fmt_msk
+ from vitro.ui._auth import ensure_user
+-from vitro.ui._filters import _filter_by_marka
++from vitro.ui._filters import (
++    _filter_by_marka,
++    render_standard_filters,
++)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -100,70 +102,8 @@ def _add_prefix(raw_value: str):
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Справочники
++#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты)
+ # ---------------------------------------------------------------------------
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_discipline_options() -> dict[str, str]:
+-    with get_conn() as conn:
+-        codes = [r["discipline"] for r in conn.execute(
+-            "SELECT DISTINCT discipline FROM documents "
+-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        if disciplines:
+-            ph = ",".join("?" * len(disciplines))
+-            rows = conn.execute(f"""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                  AND discipline IN ({ph})
+-                ORDER BY section
+-            """, tuple(disciplines)).fetchall()
+-        else:
+-            rows = conn.execute("""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                ORDER BY section
+-            """).fetchall()
+-    return {r["section"]: r["section"] for r in rows}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_kit_options(disciplines: tuple = (),
+-                      sections: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        where = ["c.code IS NOT NULL"]
+-        params: list = []
+-
+-        if disciplines:
+-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
+-            params += list(disciplines)
+-
+-        if sections:
+-            ph = ",".join("?" * len(sections))
+-            where.append(f"""c.code IN (
+-                SELECT DISTINCT complex FROM documents
+-                WHERE section IN ({ph})
+-                  AND complex IS NOT NULL
+-            )""")
+-            params += list(sections)
+-
+-        rows = conn.execute(f"""
+-            SELECT c.code, c.name
+-            FROM complexes c
+-            WHERE {' AND '.join(where)}
+-            ORDER BY c.code
+-        """, tuple(params)).fetchall()
+-
+-    result = {}
+-    for r in rows:
+-        code = r["code"]
+-        name = (r["name"] or "").strip()
+-        result[code] = f"{code} — {name}" if name else code
+-    return result
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -542,95 +482,37 @@ def _render_editor():
+             key="editor_only_uncat",
+         )
+ 
+-    disc_options = _load_discipline_options()
+-
+-    with st.expander("🎛 Фильтры", expanded=False):
+-        c1, c2, c3, c4 = st.columns(4)
+-
+-        with c1:
+-            sel_disc_labels = st.multiselect(
+-                "Дисциплина",
+-                options=list(disc_options.values()),
+-                placeholder="Все дисциплины",
+-                key="editor_disc",
+-            )
+-            sel_disc = [code for code, label in disc_options.items()
+-                        if label in sel_disc_labels]
+-
+-        section_options = _load_section_options(
+-            tuple(sel_disc) if sel_disc else ())
+-
+-        with c2:
+-            if section_options:
+-                sel_section_labels = st.multiselect(
+-                    "Раздел",
+-                    options=list(section_options.values()),
+-                    placeholder="Все разделы",
+-                    key="editor_section",
+-                )
+-                sel_section = [code for code, label in section_options.items()
+-                               if label in sel_section_labels]
+-            else:
+-                sel_section = []
+-                st.multiselect(
+-                    "Раздел", options=[],
+-                    placeholder="Разделы не применимы",
+-                    disabled=True,
+-                    key="editor_section_empty",
+-                )
+-
+-        kit_options = _load_kit_options(
+-            tuple(sel_disc) if sel_disc else (),
+-            tuple(sel_section) if sel_section else (),
+-        )
+-
+-        with c3:
+-            sel_kit_labels = st.multiselect(
+-                "Комплект",
+-                options=list(kit_options.values()),
+-                placeholder="Все комплекты",
+-                key="editor_kit",
+-            )
+-            sel_kit = [code for code, label in kit_options.items()
+-                       if label in sel_kit_labels]
+-
+-        with c4:
+-            sel_marka = st.text_input(
+-                "Марка комплекта",
+-                placeholder="например: КЖ1",
+-                key="editor_marka",
+-                help="Точное совпадение 2-го блока шифра (марки). "
+-                     "КЖ1 не найдёт КЖ11 или КЖ10. "
+-                     "Применяется после лимита строк.",
+-            )
+-
+-        if show_waiting:
+-            status_options = [
+-                "Новое", "Принято в работу", "Не принято",
+-                "К обсуждению", "Выполнено",
+-            ]
+-        else:
+-            status_options = [
+-                "Новое", "Принято в работу",
+-                "Не принято", "К обсуждению",
+-            ]
+-
+-        c5, c6 = st.columns(2)
+-        with c5:
+-            sel_status = st.multiselect(
+-                "Статус замечания",
+-                options=status_options,
+-                default=status_options,
+-                placeholder="Все доступные статусы",
+-                key="editor_status",
+-            )
+-
+-        with c6:
++    # Единый стандарт фильтров (как в Сводке) + лимит строк в 3-м ряду.
++    def _editor_extra_row():
++        c_l1, c_l2 = st.columns(2)
++        with c_l1:
+             limit = st.number_input(
+                 "Лимит строк",
+                 min_value=50, max_value=2000,
+                 value=300, step=50, key="editor_limit",
+             )
++        with c_l2:
++            st.caption(
++                "Показываются только активные статусы. «Выполнено» "
++                "учитывается, если включено выше."
++            )
++        return {"limit": int(limit)}
++
++    flt = render_standard_filters(
++        key_prefix="editor_",
++        expander_label="🎛 Фильтры",
++        expanded=False,
++        show_remark_status=True,
++        show_sheet_status=False,
++        extra_row=_editor_extra_row,
++    )
++
++    sel_disc = flt["disc"]
++    sel_section = flt["section"]
++    sel_kit = flt["kits"]
++    sel_marka = flt["marka"]
++    sel_status = flt["remark_statuses"]
++    limit = flt["extra"].get("limit", 300)
+ 
+     df = load_remarks_for_editor(
+         disciplines=tuple(sel_disc) if sel_disc else None,
+diff --git a/vitro/ui/deadlines.py b/vitro/ui/deadlines.py
+index 504cecc..83e7e9a 100644
+--- a/vitro/ui/deadlines.py
++++ b/vitro/ui/deadlines.py
+@@ -20,12 +20,14 @@ import plotly.express as px
+ import streamlit as st
+ 
+ from vitro.sqlite_db import get_conn
+-from vitro.disciplines import discipline_name
+ from vitro.workdays import add_workdays, parse_date, workdays_between
+ from vitro.text_utils import clean_leaf_key
+-from vitro.time_utils import fmt_msk
+ from vitro.ui._urls import build_vitro_comment_url
+-from vitro.ui._filters import _filter_by_marka
++from vitro.ui._filters import (
++    _filter_by_marka,
++    _extract_4th_block,
++    render_standard_filters,
++)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -35,16 +37,6 @@ SLA_DAYS = 10
+ ABANDONED_DAYS = 90
+ CHRONIC_WORKDAYS = 90
+ 
+-BLOCK_OPTIONS = {
+-    "Корпус 1":                    "1",
+-    "Корпус 2":                    "2",
+-    "Общие":                       "0",
+-    "Стилобат":                    "С",
+-    "Газовая котельная":           "ГК",
+-    "Генплан":                     "ГП",
+-    "Автомобильные дороги (УДС)":  "А",
+-}
+-
+ BUCKET_ORDER = ["≤10", "10–30", "30–90", ">90"]
+ 
+ BUCKET_LABELS = {
+@@ -101,81 +93,8 @@ SHEET_GROUPS_OURS = [
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Справочники
++#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты)
+ # ---------------------------------------------------------------------------
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_discipline_options() -> dict[str, str]:
+-    with get_conn() as conn:
+-        codes = [r["discipline"] for r in conn.execute(
+-            "SELECT DISTINCT discipline FROM documents "
+-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        if disciplines:
+-            ph = ",".join("?" * len(disciplines))
+-            rows = conn.execute(f"""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                  AND discipline IN ({ph})
+-                ORDER BY section
+-            """, tuple(disciplines)).fetchall()
+-        else:
+-            rows = conn.execute("""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                ORDER BY section
+-            """).fetchall()
+-    return {r["section"]: r["section"] for r in rows}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_kit_options(disciplines: tuple = (),
+-                       sections: tuple = (),
+-                       block_codes: tuple = ()) -> dict[str, str]:
+-    """
+-    Комплекты с учётом дисциплин, разделов и расположения (4-й блок).
+-    """
+-    with get_conn() as conn:
+-        where = ["c.code IS NOT NULL"]
+-        params: list = []
+-
+-        if disciplines:
+-            where.append(
+-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
+-            params += list(disciplines)
+-
+-        if sections:
+-            ph = ",".join("?" * len(sections))
+-            where.append(f"""c.code IN (
+-                SELECT DISTINCT complex FROM documents
+-                WHERE section IN ({ph}) AND complex IS NOT NULL)""")
+-            params += list(sections)
+-
+-        rows = conn.execute(f"""
+-            SELECT c.code, c.name FROM complexes c
+-            WHERE {' AND '.join(where)} ORDER BY c.code
+-        """, tuple(params)).fetchall()
+-
+-    result = {r["code"]: f"{r['code']} — {r['name']}"
+-                       if r["name"] else r["code"]
+-            for r in rows}
+-
+-    # Фильтр по расположению (в Python)
+-    if block_codes:
+-        filtered = {}
+-        for code, label in result.items():
+-            block = _extract_4th_block(code)
+-            if block in block_codes:
+-                filtered[code] = label
+-        return filtered
+-
+-    return result
+-
+-
+ @st.cache_data(ttl=600, show_spinner=False)
+ def _load_sheet_options(kits: tuple = ()) -> list[str]:
+     if not kits:
+@@ -208,17 +127,8 @@ def _load_last_sync_date() -> str | None:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  4-й блок
++#  4-й блок — общий модуль _filters.py
+ # ---------------------------------------------------------------------------
+-def _extract_4th_block(complex_code) -> str:
+-    if not complex_code:
+-        return ""
+-    parts = str(complex_code).split("-")
+-    if len(parts) >= 4:
+-        return parts[3].strip().upper()
+-    return ""
+-
+-
+ def _sheet_status_group(raw) -> str:
+     if raw is None:
+         return "Прочее"
+@@ -499,90 +409,40 @@ def _pie_with_legend(data: pd.DataFrame,
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Верхние фильтры
++#  Верхние фильтры — единый стандарт (как в Сводке) + 6-я колонка «Лист»
+ # ---------------------------------------------------------------------------
+ def _render_filters():
+-    disc_options = _load_discipline_options()
+-
+-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+-
+-    # 1. Дисциплина
+-    with c1:
+-        sel_disc_labels = st.multiselect(
+-            "Дисциплина", options=list(disc_options.values()),
+-            placeholder="Все", key="dl_disc",
+-        )
+-        sel_disc = [c for c, l in disc_options.items()
+-                    if l in sel_disc_labels]
+-
+-    # 2. Раздел
+-    section_options = _load_section_options(
+-        tuple(sel_disc) if sel_disc else ())
+-    with c2:
+-        if section_options:
+-            sel_section_labels = st.multiselect(
+-                "Раздел", options=list(section_options.values()),
+-                placeholder="Все", key="dl_section",
+-            )
+-            sel_section = [c for c, l in section_options.items()
+-                            if l in sel_section_labels]
+-        else:
+-            sel_section = []
+-            st.multiselect("Раздел", options=[],
+-                            placeholder="—",
+-                            disabled=True, key="dl_section_empty")
+-
+-    # 3. Расположение
+-    with c3:
+-        sel_blocks = st.multiselect(
+-            "Расположение",
+-            options=list(BLOCK_OPTIONS.keys()),
+-            placeholder="Все",
+-            key="dl_blocks",
+-        )
+-        block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
+-
+-    # 4. Комплект (с учётом дисциплины, раздела, расположения)
+-    kit_options = _load_kit_options(
+-        tuple(sel_disc) if sel_disc else (),
+-        tuple(sel_section) if sel_section else (),
+-        block_codes,
+-    )
+-    with c4:
+-        sel_kit_labels = st.multiselect(
+-            "Комплект", options=list(kit_options.values()),
+-            placeholder="Все", key="dl_kit",
+-        )
+-        sel_kit = [c for c, l in kit_options.items()
+-                    if l in sel_kit_labels]
+-
+-    # 5. Марка комплекта (блок 2 шифра)
+-    with c5:
+-        sel_marka = st.text_input(
+-            "Марка комплекта",
+-            placeholder="например: КЖ1",
+-            key="dl_marka",
+-            help="Точное совпадение 2-го блока шифра (марки). "
+-                 "КЖ1 не найдёт КЖ11 или КЖ10.",
+-        )
++    """
++    Единый стандарт фильтров (_filters.render_standard_filters).
++    Каскад ряда 1: Дисциплина → Раздел → Расположение → Комплект → Марка,
++    плюс вкладко-специфичная колонка «Лист» (только из выбранного комплекта).
++    Возвращает (disc, sect, kits, sheets, block_codes, marka) — прежний
++    контракт, чтобы не менять код ниже.
++    """
+ 
+-    # 6. Лист (только из выбранного комплекта)
+-    with c6:
+-        if sel_kit:
+-            sheet_options = _load_sheet_options(tuple(sel_kit))
+-            sel_sheet = st.multiselect(
++    def _sheet_filter(col, kits_t):
++        if kits_t:
++            sheet_options = _load_sheet_options(kits_t)
++            val = col.multiselect(
+                 "Лист", options=sheet_options,
+                 placeholder="Все", key="dl_sheet",
+             )
+         else:
+-            sel_sheet = []
+-            st.multiselect("Лист", options=[],
++            val = []
++            col.multiselect("Лист", options=[],
+                             placeholder="Выберите комплект",
+                             disabled=True, key="dl_sheet_empty")
++        return {"sheets": tuple(val)}
+ 
+-    return (tuple(sel_disc), tuple(sel_section),
+-            tuple(sel_kit), tuple(sel_sheet), block_codes,
+-            (sel_marka or "").strip())
++    flt = render_standard_filters(
++        key_prefix="dl_",
++        show_remark_status=False,
++        show_sheet_status=False,
++        row1_extra=_sheet_filter,
++    )
++    return (flt["disc"], flt["section"], flt["kits"],
++            flt["extra"].get("sheets", ()), flt["block_codes"],
++            flt["marka"])
+ 
+ 
+ def _apply_filters(df: pd.DataFrame,
+diff --git a/vitro/ui/dynamics.py b/vitro/ui/dynamics.py
+index 48dfa18..bed50fb 100644
+--- a/vitro/ui/dynamics.py
++++ b/vitro/ui/dynamics.py
+@@ -3,7 +3,8 @@
+ 📈 Динамика — потоки замечаний по месяцам.
+ 
+ Инструмент РП и Директора: сколько выдаётся, отвечаем, закрывается.
+-Каскадные фильтры: дисциплина → раздел → расположение → комплект.
++Фильтры — единый стандарт (_filters.render_standard_filters):
++дисциплина → раздел → расположение → комплект → марка.
+ Период: пресеты + календарь.
+ """
+ 
+@@ -16,100 +17,7 @@ import streamlit as st
+ 
+ from vitro.sqlite_db import get_conn
+ from vitro.disciplines import discipline_name
+-
+-
+-# ---------------------------------------------------------------------------
+-#  Расположение (4-й блок шифра)
+-# ---------------------------------------------------------------------------
+-BLOCK_OPTIONS = {
+-    "Корпус 1":                    "1",
+-    "Корпус 2":                    "2",
+-    "Общие":                       "0",
+-    "Стилобат":                    "С",
+-    "Газовая котельная":           "ГК",
+-    "Генплан":                     "ГП",
+-    "Автомобильные дороги (УДС)":  "А",
+-}
+-
+-
+-def _extract_4th_block(complex_code) -> str:
+-    if not complex_code:
+-        return ""
+-    parts = str(complex_code).split("-")
+-    if len(parts) >= 4:
+-        return parts[3].strip().upper()
+-    return ""
+-
+-
+-# ---------------------------------------------------------------------------
+-#  Справочники
+-# ---------------------------------------------------------------------------
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_discipline_options() -> dict[str, str]:
+-    with get_conn() as conn:
+-        codes = [r["discipline"] for r in conn.execute(
+-            "SELECT DISTINCT discipline FROM documents "
+-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        if disciplines:
+-            ph = ",".join("?" * len(disciplines))
+-            rows = conn.execute(f"""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                  AND discipline IN ({ph})
+-                ORDER BY section
+-            """, tuple(disciplines)).fetchall()
+-        else:
+-            rows = conn.execute("""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                ORDER BY section
+-            """).fetchall()
+-    return {r["section"]: r["section"] for r in rows}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_kit_options(disciplines: tuple = (),
+-                       sections: tuple = (),
+-                       block_codes: tuple = ()) -> dict[str, str]:
+-    """Комплекты с учётом дисциплины, раздела и расположения."""
+-    with get_conn() as conn:
+-        where = ["c.code IS NOT NULL"]
+-        params: list = []
+-        if disciplines:
+-            where.append(
+-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
+-            params += list(disciplines)
+-        if sections:
+-            ph = ",".join("?" * len(sections))
+-            where.append(f"""c.code IN (
+-                SELECT DISTINCT complex FROM documents
+-                WHERE section IN ({ph}) AND complex IS NOT NULL)""")
+-            params += list(sections)
+-        rows = conn.execute(f"""
+-            SELECT c.code, c.name FROM complexes c
+-            WHERE {' AND '.join(where)}
+-            ORDER BY c.code
+-        """, tuple(params)).fetchall()
+-
+-    result = {r["code"]: f"{r['code']} — {r['name']}"
+-                       if r["name"] else r["code"]
+-            for r in rows}
+-
+-    # Фильтр по расположению (в Python — 4-й блок)
+-    if block_codes:
+-        filtered = {}
+-        for code, label in result.items():
+-            block = _extract_4th_block(code)
+-            if block in block_codes:
+-                filtered[code] = label
+-        return filtered
+-    return result
++from vitro.ui._filters import render_standard_filters
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -119,7 +27,8 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
+                        kits: tuple, block_codes: tuple,
+                        date_from: date, date_to: date,
+                        date_col: str,
+-                       alias: str = "d") -> tuple[str, list]:
++                       alias: str = "d",
++                       marka: str = "") -> tuple[str, list]:
+     parts = []
+     params: list = []
+     if disciplines:
+@@ -141,6 +50,12 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
+             ors.append(f"{alias}.complex LIKE '%-{bc}-%'")
+             ors.append(f"{alias}.complex LIKE '%-{bc.lower()}-%'")
+         parts.append("(" + " OR ".join(ors) + ")")
++    if marka:
++        # Марка (2-й блок) — строгое совпадение через LIKE:
++        # '%-КЖ1-%' найдёт только КЖ1, не найдёт КЖ11 или КЖ10.
++        m = marka.strip().upper()
++        if m:
++            parts.append(f"{alias}.complex LIKE '%-{m}-%'")
+     if date_from:
+         parts.append(f"{date_col} >= ?")
+         params.append(date_from.isoformat())
+@@ -156,10 +71,11 @@ def _build_filter_sql(disciplines: tuple, sections: tuple,
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_issue_stats(disciplines: tuple, sections: tuple,
+                        kits: tuple, block_codes: tuple,
+-                       date_from: date, date_to: date) -> pd.DataFrame:
++                       date_from: date, date_to: date,
++                       marka: str = "") -> pd.DataFrame:
+     where, params = _build_filter_sql(
+         disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.created")
++        date_from, date_to, "c.created", marka=marka)
+     q = f"""
+         SELECT substr(c.created, 1, 7) AS ym, COUNT(*) AS n
+         FROM comments c
+@@ -175,10 +91,11 @@ def _load_issue_stats(disciplines: tuple, sections: tuple,
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_our_answers_stats(disciplines: tuple, sections: tuple,
+                               kits: tuple, block_codes: tuple,
+-                              date_from: date, date_to: date) -> pd.DataFrame:
++                              date_from: date, date_to: date,
++                              marka: str = "") -> pd.DataFrame:
+     where, params = _build_filter_sql(
+         disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.fix_date")
++        date_from, date_to, "c.fix_date", marka=marka)
+     q = f"""
+         SELECT substr(c.fix_date, 1, 7) AS ym, COUNT(*) AS n
+         FROM comments c
+@@ -195,10 +112,11 @@ def _load_our_answers_stats(disciplines: tuple, sections: tuple,
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
+                                   kits: tuple, block_codes: tuple,
+-                                  date_from: date, date_to: date) -> pd.DataFrame:
++                                  date_from: date, date_to: date,
++                                  marka: str = "") -> pd.DataFrame:
+     where, params = _build_filter_sql(
+         disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.fix_date")
++        date_from, date_to, "c.fix_date", marka=marka)
+     q = f"""
+         SELECT substr(c.fix_date, 1, 7) AS ym, COUNT(*) AS n
+         FROM comments c
+@@ -218,10 +136,11 @@ def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_issue_by_discipline(disciplines: tuple, sections: tuple,
+                                 kits: tuple, block_codes: tuple,
+-                                date_from: date, date_to: date) -> pd.DataFrame:
++                                date_from: date, date_to: date,
++                                marka: str = "") -> pd.DataFrame:
+     where, params = _build_filter_sql(
+         disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.created")
++        date_from, date_to, "c.created", marka=marka)
+     q = f"""
+         SELECT substr(c.created, 1, 7) AS ym,
+                d.discipline AS discipline, COUNT(*) AS n
+@@ -239,10 +158,11 @@ def _load_issue_by_discipline(disciplines: tuple, sections: tuple,
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
+                                       kits: tuple, block_codes: tuple,
+-                                      date_from: date, date_to: date) -> pd.DataFrame:
++                                      date_from: date, date_to: date,
++                                      marka: str = "") -> pd.DataFrame:
+     where, params = _build_filter_sql(
+         disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.fix_date")
++        date_from, date_to, "c.fix_date", marka=marka)
+     q = f"""
+         SELECT substr(c.fix_date, 1, 7) AS ym,
+                d.discipline AS discipline, COUNT(*) AS n
+@@ -261,10 +181,11 @@ def _load_our_answers_by_discipline(disciplines: tuple, sections: tuple,
+ @st.cache_data(ttl=3600, show_spinner=False)
+ def _load_customer_closed_by_discipline(disciplines: tuple, sections: tuple,
+                                           kits: tuple, block_codes: tuple,
+-                                          date_from: date, date_to: date) -> pd.DataFrame:
++                                          date_from: date, date_to: date,
++                                          marka: str = "") -> pd.DataFrame:
+     where, params = _build_filter_sql(
+         disciplines, sections, kits, block_codes,
+-        date_from, date_to, "c.fix_date")
++        date_from, date_to, "c.fix_date", marka=marka)
+     q = f"""
+         SELECT substr(c.fix_date, 1, 7) AS ym,
+                d.discipline AS discipline, COUNT(*) AS n
+@@ -445,7 +366,8 @@ def _render_cumulative(issue: pd.DataFrame,
+ # ---------------------------------------------------------------------------
+ def _render_by_discipline(disciplines: tuple, sections: tuple,
+                             kits: tuple, block_codes: tuple,
+-                            date_from: date, date_to: date):
++                            date_from: date, date_to: date,
++                            marka: str = ""):
+     st.markdown("### 🏷 По дисциплинам")
+ 
+     tab_issue, tab_our, tab_cust = st.tabs([
+@@ -454,7 +376,8 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
+ 
+     with tab_issue:
+         df = _load_issue_by_discipline(
+-            disciplines, sections, kits, block_codes, date_from, date_to)
++            disciplines, sections, kits, block_codes, date_from, date_to,
++            marka=marka)
+         if df.empty:
+             st.info("Нет данных.")
+         else:
+@@ -472,7 +395,8 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
+ 
+     with tab_our:
+         df = _load_our_answers_by_discipline(
+-            disciplines, sections, kits, block_codes, date_from, date_to)
++            disciplines, sections, kits, block_codes, date_from, date_to,
++            marka=marka)
+         if df.empty:
+             st.info("Нет данных.")
+         else:
+@@ -490,7 +414,8 @@ def _render_by_discipline(disciplines: tuple, sections: tuple,
+ 
+     with tab_cust:
+         df = _load_customer_closed_by_discipline(
+-            disciplines, sections, kits, block_codes, date_from, date_to)
++            disciplines, sections, kits, block_codes, date_from, date_to,
++            marka=marka)
+         if df.empty:
+             st.info("Нет данных.")
+         else:
+@@ -589,79 +514,33 @@ def render():
+         "Инструмент РП и Директора: потоки замечаний по месяцам."
+     )
+ 
+-    # ===== Каскадные фильтры (как в Сроках) =====
+-    disc_options = _load_discipline_options()
+-
+-    c1, c2, c3, c4 = st.columns(4)
+-
+-    with c1:
+-        sel_disc_labels = st.multiselect(
+-            "Дисциплина",
+-            options=list(disc_options.values()),
+-            placeholder="Все",
+-            key="dyn_disc",
+-        )
+-        sel_disc = [code for code, label in disc_options.items()
+-                    if label in sel_disc_labels]
+-
+-    section_options = _load_section_options(
+-        tuple(sel_disc) if sel_disc else ())
+-    with c2:
+-        if section_options:
+-            sel_section_labels = st.multiselect(
+-                "Раздел",
+-                options=list(section_options.values()),
+-                placeholder="Все",
+-                key="dyn_section",
+-            )
+-            sel_section = [code for code, label in section_options.items()
+-                            if label in sel_section_labels]
+-        else:
+-            sel_section = []
+-            st.multiselect("Раздел", options=[],
+-                            placeholder="—",
+-                            disabled=True, key="dyn_section_empty")
+-
+-    with c3:
+-        sel_blocks = st.multiselect(
+-            "Расположение",
+-            options=list(BLOCK_OPTIONS.keys()),
+-            placeholder="Все",
+-            key="dyn_blocks",
+-        )
+-        block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
+-
+-    kit_options = _load_kit_options(
+-        tuple(sel_disc) if sel_disc else (),
+-        tuple(sel_section) if sel_section else (),
+-        block_codes,
++    # ===== Единый стандарт фильтров (как в Сводке) =====
++    flt = render_standard_filters(
++        key_prefix="dyn_",
++        show_remark_status=False,
++        show_sheet_status=False,
+     )
+-    with c4:
+-        sel_kit_labels = st.multiselect(
+-            "Комплект",
+-            options=list(kit_options.values()),
+-            placeholder="Все",
+-            key="dyn_kit",
+-        )
+-        sel_kit = [code for code, label in kit_options.items()
+-                    if label in sel_kit_labels]
++    disc_t = flt["disc"]
++    sect_t = flt["section"]
++    kit_t = flt["kits"]
++    block_codes = flt["block_codes"]
++    marka_t = flt["marka"]
+ 
+     # ===== Период =====
+     date_from, date_to = _render_period_filter()
+ 
+-    disc_t = tuple(sel_disc)
+-    sect_t = tuple(sel_section)
+-    kit_t = tuple(sel_kit)
+-
+     st.divider()
+ 
+     with st.spinner("Загрузка..."):
+         issue = _load_issue_stats(
+-            disc_t, sect_t, kit_t, block_codes, date_from, date_to)
++            disc_t, sect_t, kit_t, block_codes, date_from, date_to,
++            marka=marka_t)
+         our_answers = _load_our_answers_stats(
+-            disc_t, sect_t, kit_t, block_codes, date_from, date_to)
++            disc_t, sect_t, kit_t, block_codes, date_from, date_to,
++            marka=marka_t)
+         cust_closed = _load_customer_closed_stats(
+-            disc_t, sect_t, kit_t, block_codes, date_from, date_to)
++            disc_t, sect_t, kit_t, block_codes, date_from, date_to,
++            marka=marka_t)
+ 
+     _render_kpi(issue, our_answers, cust_closed)
+ 
+@@ -676,4 +555,5 @@ def render():
+     st.divider()
+ 
+     _render_by_discipline(
+-        disc_t, sect_t, kit_t, block_codes, date_from, date_to)
+\ No newline at end of file
++        disc_t, sect_t, kit_t, block_codes, date_from, date_to,
++        marka=marka_t)
+\ No newline at end of file
+diff --git a/vitro/ui/export.py b/vitro/ui/export.py
+index f2d28a4..c3fab6e 100644
+--- a/vitro/ui/export.py
++++ b/vitro/ui/export.py
+@@ -15,8 +15,8 @@ import pandas as pd
+ import streamlit as st
+ 
+ from vitro.sqlite_db import get_conn
+-from vitro.disciplines import discipline_name
+ from vitro.pdf_builder import build_pdf
++from vitro.ui._filters import render_standard_filters
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -47,61 +47,8 @@ def _load_active_df() -> pd.DataFrame:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Справочники
++#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты)
+ # ---------------------------------------------------------------------------
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_discipline_options() -> dict[str, str]:
+-    with get_conn() as conn:
+-        codes = [r["discipline"] for r in conn.execute(
+-            "SELECT DISTINCT discipline FROM documents "
+-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_section_options(disciplines: tuple[str, ...] = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        if disciplines:
+-            placeholders = ",".join("?" * len(disciplines))
+-            rows = conn.execute(f"""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                  AND discipline IN ({placeholders})
+-                ORDER BY section
+-            """, tuple(disciplines)).fetchall()
+-        else:
+-            rows = conn.execute("""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                ORDER BY section
+-            """).fetchall()
+-    return {r["section"]: r["section"] for r in rows}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_kit_options(disciplines: tuple[str, ...] = (),
+-                       sections: tuple[str, ...] = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        where = ["c.code IS NOT NULL"]
+-        params: list = []
+-        if disciplines:
+-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
+-            params += list(disciplines)
+-        if sections:
+-            placeholders = ",".join("?" * len(sections))
+-            where.append(f"""c.code IN (
+-                SELECT DISTINCT complex FROM documents
+-                WHERE section IN ({placeholders}) AND complex IS NOT NULL
+-            )""")
+-            params += list(sections)
+-
+-        rows = conn.execute(f"""
+-            SELECT c.code, c.name FROM complexes c
+-            WHERE {' AND '.join(where)}
+-            ORDER BY c.code
+-        """, tuple(params)).fetchall()
+-    return {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
+-            for r in rows}
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -384,6 +331,7 @@ def _load_section_summary() -> pd.DataFrame:
+ def _load_comments_filtered(query: str,
+                              disciplines=(), sections=(), kits=(),
+                              statuses=(), categories=(),
++                             block_codes=(), marka: str = "",
+                              limit: int = 20000) -> pd.DataFrame:
+     q = """
+         SELECT
+@@ -417,6 +365,17 @@ def _load_comments_filtered(query: str,
+     if kits:
+         q += f" AND d.complex IN ({','.join('?' * len(kits))})"
+         params += list(kits)
++    if block_codes:
++        ors = []
++        for bc in block_codes:
++            ors.append("d.complex LIKE '%-" + str(bc) + "-%'")
++            ors.append("d.complex LIKE '%-" + str(bc).lower() + "-%'")
++        q += " AND (" + " OR ".join(ors) + ")"
++    if marka:
++        m = marka.strip().upper()
++        if m:
++            q += " AND d.complex LIKE ?"
++            params.append(f"%-{m}-%")
+     if statuses:
+         q += f" AND c.status IN ({','.join('?' * len(statuses))})"
+         params += list(statuses)
+@@ -712,63 +671,48 @@ def _render_comments_export():
+         "в Excel или PDF."
+     )
+ 
+-    disc_options = _load_discipline_options()
+-
+-    c1, c2, c3 = st.columns(3)
+-    with c1:
+-        sel_disc_labels = st.multiselect(
+-            "Дисциплина", options=list(disc_options.values()),
+-            placeholder="Все дисциплины", key="exp_disc")
+-        sel_disc = [code for code, label in disc_options.items()
+-                    if label in sel_disc_labels]
+-
+-    section_options = _load_section_options(
+-        tuple(sel_disc) if sel_disc else ())
+-
+-    with c2:
+-        if section_options:
+-            sel_section_labels = st.multiselect(
+-                "Раздел", options=list(section_options.values()),
+-                placeholder="Все разделы", key="exp_section")
+-            sel_section = [code for code, label in section_options.items()
+-                           if label in sel_section_labels]
+-        else:
+-            sel_section = []
+-            st.multiselect("Раздел", options=[],
+-                            placeholder="Разделы не применимы",
+-                            disabled=True, key="exp_section_empty")
+-
+-    kit_options = _load_kit_options(
+-        tuple(sel_disc) if sel_disc else (),
+-        tuple(sel_section) if sel_section else ())
+-
+-    with c3:
+-        sel_kit_labels = st.multiselect(
+-            "Комплект", options=list(kit_options.values()),
+-            placeholder="Все комплекты", key="exp_kit")
+-        sel_kit = [code for code, label in kit_options.items()
+-                    if label in sel_kit_labels]
+-
+-    c4, c5, c6 = st.columns(3)
+-    with c4:
+-        sel_status = st.multiselect("Статус", STATUSES,
+-                                     placeholder="Все статусы",
+-                                     key="exp_status")
+-    with c5:
+-        sel_category = st.multiselect(
+-            "Категория", [CAT_1, CAT_2, CAT_3, CAT_4],
+-            placeholder="Все категории", key="exp_category")
+-    with c6:
+-        query = st.text_input("Поиск по тексту",
+-                               placeholder="Оставьте пустым для всех",
+-                               key="exp_query")
+-
+-    limit = st.number_input(
+-        "Максимум строк", min_value=100, max_value=100000,
+-        value=20000, step=1000, key="exp_limit",
+-        help="При большом объёме выгрузка может занять время",
++    # --- Единый стандарт фильтров (как в Сводке) ---
++    def _export_extra_row():
++        c4, c5, c6 = st.columns(3)
++        with c4:
++            sel_category = st.multiselect(
++                "Категория", [CAT_1, CAT_2, CAT_3, CAT_4],
++                placeholder="Все категории", key="exp_category")
++        with c5:
++            query = st.text_input(
++                "Поиск по тексту",
++                placeholder="Оставьте пустым для всех",
++                key="exp_query")
++        with c6:
++            limit = st.number_input(
++                "Максимум строк", min_value=100, max_value=100000,
++                value=20000, step=1000, key="exp_limit",
++                help="При большом объёме выгрузка может занять время",
++            )
++        return {
++            "category": tuple(sel_category),
++            "query": query or "",
++            "limit": int(limit),
++        }
++
++    # Экспорт ищет также по «Закрыто» и «Аннулировано» — поэтому
++    # расширенный список статусов вместо стандартных пяти.
++    flt = render_standard_filters(
++        key_prefix="exp_",
++        expander_label="🎛 Фильтры",
++        remark_status_options=tuple(STATUSES),
++        extra_row=_export_extra_row,
+     )
+ 
++    sel_disc = flt["disc"]
++    sel_section = flt["section"]
++    sel_kit = flt["kits"]
++    sel_marka = flt["marka"]
++    sel_status = flt["remark_statuses"]
++    sel_category = list(flt["extra"].get("category", ()))
++    query = flt["extra"].get("query", "")
++    limit = flt["extra"].get("limit", 20000)
++
+     df = _load_comments_filtered(
+         query=query,
+         disciplines=tuple(sel_disc) if sel_disc else (),
+@@ -776,6 +720,8 @@ def _render_comments_export():
+         kits=tuple(sel_kit) if sel_kit else (),
+         statuses=tuple(sel_status) if sel_status else (),
+         categories=tuple(sel_category) if sel_category else (),
++        block_codes=flt["block_codes"],
++        marka=sel_marka,
+         limit=int(limit),
+     )
+ 
+diff --git a/vitro/ui/search.py b/vitro/ui/search.py
+index 1b16972..9829336 100644
+--- a/vitro/ui/search.py
++++ b/vitro/ui/search.py
+@@ -17,11 +17,11 @@ import pandas as pd
+ import streamlit as st
+ 
+ from vitro.sqlite_db import get_conn
+-from vitro.disciplines import discipline_name
+ from vitro.ui._filters import (
+-    SHEET_GROUP_OPTIONS,
++    _filter_by_blocks,
+     _filter_by_marka,
+     _sheet_groups_to_sql,
++    render_standard_filters,
+ )
+ from vitro.ui._urls import build_vitro_comment_url
+ 
+@@ -43,66 +43,9 @@ STATUSES = [
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Справочники
++#  Справочники — общий модуль _filters.py (дисциплины / разделы / комплекты),
++#  авторы — локальный справочник поиска
+ # ---------------------------------------------------------------------------
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_discipline_options() -> dict[str, str]:
+-    with get_conn() as conn:
+-        codes = [r["discipline"] for r in conn.execute(
+-            "SELECT DISTINCT discipline FROM documents "
+-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_section_options(disciplines: tuple[str, ...] = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        if disciplines:
+-            placeholders = ",".join("?" * len(disciplines))
+-            rows = conn.execute(f"""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                  AND discipline IN ({placeholders})
+-                ORDER BY section
+-            """, tuple(disciplines)).fetchall()
+-        else:
+-            rows = conn.execute("""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                ORDER BY section
+-            """).fetchall()
+-    return {r["section"]: r["section"] for r in rows}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_kit_options(disciplines: tuple[str, ...] = (),
+-                      sections: tuple[str, ...] = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        where = ["c.code IS NOT NULL"]
+-        params: list = []
+-
+-        if disciplines:
+-            where.append(f"c.discipline IN ({','.join('?' * len(disciplines))})")
+-            params += list(disciplines)
+-
+-        if sections:
+-            placeholders = ",".join("?" * len(sections))
+-            where.append(f"""c.code IN (
+-                SELECT DISTINCT complex FROM documents
+-                WHERE section IN ({placeholders}) AND complex IS NOT NULL
+-            )""")
+-            params += list(sections)
+-
+-        rows = conn.execute(f"""
+-            SELECT c.code, c.name FROM complexes c
+-            WHERE {' AND '.join(where)}
+-            ORDER BY c.code
+-        """, tuple(params)).fetchall()
+-
+-    return {r["code"]: f"{r['code']} — {r['name']}" if r["name"] else r["code"]
+-            for r in rows}
+-
+-
+ @st.cache_data(ttl=600, show_spinner=False)
+ def _load_author_options() -> list[str]:
+     with get_conn() as conn:
+@@ -254,114 +197,70 @@ def render():
+         key="search_query",
+     )
+ 
+-    # --- Каскадные фильтры ---
+-    disc_options = _load_discipline_options()
++    # --- Каскадные фильтры (единый стандарт) ---
+     author_options = _load_author_options()
+ 
+-    with st.expander("🎛 Фильтры", expanded=True):
+-        c1, c2, c3 = st.columns(3)
+-
+-        with c1:
+-            sel_disc_labels = st.multiselect(
+-                "Дисциплина",
+-                options=list(disc_options.values()),
+-                placeholder="Все дисциплины",
+-                key="search_disc",
++    def _search_extra_row():
++        c_a1, c_a2, c_a3 = st.columns(3)
++        with c_a1:
++            complex_mask = st.text_input(
++                "Маска комплекта (поиск по подстроке)",
++                placeholder="например: -С- для стилобата, КЖ для конструкций",
++                key="search_complex_mask",
++                help="Показывает только комплекты, в шифре которых есть эта "
++                     "подстрока. Регистронезависимо.",
+             )
+-            sel_disc = [code for code, label in disc_options.items()
+-                        if label in sel_disc_labels]
+-
+-        section_options = _load_section_options(
+-            tuple(sel_disc) if sel_disc else ())
+-
+-        with c2:
+-            if section_options:
+-                sel_section_labels = st.multiselect(
+-                    "Раздел",
+-                    options=list(section_options.values()),
+-                    placeholder="Все разделы",
+-                    key="search_section",
+-                )
+-                sel_section = [code for code, label in section_options.items()
+-                               if label in sel_section_labels]
+-            else:
+-                sel_section = []
+-                st.multiselect(
+-                    "Раздел", options=[],
+-                    placeholder="Разделы не применимы",
+-                    disabled=True,
+-                    key="search_section_empty",
+-                )
+-
+-        kit_options = _load_kit_options(
+-            tuple(sel_disc) if sel_disc else (),
+-            tuple(sel_section) if sel_section else (),
+-        )
+-
+-        with c3:
+-            sel_kit_labels = st.multiselect(
+-                "Комплект",
+-                options=list(kit_options.values()),
+-                placeholder="Все комплекты",
+-                key="search_kit",
+-            )
+-            sel_kit = [code for code, label in kit_options.items()
+-                       if label in sel_kit_labels]
+-
+-        # ---- Строка маски комплекта ----
+-        complex_mask = st.text_input(
+-            "Маска комплекта (поиск по подстроке)",
+-            placeholder="например: -С- для стилобата, КЖ для конструкций",
+-            key="search_complex_mask",
+-            help="Показывает только комплекты, в шифре которых есть эта "
+-                 "подстрока. Регистронезависимо.",
+-        )
+-
+-        # ---- Строка марки комплекта ----
+-        sel_marka = st.text_input(
+-            "Марка комплекта",
+-            placeholder="например: КЖ1",
+-            key="search_marka",
+-            help="Точное совпадение 2-го блока шифра (марки). "
+-                 "КЖ1 не найдёт КЖ11 или КЖ10. "
+-                 "Работает вместе с маской (AND).",
+-        )
+-
+-        c4, c5, c6 = st.columns(3)
+-        with c4:
+-            sel_status = st.multiselect(
+-                "Статус замечания", STATUSES,
+-                placeholder="Все статусы", key="search_status")
+-        with c5:
++        with c_a2:
+             sel_author = st.multiselect(
+                 "Автор", author_options,
+                 placeholder="Все авторы", key="search_author")
+-        with c6:
++        with c_a3:
+             sel_category = st.multiselect(
+                 "Категория", CATEGORIES,
+                 placeholder="Все категории", key="search_category")
+ 
+-        c7, c8, c9 = st.columns(3)
+-        with c7:
+-            sel_sheet_groups = st.multiselect(
+-                "Статус листа", SHEET_GROUP_OPTIONS,
+-                placeholder="Все статусы листов",
+-                key="search_sheet_group")
+-
+-        c10, c11 = st.columns([1, 1])
+-        with c10:
++        c_b1, c_b2 = st.columns(2)
++        with c_b1:
+             limit = st.number_input(
+                 "Лимит результатов", min_value=100, max_value=10000,
+                 value=2000, step=100, key="search_limit",
+                 help="Максимум строк, которые будут загружены для отображения",
+             )
+-        with c11:
+-            # Показывать ли пустой поиск (без запроса)
++        with c_b2:
+             show_all = st.checkbox(
+                 "Показывать всё без запроса", value=False,
+                 key="search_show_all",
+-                help="Если выключено, результаты появятся только после ввода запроса",
++                help="Если выключено, результаты появятся только после "
++                     "ввода запроса",
+             )
++        return {
++            "complex_mask": complex_mask or "",
++            "author": tuple(sel_author),
++            "category": tuple(sel_category),
++            "limit": int(limit),
++            "show_all": bool(show_all),
++        }
++
++    # Поиск ищет также по «Закрыто» и «Аннулировано» — поэтому расширенный
++    # список статусов замечаний вместо стандартных пяти.
++    flt = render_standard_filters(
++        key_prefix="search_",
++        expander_label="🎛 Фильтры",
++        remark_status_options=tuple(STATUSES),
++        extra_row=_search_extra_row,
++    )
++
++    sel_disc = flt["disc"]
++    sel_section = flt["section"]
++    sel_kit = flt["kits"]
++    sel_marka = flt["marka"]
++    sel_status = flt["remark_statuses"]
++    sel_sheet_groups = flt["sheet_groups"]
++    complex_mask = flt["extra"].get("complex_mask", "")
++    sel_author = list(flt["extra"].get("author", ()))
++    sel_category = list(flt["extra"].get("category", ()))
++    limit = flt["extra"].get("limit", 2000)
++    show_all = flt["extra"].get("show_all", False)
+ 
+     # --- Условия запуска поиска ---
+     if not query.strip() and not show_all:
+@@ -383,6 +282,10 @@ def render():
+             limit=int(limit),
+         )
+ 
++    # Фильтр по расположению (4-й блок шифра) — в Python после SQL
++    if flt["block_codes"] and not df.empty:
++        df = _filter_by_blocks(df, flt["block_codes"])
++
+     if df.empty:
+         st.warning(f"Ничего не найдено по запросу «{query}» с текущими фильтрами.")
+         return
+diff --git a/vitro/ui/summary.py b/vitro/ui/summary.py
+index 8f43333..1392d69 100644
+--- a/vitro/ui/summary.py
++++ b/vitro/ui/summary.py
+@@ -25,11 +25,11 @@ import streamlit as st
+ from vitro.sqlite_db import get_conn
+ from vitro.disciplines import discipline_name
+ from vitro.ui._filters import (
+-    REMARK_STATUS_OPTIONS,
+-    SHEET_GROUP_OPTIONS,
+     _doc_status_group,
++    _filter_by_blocks,
+     _filter_by_marka,
+     _sheet_groups_to_sql,
++    render_standard_filters,
+ )
+ 
+ 
+@@ -41,16 +41,6 @@ CAT_2 = "Формальное/нет влияния на СМР"
+ CAT_3 = "Доп.требование/отсутствует в ТЗ"
+ CAT_4 = "Не принято/нарушение ТНПА"
+ 
+-BLOCK_OPTIONS = {
+-    "Корпус 1":                    "1",
+-    "Корпус 2":                    "2",
+-    "Общие":                       "0",
+-    "Стилобат":                    "С",
+-    "Газовая котельная":           "ГК",
+-    "Генплан":                     "ГП",
+-    "Автомобильные дороги (УДС)":  "А",
+-}
+-
+ # ---------------------------------------------------------------------------
+ #  Палитры
+ # ---------------------------------------------------------------------------
+@@ -107,97 +97,10 @@ def _load_all_categorized() -> pd.DataFrame:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Справочники
++#  Справочники (дисциплины / разделы / комплекты) — общий модуль _filters.py
++#  Раньше здесь были собственные копии — теперь все вкладки используют
++#  load_discipline_options / load_section_options / load_kit_options.
+ # ---------------------------------------------------------------------------
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_discipline_options() -> dict[str, str]:
+-    with get_conn() as conn:
+-        codes = [r["discipline"] for r in conn.execute(
+-            "SELECT DISTINCT discipline FROM documents "
+-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        if disciplines:
+-            ph = ",".join("?" * len(disciplines))
+-            rows = conn.execute(f"""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                  AND discipline IN ({ph})
+-                ORDER BY section
+-            """, tuple(disciplines)).fetchall()
+-        else:
+-            rows = conn.execute("""
+-                SELECT DISTINCT section FROM documents
+-                WHERE section IS NOT NULL AND section <> ''
+-                ORDER BY section
+-            """).fetchall()
+-    return {r["section"]: r["section"] for r in rows}
+-
+-
+-@st.cache_data(ttl=600, show_spinner=False)
+-def _load_kit_options(disciplines: tuple = (),
+-                      sections: tuple = (),
+-                      block_codes: tuple = ()) -> dict[str, str]:
+-    with get_conn() as conn:
+-        where = ["c.code IS NOT NULL"]
+-        params: list = []
+-
+-        if disciplines:
+-            where.append(
+-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
+-            params += list(disciplines)
+-
+-        if sections:
+-            ph = ",".join("?" * len(sections))
+-            where.append(f"""c.code IN (
+-                SELECT DISTINCT complex FROM documents
+-                WHERE section IN ({ph}) AND complex IS NOT NULL
+-            )""")
+-            params += list(sections)
+-
+-        rows = conn.execute(f"""
+-            SELECT c.code, c.name FROM complexes c
+-            WHERE {' AND '.join(where)}
+-            ORDER BY c.code
+-        """, tuple(params)).fetchall()
+-
+-    result = {r["code"]: f"{r['code']} — {r['name']}"
+-                       if r["name"] else r["code"]
+-            for r in rows}
+-
+-    # Фильтр по расположению (4-й блок) — в Python
+-    if block_codes:
+-        filtered = {}
+-        for code, label in result.items():
+-            block = _extract_4th_block(code)
+-            if block in block_codes:
+-                filtered[code] = label
+-        return filtered
+-    return result
+-
+-
+-# ---------------------------------------------------------------------------
+-#  4-й блок
+-# ---------------------------------------------------------------------------
+-def _extract_4th_block(complex_code) -> str:
+-    if not complex_code:
+-        return ""
+-    parts = str(complex_code).split("-")
+-    if len(parts) >= 4:
+-        return parts[3].strip().upper()
+-    return ""
+-
+-
+-def _filter_by_blocks(df: pd.DataFrame,
+-                       block_codes: tuple = ()) -> pd.DataFrame:
+-    if df.empty or not block_codes:
+-        return df
+-    blocks = df["complex"].apply(_extract_4th_block)
+-    return df[blocks.isin(block_codes)]
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1319,104 +1222,17 @@ def render():
+         "разрез по дисциплинам, разделам и комплектам."
+     )
+ 
+-    disc_options = _load_discipline_options()
+-
+-    with st.expander("Фильтры", expanded=True):
+-        c1, c2, c3, c4, c5 = st.columns(5)
+-
+-        # 1. Дисциплина
+-        with c1:
+-            sel_disc_labels = st.multiselect(
+-                "Дисциплина",
+-                options=list(disc_options.values()),
+-                placeholder="Все",
+-                key="sum_disc",
+-            )
+-            sel_disc = [code for code, label in disc_options.items()
+-                        if label in sel_disc_labels]
+-
+-        # 2. Раздел
+-        section_options = _load_section_options(
+-            tuple(sel_disc) if sel_disc else ())
+-        with c2:
+-            if section_options:
+-                sel_section_labels = st.multiselect(
+-                    "Раздел",
+-                    options=list(section_options.values()),
+-                    placeholder="Все",
+-                    key="sum_section",
+-                )
+-                sel_section = [
+-                    code for code, label in section_options.items()
+-                    if label in sel_section_labels
+-                ]
+-            else:
+-                sel_section = []
+-                st.multiselect(
+-                    "Раздел", options=[],
+-                    placeholder="—",
+-                    disabled=True, key="sum_section_empty",
+-                )
+-
+-        # 3. Расположение
+-        with c3:
+-            sel_blocks = st.multiselect(
+-                "Расположение",
+-                options=list(BLOCK_OPTIONS.keys()),
+-                placeholder="Все",
+-                key="sum_blocks",
+-            )
+-            block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
+-
+-        # 4. Комплект (зависит от всех трёх)
+-        kit_options = _load_kit_options(
+-            tuple(sel_disc) if sel_disc else (),
+-            tuple(sel_section) if sel_section else (),
+-            block_codes,
+-        )
+-        with c4:
+-            sel_kit_labels = st.multiselect(
+-                "Комплект",
+-                options=list(kit_options.values()),
+-                placeholder="Все",
+-                key="sum_kit",
+-            )
+-            sel_kit = [code for code, label in kit_options.items()
+-                        if label in sel_kit_labels]
+-
+-        # 5. Марка комплекта (блок 2 шифра)
+-        with c5:
+-            sel_marka = st.text_input(
+-                "Марка комплекта",
+-                placeholder="например: КЖ1",
+-                key="sum_marka",
+-                help="Точное совпадение 2-го блока шифра (марки). "
+-                     "КЖ1 не найдёт КЖ11 или КЖ10.",
+-            )
+-
+-        st.write("")
+-        c6, c7 = st.columns(2)
+-        with c6:
+-            sel_remark_statuses = st.multiselect(
+-                "Статус замечания",
+-                options=REMARK_STATUS_OPTIONS,
+-                placeholder="Все",
+-                key="sum_remark_status",
+-            )
+-        with c7:
+-            sel_sheet_groups = st.multiselect(
+-                "Статус листа",
+-                options=SHEET_GROUP_OPTIONS,
+-                placeholder="Все",
+-                key="sum_sheet_group",
+-            )
+-
+-    disc_t = tuple(sel_disc)
+-    sect_t = tuple(sel_section)
+-    kit_t = tuple(sel_kit)
+-    remark_statuses_t = tuple(sel_remark_statuses) if sel_remark_statuses else ()
+-    sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
+-    marka_t = (sel_marka or "").strip()
++    # Единый стандарт фильтров (эталон). Ключи виджетов прежние ('sum_*'),
++    # поэтому сохранённые выборки пользователей не сбрасываются.
++    flt = render_standard_filters(key_prefix="sum_")
++
++    disc_t = flt["disc"]
++    sect_t = flt["section"]
++    kit_t = flt["kits"]
++    block_codes = flt["block_codes"]
++    remark_statuses_t = flt["remark_statuses"]
++    sheet_groups_t = flt["sheet_groups"]
++    marka_t = flt["marka"]
+ 
+     _LAST_FILTERS["disc_t"] = disc_t
+     _LAST_FILTERS["sect_t"] = sect_t

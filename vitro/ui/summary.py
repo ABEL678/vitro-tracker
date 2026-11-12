@@ -4,11 +4,17 @@
 
 Структура:
   1. Объём замечаний — 6 плиток.
-  2. Листы РД — 8 плиток.
+  2. Листы РД — 9 плиток (патч 15: добавлена «Прочие статусы»,
+     под плитками — строка арифметики:
+     11 312 = (A+B+C+И) + на согласовании + готовится + аннулировано).
   3. Замечания на стороне АТП ТЛП — 8 плиток.
   4. Замечания на стороне Заказчика — 6 плиток.
   5. Категории замечаний, оценка АТП ТЛП — 6 плиток.
   + Разрез по дисциплинам / разделам / комплектам.
+    Патч 18 (Блок 6): в таблицу разреза добавлены колонки
+    «Ревизия комплекта» (revision из documents, только на уровне
+    «По комплектам») и «Количество листов» (docs_total — уникальные
+    листы, в разрезах — сумма групп).
 
 Источник: `_load_all_categorized` (deadlines.py).
 Фильтры: дисциплина → раздел → расположение → комплект.
@@ -23,13 +29,15 @@ import plotly.express as px
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
+from vitro._cache import versioned_cache
+from vitro.sheets import unique_vitro_sheets
 from vitro.disciplines import discipline_name
 from vitro.ui._filters import (
-    REMARK_STATUS_OPTIONS,
-    SHEET_GROUP_OPTIONS,
     _doc_status_group,
+    _filter_by_blocks,
     _filter_by_marka,
     _sheet_groups_to_sql,
+    render_standard_filters,
 )
 
 
@@ -40,16 +48,6 @@ CAT_1 = "Принято/корректное"
 CAT_2 = "Формальное/нет влияния на СМР"
 CAT_3 = "Доп.требование/отсутствует в ТЗ"
 CAT_4 = "Не принято/нарушение ТНПА"
-
-BLOCK_OPTIONS = {
-    "Корпус 1":                    "1",
-    "Корпус 2":                    "2",
-    "Общие":                       "0",
-    "Стилобат":                    "С",
-    "Газовая котельная":           "ГК",
-    "Генплан":                     "ГП",
-    "Автомобильные дороги (УДС)":  "А",
-}
 
 # ---------------------------------------------------------------------------
 #  Палитры
@@ -100,104 +98,17 @@ EMOJI = {
 # ---------------------------------------------------------------------------
 #  Источник
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_all_categorized() -> pd.DataFrame:
     from vitro.ui.deadlines import _load_all_categorized as _src
     return _src()
 
 
 # ---------------------------------------------------------------------------
-#  Справочники
+#  Справочники (дисциплины / разделы / комплекты) — общий модуль _filters.py
+#  Раньше здесь были собственные копии — теперь все вкладки используют
+#  load_discipline_options / load_section_options / load_kit_options.
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_discipline_options() -> dict[str, str]:
-    with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
-            "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_section_options(disciplines: tuple = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        if disciplines:
-            ph = ",".join("?" * len(disciplines))
-            rows = conn.execute(f"""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                  AND discipline IN ({ph})
-                ORDER BY section
-            """, tuple(disciplines)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT DISTINCT section FROM documents
-                WHERE section IS NOT NULL AND section <> ''
-                ORDER BY section
-            """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_kit_options(disciplines: tuple = (),
-                      sections: tuple = (),
-                      block_codes: tuple = ()) -> dict[str, str]:
-    with get_conn() as conn:
-        where = ["c.code IS NOT NULL"]
-        params: list = []
-
-        if disciplines:
-            where.append(
-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
-            params += list(disciplines)
-
-        if sections:
-            ph = ",".join("?" * len(sections))
-            where.append(f"""c.code IN (
-                SELECT DISTINCT complex FROM documents
-                WHERE section IN ({ph}) AND complex IS NOT NULL
-            )""")
-            params += list(sections)
-
-        rows = conn.execute(f"""
-            SELECT c.code, c.name FROM complexes c
-            WHERE {' AND '.join(where)}
-            ORDER BY c.code
-        """, tuple(params)).fetchall()
-
-    result = {r["code"]: f"{r['code']} — {r['name']}"
-                       if r["name"] else r["code"]
-            for r in rows}
-
-    # Фильтр по расположению (4-й блок) — в Python
-    if block_codes:
-        filtered = {}
-        for code, label in result.items():
-            block = _extract_4th_block(code)
-            if block in block_codes:
-                filtered[code] = label
-        return filtered
-    return result
-
-
-# ---------------------------------------------------------------------------
-#  4-й блок
-# ---------------------------------------------------------------------------
-def _extract_4th_block(complex_code) -> str:
-    if not complex_code:
-        return ""
-    parts = str(complex_code).split("-")
-    if len(parts) >= 4:
-        return parts[3].strip().upper()
-    return ""
-
-
-def _filter_by_blocks(df: pd.DataFrame,
-                       block_codes: tuple = ()) -> pd.DataFrame:
-    if df.empty or not block_codes:
-        return df
-    blocks = df["complex"].apply(_extract_4th_block)
-    return df[blocks.isin(block_codes)]
 
 
 # ---------------------------------------------------------------------------
@@ -259,14 +170,38 @@ def _filter_documents(df: pd.DataFrame,
 # ---------------------------------------------------------------------------
 #  Документы
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_documents() -> pd.DataFrame:
+    """Листы РД — ЕДИНЫЙ СТАНДАРТ «Плана выдачи» (патч 14).
+
+    Одна строка = один УНИКАЛЬНЫЙ лист (complex, sheet_number):
+      * дедуп ревизий/повторных выгрузок (последняя ревизия,
+        sheets.unique_vitro_sheets — тот же код, что в «Плане
+        выдачи»);
+      * строки с пустым sheet_number не склеиваются (fallback по id);
+      * аннулирование «липкое» (патч 12): если хотя бы одна ревизия
+        листа имеет статус «Аннулировано», лист учитывается как
+        аннулированный;
+      * шифр комплекта нормализуется (trim, регистр, латинские
+        двойники) и обязан проходить is_valid_kit_code — мусорные
+        шифры из папок SharePoint исключаются, как в таблице
+        «Плана выдачи».
+
+    Благодаря этому «Листов всего» в Сводке совпадает с
+    «Листов в Витро» в «Плане выдачи» (раньше: 12 451 против
+    11 312 — Сводка не отсекала мусорные шифры).
+    """
     with get_conn() as conn:
-        return pd.read_sql("""
+        df = pd.read_sql("""
             SELECT id, leaf, discipline, section, complex,
                    status, revision, name, status_date, sheet_number
             FROM documents
+            WHERE complex IS NOT NULL
         """, conn)
+    kept = unique_vitro_sheets(df.to_dict("records"))
+    if not kept:
+        return df.iloc[0:0]
+    return pd.DataFrame(kept).reindex(columns=df.columns)
 
 
 
@@ -275,7 +210,7 @@ def _load_documents() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 #  Общий объём
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_scale(disciplines: tuple = (),
                  sections: tuple = (),
                  kits: tuple = (),
@@ -456,6 +391,10 @@ def _render_scale_section(scale: dict,
 # ===========================================================================
 def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     st.markdown("##### Листы РД")
+    st.caption(
+        "Один уникальный лист = одна строка: ревизии и повторные выгрузки "
+        "считаются один раз, берётся последняя ревизия листа."
+    )
 
     if docs_df.empty:
         st.info("Нет данных по листам.")
@@ -477,13 +416,34 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     denominator = total - n_i - n_annulled
     pct_ab = (round((n_a + n_b) / denominator * 100, 1)
               if denominator > 0 else 0.0)
+    # Патч 12: аннулирование «липкое» (см. sheets.dedup_document_rows) —
+    # лист с любой аннулированной ревизией учитывается здесь как
+    # аннулированный и не попадает в A/B/C/И.
+
+    # Патч 15: арифметика «Листов всего» на экране. Сумма A+B+C+И
+    # (8 337) не равна «Листов всего» (11 312) — разница 2 975 это
+    # прочие статусы: на согласовании (2 425) + готовится к загрузке
+    # (66) + аннулировано (484). Показываем её явно: плитка
+    # «Прочие статусы» слева и строка арифметики под плитками.
+    n_working = n_a + n_b + n_c + n_i
+    n_other = n_review + n_loading + n_annulled
 
     col_left, col_mid, col_right = st.columns([2, 3, 2])
 
     with col_left:
         _metric(
             st, "Листов всего", total,
-            "Выгрузка из Витро: COUNT(documents).",
+            "Выгрузка из Витро: УНИКАЛЬНЫЕ листы (complex + sheet_number).\n\n"
+            "Несколько ревизий/выгрузок одного листа считаются один лист — "
+            "как в «Плане выдачи». Строки без номера листа считаются по файлам.",
+        )
+        _metric(
+            st, f"{EMOJI['white']} Прочие статусы", n_other,
+            "Расчёт: На согласовании Заказчика + Готовится к загрузке "
+            "+ Аннулировано (патч 15 — видна арифметика «Листов всего»).\n\n"
+            f"Арифметика: Листов всего {_fmt_num(total)} = "
+            f"рабочие статусы A + B + C + И ({_fmt_num(n_working)}) "
+            f"+ прочие ({_fmt_num(n_other)}).",
         )
         sheet_dist = _sheet_distribution_from_df(docs_df)
         _pie(sheet_dist, "Статус листа", "Количество", SHEET_COLORS,
@@ -492,15 +452,18 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     with col_mid:
         _metric(
             st, f"{EMOJI['green']} Статус A — утверждён", n_a,
-            "Выгрузка из Витро: COUNT(documents WHERE status='A').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'A'.",
         )
         _metric(
             st, f"{EMOJI['yellow']} Статус B — к сдаче", n_b,
-            "Выгрузка из Витро: COUNT(documents WHERE status='B').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'B'.",
         )
         _metric(
             st, f"{EMOJI['orange']} Статус C — в работе", n_c,
-            "Выгрузка из Витро: COUNT(documents WHERE status='C').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'C'.",
         )
         _metric(
             st, " % готовых (A+B)", f"{pct_ab}%",
@@ -510,7 +473,8 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
     with col_right:
         _metric(
             st, f"{EMOJI['white']} Статус И — информационный", n_i,
-            "Выгрузка из Витро: COUNT(documents WHERE status='И').",
+            "Выгрузка из Витро: уникальные листы, у которых ПОСЛЕДНЯЯ "
+            "ревизия имеет статус 'И'.",
         )
         _metric(
             st, f"{EMOJI['globe']} На согласовании Заказчика",
@@ -523,9 +487,22 @@ def _render_sheets_section(docs_df: pd.DataFrame) -> None:
         )
         _metric(
             st, f"{EMOJI['black']} Аннулировано", n_annulled,
-            "Выгрузка из Витро: "
-            "COUNT(documents WHERE status='Аннулировано').",
+            "Выгрузка из Витро: уникальные листы, у которых ХОТЯ БЫ ОДНА "
+            "ревизия имеет статус «Аннулировано» (патч 12: аннулирование "
+            "не теряется при дедупликации, даже если последняя ревизия "
+            "живая).",
         )
+
+    # Патч 15: строка арифметики под плитками — сумма A/B/C/И не равна
+    # «Листов всего», и пользователь должен видеть, куда делись
+    # остальные листы: 11 312 = 8 337 + 2 975.
+    st.caption(
+        f"Арифметика: **{_fmt_num(total)}** листов всего = "
+        f"**{_fmt_num(n_working)}** (статусы A + B + C + И) + "
+        f"**{_fmt_num(n_other)}** прочих — на согласовании "
+        f"{_fmt_num(n_review)} · готовится к загрузке "
+        f"{_fmt_num(n_loading)} · аннулировано {_fmt_num(n_annulled)}."
+    )
 
 
 # ===========================================================================
@@ -793,7 +770,7 @@ def _render_categories_section(active_df: pd.DataFrame) -> None:
 # ===========================================================================
 #  Бублик статусов замечаний
 # ===========================================================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_status_distribution_by_filter(filter_key: tuple) -> pd.DataFrame:
     (disciplines, sections, kits, block_codes,
      remark_statuses, sheet_groups, marka) = filter_key
@@ -877,7 +854,19 @@ def _build_summary_rows(group_col: str,
     if docs_df.empty and active_df.empty:
         return pd.DataFrame()
 
-    # --- Листы ---
+    # --- Листы (docs_df уже дедуплицирован в _load_documents, патч 11:
+    #     одна строка = один уникальный лист, статусы последней ревизии) ---
+    # Патч 18 (Блок 6): «Ревизия комплекта» — поле revision из documents
+    # (VitroBaseDocumentRevision); осмысленна только для уровня
+    # «По комплектам» (группа = один комплект) — берётся максимальная
+    # ревизия листов комплекта (численно: «2.0» > «10.0» как числа).
+    # Для разрезов по дисциплинам/разделам колонка не заполняется.
+    def _rev_key(v: str) -> float:
+        try:
+            return float(str(v).strip())
+        except (TypeError, ValueError):
+            return -1.0
+
     if not docs_df.empty:
         doc_rows = []
         for grp, sub in docs_df.groupby(group_col, dropna=True):
@@ -892,9 +881,16 @@ def _build_summary_rows(group_col: str,
             annulled = int((statuses == "АННУЛИРОВАНО").sum())
             pct_ab = (round((a + b) / total * 100, 1)
                       if total > 0 else 0.0)
+            kit_revision = ""
+            if group_col == "complex" and "revision" in sub.columns:
+                rev_vals = [str(v).strip() for v in sub["revision"].tolist()
+                            if v is not None and str(v).strip()]
+                if rev_vals:
+                    kit_revision = max(rev_vals, key=_rev_key)
             doc_rows.append({
                 group_col: grp,
                 "docs_total": total,
+                "kit_revision": kit_revision,
                 "doc_a": a,
                 "doc_b": b,
                 "doc_c": c,
@@ -981,7 +977,18 @@ def _build_summary_rows(group_col: str,
     elif active_grp.empty:
         result = docs_grp
     else:
+        # Патч 11: выравниваем тип ключа перед merge — groupby pandas
+        # по колонке из одних None даёт float64, а из строк — object,
+        # из-за расхождения типов merge падает с ValueError.
+        for frame in (docs_grp, active_grp):
+            if group_col in frame.columns:
+                frame[group_col] = frame[group_col].fillna("").astype(str)
         result = docs_grp.merge(active_grp, on=group_col, how="outer")
+    # Патч 18: kit_revision — текстовая колонка; пустые значения
+    # заполняем строкой ДО общего fillna(0), иначе группы без листов
+    # (outer merge) получили бы 0 в текстовой колонке.
+    if "kit_revision" in result.columns:
+        result["kit_revision"] = result["kit_revision"].fillna("")
     result = result.fillna(0)
 
     group_col_names = {
@@ -993,7 +1000,7 @@ def _build_summary_rows(group_col: str,
     return result
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_summary_by_discipline(
     disciplines: tuple = (),
     sections: tuple = (),
@@ -1013,7 +1020,7 @@ def _load_summary_by_discipline(
     return _build_summary_rows("discipline", active, docs)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_summary_by_section(
     disciplines: tuple = (),
     sections: tuple = (),
@@ -1033,7 +1040,7 @@ def _load_summary_by_section(
     return _build_summary_rows("section", active, docs)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@versioned_cache(3600)
 def _load_summary_by_complex(
     disciplines: tuple = (),
     sections: tuple = (),
@@ -1089,6 +1096,8 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) -> 
         column_width_map = {
             group_label: 20,
             "Полное наименование": 50,
+            "Ревизия комплекта": 16,
+            "Количество листов": 14,
             "Открытых замечаний": 14,
             "Всего у АТП ТЛП": 14,
             "Всего у Заказчика": 18,
@@ -1201,9 +1210,24 @@ def _render_summary_table(df: pd.DataFrame,
 
     # --- Приводим числовые колонки к int ---
     for c in ["active_total", "n_new", "n_in_work", "n_rejected",
-              "n_discussion", "n_customer", "n_customer_a", "n_annulled"]:
+              "n_discussion", "n_customer", "n_customer_a", "n_annulled",
+              "docs_total"]:
         if c in view.columns:
             view[c] = view[c].fillna(0).astype(int)
+
+    # --- Патч 18 (Блок 6): «Ревизия комплекта» и «Количество листов» ---
+    # «Количество листов» — docs_total: число УНИКАЛЬНЫХ листов
+    # (тот же дедуп, что в секции «Листы РД»); в разрезах — сумма
+    # листов групп. «Ревизия комплекта» — revision из documents,
+    # заполняется только на уровне «По комплектам».
+    if "docs_total" in view.columns:
+        view = view.rename(columns={"docs_total": "Количество листов"})
+    if "kit_revision" in view.columns:
+        view = view.rename(columns={"kit_revision": "Ревизия комплекта"})
+        if level != "complex":
+            # Ревизия осмысленна только для комплекта — в разрезах
+            # по дисциплинам/разделам колонку не показываем.
+            view = view.drop(columns=["Ревизия комплекта"])
 
     # --- Формируем финальные колонки ---
     view = view.rename(columns={
@@ -1241,13 +1265,15 @@ def _render_summary_table(df: pd.DataFrame,
     cols_order = [
         group_label,
         "Полное наименование",
+        "Ревизия комплекта",
+        "Количество листов",
         "Открытых замечаний",
         "Всего у АТП ТЛП",
-        "Всего у Заказчика",
         "🔵 Новое",
         "🔴 Не принято",
         "🟡 К обсуждению",
         "🌐 Принято в работу",
+        "Всего у Заказчика",
         "🟢 Выполнено",
         "Пояснения",
     ]
@@ -1262,9 +1288,13 @@ def _render_summary_table(df: pd.DataFrame,
     totals_row = {group_label: "ИТОГО"}
     totals_row["Полное наименование"] = ""
     totals_row["Пояснения"] = ""
+    if "Ревизия комплекта" in view.columns:
+        # Ревизия — не число: в ИТОГО не суммируется (патч 18).
+        totals_row["Ревизия комплекта"] = ""
 
     for c in view.columns:
-        if c in (group_label, "Полное наименование", "Пояснения"):
+        if c in (group_label, "Полное наименование", "Пояснения",
+                 "Ревизия комплекта"):
             continue
         totals_row[c] = int(view[c].fillna(0).sum())
 
@@ -1319,104 +1349,17 @@ def render():
         "разрез по дисциплинам, разделам и комплектам."
     )
 
-    disc_options = _load_discipline_options()
+    # Единый стандарт фильтров (эталон). Ключи виджетов прежние ('sum_*'),
+    # поэтому сохранённые выборки пользователей не сбрасываются.
+    flt = render_standard_filters(key_prefix="sum_")
 
-    with st.expander("Фильтры", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns(5)
-
-        # 1. Дисциплина
-        with c1:
-            sel_disc_labels = st.multiselect(
-                "Дисциплина",
-                options=list(disc_options.values()),
-                placeholder="Все",
-                key="sum_disc",
-            )
-            sel_disc = [code for code, label in disc_options.items()
-                        if label in sel_disc_labels]
-
-        # 2. Раздел
-        section_options = _load_section_options(
-            tuple(sel_disc) if sel_disc else ())
-        with c2:
-            if section_options:
-                sel_section_labels = st.multiselect(
-                    "Раздел",
-                    options=list(section_options.values()),
-                    placeholder="Все",
-                    key="sum_section",
-                )
-                sel_section = [
-                    code for code, label in section_options.items()
-                    if label in sel_section_labels
-                ]
-            else:
-                sel_section = []
-                st.multiselect(
-                    "Раздел", options=[],
-                    placeholder="—",
-                    disabled=True, key="sum_section_empty",
-                )
-
-        # 3. Расположение
-        with c3:
-            sel_blocks = st.multiselect(
-                "Расположение",
-                options=list(BLOCK_OPTIONS.keys()),
-                placeholder="Все",
-                key="sum_blocks",
-            )
-            block_codes = tuple(BLOCK_OPTIONS[b] for b in sel_blocks)
-
-        # 4. Комплект (зависит от всех трёх)
-        kit_options = _load_kit_options(
-            tuple(sel_disc) if sel_disc else (),
-            tuple(sel_section) if sel_section else (),
-            block_codes,
-        )
-        with c4:
-            sel_kit_labels = st.multiselect(
-                "Комплект",
-                options=list(kit_options.values()),
-                placeholder="Все",
-                key="sum_kit",
-            )
-            sel_kit = [code for code, label in kit_options.items()
-                        if label in sel_kit_labels]
-
-        # 5. Марка комплекта (блок 2 шифра)
-        with c5:
-            sel_marka = st.text_input(
-                "Марка комплекта",
-                placeholder="например: КЖ1",
-                key="sum_marka",
-                help="Точное совпадение 2-го блока шифра (марки). "
-                     "КЖ1 не найдёт КЖ11 или КЖ10.",
-            )
-
-        st.write("")
-        c6, c7 = st.columns(2)
-        with c6:
-            sel_remark_statuses = st.multiselect(
-                "Статус замечания",
-                options=REMARK_STATUS_OPTIONS,
-                placeholder="Все",
-                key="sum_remark_status",
-            )
-        with c7:
-            sel_sheet_groups = st.multiselect(
-                "Статус листа",
-                options=SHEET_GROUP_OPTIONS,
-                placeholder="Все",
-                key="sum_sheet_group",
-            )
-
-    disc_t = tuple(sel_disc)
-    sect_t = tuple(sel_section)
-    kit_t = tuple(sel_kit)
-    remark_statuses_t = tuple(sel_remark_statuses) if sel_remark_statuses else ()
-    sheet_groups_t = tuple(sel_sheet_groups) if sel_sheet_groups else ()
-    marka_t = (sel_marka or "").strip()
+    disc_t = flt["disc"]
+    sect_t = flt["section"]
+    kit_t = flt["kits"]
+    block_codes = flt["block_codes"]
+    remark_statuses_t = flt["remark_statuses"]
+    sheet_groups_t = flt["sheet_groups"]
+    marka_t = flt["marka"]
 
     _LAST_FILTERS["disc_t"] = disc_t
     _LAST_FILTERS["sect_t"] = sect_t

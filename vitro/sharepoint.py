@@ -10,8 +10,12 @@ from vitro.config import (
     VITRO_USER, VITRO_PASSWORD, VITRO_BASE_URL, VITRO_OKHTA_URL,
     VITRO_VERIFY_SSL, HEADERS,
 )
+from vitro.sheets import looks_like_rd_code
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Гасим предупреждение InsecureRequestWarning ТОЛЬКО когда проверка
+# сертификата осознанно отключена (.env: VITRO_VERIFY_SSL=false).
+if not VITRO_VERIFY_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 #  GUID-ы списков SharePoint
@@ -27,6 +31,10 @@ LIST_DOC_STATUSES = "a00854d8-6130-4f26-89ea-6f4f940350e3"
 # ---------------------------------------------------------------------------
 ATP_ROOT = "/okhta/DocProjectLib/01_РД/02_АТП"
 ATP_WORK = ATP_ROOT + "/01_В процессе"
+
+# Папка ГИС (патч 20)
+GIS_ROOT = "/okhta/DocProjectLib/01_РД/02_ГИС"
+GIS_WORK = GIS_ROOT + "/01_В процессе"
 
 # ---------------------------------------------------------------------------
 #  Исключения (TECT/, сервисные рендеры, аннулированные, архив)
@@ -139,21 +147,41 @@ def parse_path(file_dir_ref: str) -> tuple[str, str, str]:
     """
     По пути родительской папки определяет (дисциплина, раздел, комплект).
     Ожидает путь внутри /01_В процессе/.
+
+    Патч 19: комплектом считается папка, чьё имя похоже на РД-код
+    ЛЮБОЙ организации (looks_like_rd_code: «АТ-РД-…», «ГИС-РД-…» и
+    др.), а не только начинающаяся с «АТ-РД-».
     """
-    if not file_dir_ref or not file_dir_ref.startswith(ATP_WORK + "/"):
+    # Патч 20: поддержка путей АТП и ГИС
+    work_prefixes = (ATP_WORK + "/", GIS_WORK + "/")
+    if not file_dir_ref or not any(file_dir_ref.startswith(p) for p in work_prefixes):
         return ("", "", "")
-    rel = file_dir_ref[len(ATP_WORK) + 1:].strip("/")
+    # Определяем, какой префикс совпал, и обрезаем его
+    rel = file_dir_ref
+    for prefix in work_prefixes:
+        if file_dir_ref.startswith(prefix):
+            rel = file_dir_ref[len(prefix):].strip("/")
+            break
     parts = [p for p in rel.split("/") if p]
-    if len(parts) < 2:
+    # Патч 20: комплект может идти сразу после папки «В процессе»
+    # (без дисциплины): «01_В процессе/ГИС-РД-СБ-АСЗП-0-00»
+    if not parts:
         return ("", "", "")
 
-    discipline = parts[0]
+    # Ищем индекс комплекта
     complex_idx = next(
-        (i for i in range(1, len(parts)) if parts[i].startswith("АТ-РД-")),
+        (i for i in range(len(parts)) if looks_like_rd_code(parts[i])),
         None,
     )
     if complex_idx is None:
-        return (discipline, "/".join(parts[1:]), "")
+        # Нет комплекта — возвращаем дисциплину (если есть)
+        return (parts[0], "/".join(parts[1:]), "")
+
+    # Всё, что до complex_idx — это дисциплина/раздел
+    discipline = parts[0] if complex_idx == 0 else parts[0]
+    section = "/".join(parts[1:complex_idx]) if complex_idx > 1 else ""
+    comp = parts[complex_idx]
+    return (discipline, section, comp)
 
     comp = parts[complex_idx]
     section = "/".join(parts[1:complex_idx]) if complex_idx > 1 else ""
@@ -196,28 +224,40 @@ def fetch_authors() -> dict[int, str]:
 # ---------------------------------------------------------------------------
 def fetch_atp_documents(max_items: int = 0) -> list[dict]:
     """
-    PDF-листы АТ-РД-* из /01_В процессе/.
+    PDF-листы РД-комплектов из /01_В процессе/ — ЛЮБОЙ организации:
+    «АТ-РД-*», «ГИС-РД-*» и др. (патч 19, looks_like_rd_code).
     Исключает TECT/ТЕСТ, служебные рендеры, файлы без папки комплекта.
+
+    Патч 20: запрашивает из двух папок — АТП и ГИС, объединяет с
+    дедупликацией по UniqueId (последняя ревизия побеждает).
     """
-    flt = (f"startswith(FileDirRef, '{ATP_WORK}/') "
-           f"and substringof('.pdf', FileLeafRef)")
-    raw = _fetch_all(
-        VITRO_OKHTA_URL, LIST_DOCS,
-        ["Id", "UniqueId", "OData__UIVersionString",
-         "FileLeafRef", "FileDirRef",
-         "VitroBaseStatus", "VitroBaseDocumentRevision",
-         "VitroBaseFullName", "VitroBaseStatusDate",
-         "VitroBaseDocSheetNumber"],
-        flt=flt, max_items=max_items,
-    )
+    work_paths = (ATP_WORK, GIS_WORK)  # патч 20
+
+    raw: list[dict] = []
+    for wp in work_paths:
+        flt = (f"startswith(FileDirRef, '{wp}/') "
+               f"and substringof('.pdf', FileLeafRef)")
+        raw.extend(
+            _fetch_all(
+                VITRO_OKHTA_URL, LIST_DOCS,
+                ["Id", "UniqueId", "OData__UIVersionString",
+                 "FileLeafRef", "FileDirRef",
+                 "VitroBaseStatus", "VitroBaseDocumentRevision",
+                 "VitroBaseFullName", "VitroBaseStatusDate",
+                 "VitroBaseDocSheetNumber"],
+                flt=flt, max_items=max_items,
+            )
+        )
 
     doc_statuses = fetch_doc_statuses()
     docs: list[dict] = []
+    # Дедупликация по UniqueId (патч 20): последняя ревизия побеждает
+    seen: dict[str, dict] = {}
     for it in raw:
         leaf = (it.get("FileLeafRef") or "").strip()
         dir_ref = it.get("FileDirRef") or ""
 
-        if not leaf.startswith("АТ-РД-"):
+        if not looks_like_rd_code(leaf):
             continue
         if _is_excluded(dir_ref, leaf):
             continue
@@ -232,7 +272,7 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
         except (ValueError, TypeError):
             vitro_version = 1
 
-        docs.append({
+        record = {
             "id": it.get("Id"),
             "leaf": leaf,
             "discipline": disc,
@@ -246,7 +286,15 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             "sheet_number": it.get("VitroBaseDocSheetNumber"),
             "vitro_guid": it.get("UniqueId"),
             "vitro_version": vitro_version,
-        })
+        }
+        # Дедуп по UniqueId: оставляем последнюю ревизию
+        guid = record["vitro_guid"]
+        if guid:
+            existing = seen.get(guid)
+            if existing is None or vitro_version >= existing.get("vitro_version", 0):
+                seen[guid] = record
+
+    docs = list(seen.values())
     return docs
 
 
@@ -429,7 +477,8 @@ def build_dashboard(docs: list[dict], comments: list[dict]) -> list[dict]:
 
 def fetch_complex_names() -> list[dict]:
     """
-    Возвращает список комплектов с названиями:
+    Возвращает список комплектов с названиями (патч 19: организации
+    любые — «АТ-РД-…», «ГИС-РД-…» и др., фильтр looks_like_rd_code):
       [{"code": "АТ-РД-КЖ0-С-П2.1", "name": "...", "discipline": "02_КР"}]
     Комплекты берутся из путей PDF-файлов; названия — из VitroBaseFullName папок.
     """
@@ -458,7 +507,7 @@ def fetch_complex_names() -> list[dict]:
     complex_codes: dict[str, str] = {}   # code → discipline
     for f in pdf_files:
         leaf = f.get("FileLeafRef") or ""
-        if not leaf.startswith("АТ-РД-"):
+        if not looks_like_rd_code(leaf):
             continue
         dir_ref = f.get("FileDirRef") or ""
         disc, sec, comp = parse_path(dir_ref)
@@ -471,7 +520,7 @@ def fetch_complex_names() -> list[dict]:
     folder_names: dict[str, str] = {}
     for fol in folders:
         leaf = (fol.get("FileLeafRef") or "").strip()
-        if not leaf.startswith("АТ-РД-"):
+        if not looks_like_rd_code(leaf):
             continue
         code = normalize_complex(leaf)
         # Если название ещё не задано и есть в VitroBaseFullName

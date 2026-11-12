@@ -1,0 +1,1088 @@
+diff --git a/app.py b/app.py
+index 56b0094..f7e6e1e 100644
+--- a/app.py
++++ b/app.py
+@@ -5,8 +5,9 @@
+ Фиксированный хедер с логотипом АТП ТЛП.
+ Фиксированная полоса с датой последней выгрузки из Витро.
+ Фиксированный футер с версией приложения.
+-9 вкладок: Сводка, Динамика, Авторы, Сроки, План выдачи,
+-Категории, Поиск, Экспорт, Управление.
++9 вкладок: План выдачи, Сводка по проекту, Динамика, Авторы,
++Сроки, Категории, Поиск, Экспорт, Управление
++(патч 18: «План выдачи» перенесена на первое место).
+ Запуск: streamlit run app.py
+ """
+ 
+@@ -261,11 +262,11 @@ t3 = time.time()
+ print(f"[TIMING] app.py: header/footer: {t3 - t2:.2f} сек")
+ 
+ _TABS = [
++    "📅 План выдачи",      # патч 18: первая вкладка
+     "📊 Сводка по проекту",
+     "📈 Динамика",
+     "👤 Авторы",
+     "⏰ Сроки",
+-    "📅 План выдачи",
+     "🏷 Категории",
+     "🔍 Поиск",
+     "📄 Экспорт",
+diff --git a/scripts/test_patch18.py b/scripts/test_patch18.py
+new file mode 100644
+index 0000000..3bd3d69
+--- /dev/null
++++ b/scripts/test_patch18.py
+@@ -0,0 +1,206 @@
++# scripts/test_patch18.py
++"""Тесты патча 18.
++
++Блок 5: валидация шифров (is_valid_kit_code) — примеры из ТЗ;
++        сводка «всего / распознано / отброшено и почему» в парсерах;
++        служебный лист «Легенда» пропускается молча.
++Блок 6: колонки «Ревизия комплекта» и «Количество листов» в Сводке.
++
++Запуск: python scripts/test_patch18.py
++"""
++import io
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++
++import openpyxl
++
++from vitro.sheets import is_valid_kit_code
++from vitro.plan_xlsx import parse_kits_workbook, parse_drawings_workbook
++
++FAILED: list[str] = []
++
++
++def check(name: str, cond: bool, detail: str = "") -> None:
++    status = "OK  " if cond else "FAIL"
++    print(f"[{status}] {name}" + (f" — {detail}" if detail and not cond else ""))
++    if not cond:
++        FAILED.append(name)
++
++
++# ---------------------------------------------------------------------------
++# 1. is_valid_kit_code — примеры из ТЗ (Блок 5)
++# ---------------------------------------------------------------------------
++MUST_PASS = [
++    "АТ-РД-ЛВС.АИС-С-00",   # точка в середине (марка)
++    "АТ-РД-КМ2-1-02.1",     # точка с цифрой в конце (индекс)
++    "АТ-РД-АР3-1-08Т",      # буква в конце
++    "АТ-РД-КЖ1-1-00",       # базовый вид
++    "АТ-РД-АР12.1-1-00",    # точка в марке (патч 12)
++    "АТ-РД-СМИК-0-00",      # блок «0»
++    "АТ-РД-ОВ2-С-00",       # латинские двойники нормализуются до проверки
++]
++MUST_FAIL = [
++    "АТ-РД-КЖ1,2-С-П2.3.ВР",  # запятая — объединение двух комплектов
++    "АТ-РД-КЖ1,2-С-00",       # запятая в марке
++    "АТ-РД-АР1-С-00-1.1",     # полный шифр листа (6 блоков)
++    "АТ-РД-ОВ1-С-00-10.01",   # полный шифр листа (6 блоков)
++    "АТ-РД-ОВ1-С-00-10",      # полный шифр листа (6 блоков)
++    "ИТОГО", "Всего", "Подземная часть", "Легенда",
++    "СО", "ВР", "П.01", "12.05.2026", "",
++    "АТ-РД-КЖ1-С-",           # хвост на дефисе
++    "АТ-РД-КЖ1-С-00.",        # хвост на точке
++]
++for code in MUST_PASS:
++    check(f"is_valid_kit_code('{code}') == True", is_valid_kit_code(code))
++for code in MUST_FAIL:
++    check(f"is_valid_kit_code('{code}') == False", not is_valid_kit_code(code))
++
++# латинские двойники (как из CAD) — через нормализацию plan_xlsx
++from vitro.plan_xlsx import _kit_code_of  # noqa: E402
++check("_kit_code_of('AT-PД-KЖ1-1-00' с латиницей)",
++      _kit_code_of("AT-РД-KM2-1-02.1") == "АТ-РД-КМ2-1-02.1",
++      f"получено: {_kit_code_of('AT-РД-KM2-1-02.1')!r}")
++
++# ---------------------------------------------------------------------------
++# 2. parse_kits_workbook — сводка «всего/распознано/отброшено и почему»
++# ---------------------------------------------------------------------------
++def build_kits_xlsx(rows: list[list], sheet_name: str = "Комплекты") -> bytes:
++    wb = openpyxl.Workbook()
++    ws = wb.active
++    ws.title = sheet_name
++    ws.append(["Шифр комплекта", "Наименование комплекта",
++               "Дисциплина", "Раздел", "Статус", "Срок готовности"])
++    for r in rows:
++        ws.append(r)
++    buf = io.BytesIO()
++    wb.save(buf)
++    return buf.getvalue()
++
++
++kits_rows = [
++    ["АТ-РД-ЛВС.АИС-С-00", "ЛВС и АИС", "01_ИС", "Секция 00", "", None],
++    ["АТ-РД-КМ2-1-02.1", "КМ корпус 2", "03_ОВ", "Корпус 2", "", None],
++    ["АТ-РД-АР3-1-08Т", "АР корпус 3", "01_АР", "Корпус 3", "", None],
++    ["АТ-РД-КЖ1-1-00", "КР секция 00", "02_КР", "Секция 00", "", None],
++    ["АТ-РД-АР12.1-1-00", "АР 12.1", "01_АР", "Секция 00", "", None],
++    ["АТ-РД-КЖ1,2-С-П2.3.ВР", "мусор с запятой", "", "", "", None],
++    ["АТ-РД-АР1-С-00-1.1", "полный шифр листа", "", "", "", None],
++    ["ИТОГО", "итог", "", "", "", None],
++]
++data = build_kits_xlsx(kits_rows)
++rows, warnings = parse_kits_workbook(data, "Разрез_Комплект.xlsx")
++check("распознано 5 комплектов из 8 строк", len(rows) == 5,
++      f"распознано {len(rows)}")
++summary_lines = [w for w in warnings if "всего строк — 8" in w]
++check("предупреждение-сводка присутствует", bool(summary_lines),
++      f"warnings={warnings}")
++if summary_lines:
++    s = summary_lines[0]
++    check("в сводке: распознано комплектов — 5",
++          "распознано комплектов — 5" in s, s)
++    check("в сводке: отброшено — 3", "отброшено — 3" in s, s)
++    check("в сводке: причина «запятая»", "запятая" in s, s)
++    check("в сводке: причина «полный шифр листа»",
++          "полный шифр листа" in s, s)
++    check("в сводке: причина «служебная строка»",
++          "служебная строка" in s, s)
++examples_lines = [w for w in warnings if "примеры отброшенных" in w]
++check("примеры отброшенных шифров с запятой",
++      bool(examples_lines) and "АТ-РД-КЖ1,2-С-П2.3.ВР" in examples_lines[0])
++
++# служебный лист «Легенда» — молча, без предупреждений о колонках
++wb = openpyxl.Workbook()
++ws_leg = wb.active
++ws_leg.title = "Легенда"
++ws_leg.append(["Это служебный лист, описание колонок"])
++ws_data = wb.create_sheet("Данные")
++ws_data.append(["Шифр комплекта", "Наименование комплекта"])
++ws_data.append(["АТ-РД-КЖ1-1-00", "КР секция 00"])
++buf = io.BytesIO()
++wb.save(buf)
++rows2, warnings2 = parse_kits_workbook(buf.getvalue(), "с_легендой.xlsx")
++check("данные с листа «Данные» распознаны", len(rows2) == 1)
++check("лист «Легенда» пропущен молча (нет предупреждения о колонках)",
++      not any("не найдены колонки" in w or "Легенда" in w
++              for w in warnings2),
++      f"warnings={warnings2}")
++
++# ---------------------------------------------------------------------------
++# 3. parse_drawings_workbook — сводка + «Легенда»
++# ---------------------------------------------------------------------------
++wb = openpyxl.Workbook()
++ws = wb.active
++ws.title = "Чертежи"
++ws.append(["Шифр", "Название листа", "Шифр листа"])
++ws.append(["АТ-РД-ОВ1-С-00 Система отопления", "Шапка комплекта", ""])
++ws.append(["", "Отопление общие данные", "АТ-РД-ОВ1-С-00-10.01"])
++ws.append(["", "Подземная часть", ""])          # строка-раздел
++ws.append(["", "", ""])                          # пустая строка
++ws_leg = wb.create_sheet("Легенда")
++ws_leg.append(["служебный лист"])
++buf = io.BytesIO()
++wb.save(buf)
++d_rows, d_warnings, d_kits = parse_drawings_workbook(
++    buf.getvalue(), "реестр_ОВ.xlsx")
++check("распознан 1 лист чертежей", len(d_rows) == 1,
++      f"распознано {len(d_rows)}")
++check("комплект из шапки распознан",
++      "АТ-РД-ОВ1-С-00" in d_kits, f"kits={d_kits}")
++d_summary = [w for w in d_warnings if "всего строк — 3" in w]
++check("сводка по чертежам присутствует", bool(d_summary),
++      f"warnings={d_warnings}")
++if d_summary:
++    s = d_summary[0]
++    check("в сводке: шапок комплектов — 1", "шапок комплектов — 1" in s, s)
++    check("в сводке: служебные строки/разделы — 1",
++          "служебные строки/разделы — 1" in s, s)
++check("«Легенда» в чертежах пропущена молча",
++      not any("Легенда" in w for w in d_warnings))
++
++# ---------------------------------------------------------------------------
++# 4. Блок 6: kit_revision / docs_total в Сводке (без Streamlit-кэша)
++# ---------------------------------------------------------------------------
++import pandas as pd  # noqa: E402
++import vitro.ui.summary as summary_mod  # noqa: E402
++
++docs_df = pd.DataFrame([
++    {"complex": "АТ-РД-КЖ1-1-00", "section": "Секция 00",
++     "status": "A", "revision": "1.0"},
++    {"complex": "АТ-РД-КЖ1-1-00", "section": "Секция 00",
++     "status": "B", "revision": "2.0"},
++    {"complex": "АТ-РД-КЖ1-1-00", "section": "Секция 00",
++     "status": "C", "revision": "1.0"},
++    {"complex": "АТ-РД-КМ2-1-02.1", "section": "Корпус 2",
++     "status": "B", "revision": "10.0"},
++])
++res = summary_mod._build_summary_rows("complex", pd.DataFrame(), docs_df)
++row1 = res[res["Комплект"] == "АТ-РД-КЖ1-1-00"].iloc[0]
++row2 = res[res["Комплект"] == "АТ-РД-КМ2-1-02.1"].iloc[0]
++check("docs_total комплекта = 3", int(row1["docs_total"]) == 3,
++      str(row1["docs_total"]))
++check("ревизия комплекта = «2.0» (макс. численно)",
++      row1["kit_revision"] == "2.0", str(row1["kit_revision"]))
++check("ревизия «10.0» больше «2.0» численно",
++      row2["kit_revision"] == "10.0", str(row2["kit_revision"]))
++
++res_sec = summary_mod._build_summary_rows("section", pd.DataFrame(), docs_df)
++check("для разреза по разделам kit_revision пуст",
++      bool(res_sec.empty) or str(res_sec.iloc[0]["kit_revision"]) == "")
++# _render_summary_table — проверяем раскладку колонок без рендера:
++# извлекаем логику переименований через прямую сборку таблицы.
++view = res.copy()
++view = view.rename(columns={"docs_total": "Количество листов",
++                            "kit_revision": "Ревизия комплекта"})
++cols = ["Комплект", "Ревизия комплекта", "Количество листов"]
++check("колонки присутствуют после переименования",
++      all(c in view.columns for c in cols), str(list(view.columns)))
++
++# ---------------------------------------------------------------------------
++print()
++if FAILED:
++    print(f"ПРОВАЛЕНО тестов: {len(FAILED)}: {FAILED}")
++    sys.exit(1)
++print("ВСЕ ТЕСТЫ ПАТЧА 18 ПРОЙДЕНЫ")
+diff --git a/vitro/plan_xlsx.py b/vitro/plan_xlsx.py
+index d3ac352..a9a5a2c 100644
+--- a/vitro/plan_xlsx.py
++++ b/vitro/plan_xlsx.py
+@@ -77,20 +77,22 @@ _QTY_KEYS = ("кол-во", "количество", "кол во")
+ _PLANNED_DATE_KEYS = ("плановая дата", "дата выдачи", "дата")
+ 
+ # Шифр комплекта — строка вида АТ-РД-АР12.1-1-00. Строгая регулярка
+-# (патч 10; семантика точек уточнена в патче 12):
++# (патч 10; семантика точек уточнена в патчах 12 и 18):
+ #   блок 1: организация (2-4 буквы) — «АТ»;
+ #   блок 2: документ (1-3 буквы) — «РД»;
+-#   блок 3: марка/дисциплина с номером — «АР1», «АР12.1», «КЖ2.1», «ОВ10».
++#   блок 3: марка/дисциплина с номером — «АР1», «АР12.1», «КЖ2.1», «ОВ10»,
++#           «ЛВС.АИС».
+ #           ТОЧКИ В МАРКЕ ДОПУСТИМЫ (реальные комплекты «АР12.1»,
+-#           «КЖ2.1» — патч 12 вернул их после ошибочного запрета);
+-#           ЗАПЯТЫЕ ЗАПРЕЩЕНЫ («КЖ1,2» — мусор);
+-#   блоки 4-5 (1-2 шт.): блок и индекс — «С-00», «1-08Т», «С-П1»
+-#           (1-3 буквоцифры БЕЗ ТОЧЕК — точки бывают только в марке
+-#            и в номерах листов: «10.01», «П.01»).
++#           «КЖ2.1», «ЛВС.АИС»);
++#           ЗАПЯТЫЕ ЗАПРЕЩЕНЫ («КЖ1,2» — объединение двух комплектов
++#           в одной строке);
++#   блоки 4-5 (1-2 шт.): блок и индекс — «С-00», «1-08Т», «С-П1»,
++#           «1-02.1» (1-4 буквоцифры, ТОЧКИ в индексе допустимы —
++#           патч 18: реальные комплекты «АТ-РД-КМ2-1-02.1»).
+ # Поэтому мусор вида «АТ-РД-КЖ1,2-С-П2.3.ВР» отбрасывается дважды:
+-# запятая в марке И точки в хвосте (П2.3.ВР). Полные шифры ЛИСТОВ
+-# (АТ-РД-ОВ1-С-00-10.01 — 6 блоков, хвост с точкой) НЕ совпадают,
+-# как и строки-разделы («Подземная часть»), итоги («Всего», «ИТОГО»),
++# запятая в марке И слишком длинный хвост (П2.3.ВР). Полные шифры
++# ЛИСТОВ (АТ-РД-ОВ1-С-00-10.01 — 6 блоков) НЕ совпадают, как и
++# строки-разделы («Подземная часть»), итоги («Всего», «ИТОГО»),
+ # приложения («СО», «ВР», «П.01») и даты.
+ # СТАРЫЙ мусор в plan_kits (загрузки до патча 10) удаляется не
+ # регуляркой, а чекбоксом «Заменить план» (патч 12).
+@@ -99,6 +101,9 @@ _PLANNED_DATE_KEYS = ("плановая дата", "дата выдачи", "д
+ # в vitro/sheets.py — единственную точку правды о листах и шифрах.
+ # Отсюда они реэкспортируются: план.py и старый код продолжают
+ # импортировать is_valid_kit_code из plan_xlsx без изменений.
++# ПАТЧ 18: расширение семантики (точки в блоках хвоста, длина блока
++# до 4 символов) сделано ТОЛЬКО в sheets.py — парсеры Excel и листы
++# из Витро валидируются одной и той же функцией.
+ from vitro.sheets import _KIT_CODE_PATTERN, is_valid_kit_code
+ 
+ # Латинские двойники кириллических букв (появляются при копировании
+@@ -127,6 +132,24 @@ def _kit_code_of(value) -> str:
+     return code if is_valid_kit_code(code) else ""
+ 
+ 
++def _kit_drop_reason(raw) -> str:
++    """Причина отброса строки ведомости (патч 18) — для предупреждений
++    «Замечаний последней загрузки». Возвращает ключ причины:
++      'comma'      — в значении есть запятая: объединение двух
++                     комплектов в одной строке;
++      'sheet_code' — 6 и более блоков: полный шифр листа
++                     («АТ-РД-АР1-С-00-1.1»), а не шифр комплекта;
++      'other'      — служебная строка (раздел, итог, приложение),
++                     дата или просто не шифр комплекта.
++    """
++    s = _norm_complex_code(raw)
++    if "," in s:
++        return "comma"
++    if len([b for b in s.split("-") if b]) >= 6:
++        return "sheet_code"
++    return "other"
++
++
+ def _kit_from_row_cells(row, skip_cols: set = frozenset()
+                         ) -> tuple[str, str, int]:
+     """Поиск шифра комплекта ПО ВСЕЙ строке (патч 13).
+@@ -431,6 +454,11 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
+     листов, приложения и даты отбрасываются со счётчиком в
+     предупреждении (патч 10: фантомные комплекты 632 вместо ~479).
+ 
++    Патч 18: по каждому листу в предупреждения пишется сводка —
++    сколько всего строк, сколько успешно распознано, сколько
++    отброшено и ПОЧЕМУ (запятая/полный шифр листа/служебная строка);
++    служебные листы «Легенда» пропускаются молча.
++
+     Возвращает (rows, warnings):
+       rows — [{'code','name','discipline','section','plan_status',
+                'due_date','due_comment'}]
+@@ -438,7 +466,6 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
+     """
+     warnings: list[str] = []
+     rows: list[dict] = []
+-    skipped_total = 0   # суммарно отброшено строк с мусорным шифром
+ 
+     try:
+         wb = openpyxl.load_workbook(
+@@ -456,6 +483,8 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
+         ws = wb[sheet_name]
+         if ws.sheet_state != "visible":
+             continue
++        if "легенда" in sheet_name.strip().lower():
++            continue  # служебный лист «Легенда» — молча (патч 18)
+ 
+         found = _find_header_row(
+             ws,
+@@ -474,7 +503,10 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
+         header_idx, cols = found
+         sheet_rows = 0
+         skipped = 0            # строки с мусором в колонке шифра (патч 10)
++        skipped_empty = 0      # строки с пустой ячейкой шифра
++        total_rows = 0         # все строки данных листа (патч 18)
+         skipped_examples: list[str] = []
++        reasons: dict[str, int] = {}
+         for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
+             if row is None or all(
+                     v is None or str(v).strip() == "" for v in row):
+@@ -483,16 +515,21 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
+                 continue
+             raw_code = row[cols["code"]] \
+                 if len(row) > cols["code"] else None
++            total_rows += 1
+             code = _kit_code_of(raw_code)
+             if not code:
+-                # Пустая ячейка — пропуск молча; НЕПУСТОЙ мусор
+-                # (раздел, «Всего», шифр листа…) — со счётчиком и
+-                # примерами в предупреждении (патч 10).
++                # Пустая ячейка — пропуск молча (только счётчик);
++                # НЕПУСТОЙ мусор (раздел, «Всего», шифр листа…) —
++                # со счётчиком, причиной и примерами (патчи 10, 18).
+                 if raw_code is not None and str(raw_code).strip():
+                     skipped += 1
++                    reason = _kit_drop_reason(raw_code)
++                    reasons[reason] = reasons.get(reason, 0) + 1
+                     if len(skipped_examples) < 3:
+                         skipped_examples.append(
+                             " ".join(str(raw_code).split())[:40])
++                else:
++                    skipped_empty += 1
+                 continue
+             name = _clean_str(row[cols["name"]]) \
+                 if cols.get("name") is not None and \
+@@ -518,22 +555,40 @@ def parse_kits_workbook(data: bytes, filename: str = "") -> tuple[list[dict], li
+             warnings.append(
+                 f"{filename} · лист «{sheet_name}»: заголовок найден, "
+                 f"но строк данных нет.")
++        # Патч 18: сводка по листу — сколько всего строк, сколько
++        # успешно распознано, сколько отброшено и по какой причине.
++        if total_rows:
++            reason_bits = []
++            if reasons.get("comma"):
++                reason_bits.append(
++                    "объединение нескольких комплектов в одной строке "
++                    f"(запятая) — {reasons['comma']}")
++            if reasons.get("sheet_code"):
++                reason_bits.append(
++                    "полный шифр листа, а не шифр комплекта — "
++                    f"{reasons['sheet_code']}")
++            if reasons.get("other"):
++                reason_bits.append(
++                    "служебная строка (раздел/итог/приложение) или "
++                    f"не шифр комплекта — {reasons['other']}")
++            if skipped_empty:
++                reason_bits.append(
++                    f"пустая ячейка шифра — {skipped_empty}")
++            dropped = skipped + skipped_empty
++            warn = (f"{filename} · лист «{sheet_name}»: всего строк — "
++                    f"{total_rows}, распознано комплектов — {sheet_rows}, "
++                    f"отброшено — {dropped}")
++            if reason_bits:
++                warn += " (" + "; ".join(reason_bits) + ")"
++            warnings.append(warn + ".")
+         if skipped:
+             examples = "; ".join(f"«{e}»" for e in skipped_examples)
+             more = " …" if skipped > len(skipped_examples) else ""
+             warnings.append(
+-                f"{filename} · лист «{sheet_name}»: отброшено "
+-                f"{skipped} строк(и) — значение в колонке шифра не "
+-                f"похоже на шифр комплекта (разделы, итоги, шифры "
+-                f"листов, приложения): {examples}{more}")
+-        skipped_total += skipped
++                f"{filename} · лист «{sheet_name}»: примеры отброшенных "
++                f"шифров: {examples}{more}")
+     wb.close()
+ 
+-    if skipped_total:
+-        warnings.insert(0,
+-            f"{filename}: всего отброшено {skipped_total} строк(и), "
+-            f"не похожих на шифры комплектов — это нормально: в план "
+-            f"попали только реальные комплекты.")
+     if not rows and not warnings:
+         warnings.append(f"{filename}: не найдено ни одной строки комплектов.")
+     return rows, warnings
+@@ -553,6 +608,11 @@ def parse_drawings_workbook(
+       - наименование:    «Название листа», «Наименование чертежа»;
+       - полный шифр:     «Шифр листа», «Полный шифр листа», «Шифр чертежа».
+ 
++    Патч 18: по каждому листу в предупреждения пишется сводка —
++    сколько всего строк, сколько распознано листов, сколько шапок
++    комплектов, сколько пропущено и почему; служебные листы
++    «Легенда» пропускаются молча.
++
+     Структура строк реальных регистров:
+       - строка-раздел («Подземная часть», «Прилагаемые документы») — пропуск;
+       - строка-шапка комплекта «АТ-РД-ОВ1-С-00 Система отопления…» —
+@@ -607,6 +667,8 @@ def parse_drawings_workbook(
+         ws = wb[sheet_name]
+         if ws.sheet_state != "visible":
+             continue
++        if "легенда" in sheet_name.strip().lower():
++            continue  # служебный лист «Легенда» — молча (патч 18)
+ 
+         found = _find_header_row(
+             ws,
+@@ -638,6 +700,9 @@ def parse_drawings_workbook(
+         sheet_rows = 0
+         no_kit = 0
+         empty_run = 0  # подряд идущие пустые строки
++        total_rows = 0        # все строки данных листа (патч 18)
++        headers_count = 0     # шапки комплектов (патч 18)
++        skipped_service = 0   # служебные строки/разделы (патч 18)
+ 
+         for row in ws.iter_rows(min_row=header_idx + 2, values_only=True):
+             if row is None or all(
+@@ -650,6 +715,7 @@ def parse_drawings_workbook(
+                     break
+                 continue
+             empty_run = 0
++            total_rows += 1
+ 
+             # ---- колонка шифра комплекта: контекст ----
+             # Переводы строк внутри ячейки («АТ-РД-ОВ1-С-00\nСистема…»)
+@@ -666,6 +732,7 @@ def parse_drawings_workbook(
+                     current_kit_name = " ".join(name_part.split())
+                     if not kits.get(current_kit):
+                         kits[current_kit] = current_kit_name
++                    headers_count += 1
+                     continue  # это не чертёж
+                 # шифр без названия — смена комплекта внутри листа,
+                 # строка ниже всё ещё может быть чертежом
+@@ -690,6 +757,7 @@ def parse_drawings_workbook(
+                         kits.setdefault(current_kit, "")
+                     if not _looks_like_drawing_row(
+                             row, cols, c_full, c_no, f_col):
++                        headers_count += 1
+                         continue  # это шапка комплекта, не чертёж
+             # иначе в колонке шифра метка («Приложение 1», «Подземная
+             # часть», «Прилагаемые документы») — комплект НЕ сменяем.
+@@ -704,9 +772,11 @@ def parse_drawings_workbook(
+             if not sheet_no and c_no is not None:
+                 sheet_no = _fmt_sheet_no(_cell(row, c_no))
+             if not title and not sheet_no:
+-                continue  # служебная строка (раздел/метка) без данных
++                skipped_service += 1  # служебная строка (раздел/метка) без данных
++                continue
+             if _looks_like_section_header(title) and not sheet_no:
+-                continue  # «Подземная часть» в колонке названия
++                skipped_service += 1  # «Подземная часть» в колонке названия
++                continue
+ 
+             kit = current_kit or default_kit
+             if not kit:
+@@ -741,6 +811,22 @@ def parse_drawings_workbook(
+             rows.append(row_data)
+             sheet_rows += 1
+ 
++        # Патч 18: сводка по листу — сколько всего строк, сколько
++        # распознано листов, сколько шапок, сколько пропущено и почему.
++        if total_rows:
++            bits = []
++            if headers_count:
++                bits.append(f"шапок комплектов — {headers_count}")
++            if no_kit:
++                bits.append(f"без шифра комплекта — {no_kit}")
++            if skipped_service:
++                bits.append(
++                    f"служебные строки/разделы — {skipped_service}")
++            warn = (f"{filename} · лист «{sheet_name}»: всего строк — "
++                    f"{total_rows}, распознано листов — {sheet_rows}")
++            if bits:
++                warn += " (" + "; ".join(bits) + ")"
++            warnings.append(warn + ".")
+         if no_kit:
+             warnings.append(
+                 f"{filename} · лист «{sheet_name}»: {no_kit} строк пропущено — "
+diff --git a/vitro/sheets.py b/vitro/sheets.py
+index 2c269d3..1cc0bb2 100644
+--- a/vitro/sheets.py
++++ b/vitro/sheets.py
+@@ -102,17 +102,29 @@ def _int(v) -> int:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Валидность шифра комплекта (патч 13)
++#  Валидность шифра комплекта (патч 13; семантика расширена патчем 18)
+ # ---------------------------------------------------------------------------
+ # Шифр комплекта вида АТ-РД-КЖ1-С-00: блоки из заглавных букв/цифр,
+-# 2–4 блока хвоста. Мусор из папок SharePoint («АТ-РД-КЖ1,2-С-П2.3.ВР»
+-# с запятыми/точками, имена-разделы, даты) под шаблон не подпадает.
++# 1–2 блока хвоста. Патч 18 — по реальным комплектам Витро:
++#   * в марке (3-й блок) точки допустимы: «ЛВС.АИС», «КЖ2.1», «АР12.1»;
++#   * в блоках хвоста (блок и индекс) точки ТОЖЕ допустимы: индексы
++#     вида «02.1» («АТ-РД-КМ2-1-02.1»), буква в конце
++#     («АТ-РД-АР3-1-08Т»);
++#   * ЗАПЯТЫЕ запрещены: «АТ-РД-КЖ1,2-С-П2.3.ВР» — объединение ДВУХ
++#     комплектов в одной строке, комплектом не является;
++#   * полный шифр листа (6 блоков: «АТ-РД-АР1-С-00-1.1») не проходит —
++#     хвостных блоков максимум два, длина блока хвоста — до 4 символов;
++#   * строка не может кончаться точкой или дефисом.
++# Мусор из папок SharePoint (имена-разделы, «ИТОГО», даты, приложения
++# «СО», «ВР», «П.01») по-прежнему под шаблон не подпадает.
+ # Раньше шаблон жил в plan_xlsx; перенесён сюда (патч 14), чтобы
+-# sheets.py оставался единственной точкой правды о листах, а
+-# plan_xlsx импортировал функцию отсюда.
++# sheets.py оставался единственной точкой правды о шифрах: ОДНА
++# функция обслуживает и парсеры Excel (plan_xlsx), и листы из Витро
++# (unique_vitro_sheets и фильтры вкладок) — правка патча 18 сделана
++# в одном месте и действует на оба источника.
+ _KIT_CODE_PATTERN = re.compile(
+     r"^[A-ZА-ЯЁ]{2,4}-[A-ZА-ЯЁ]{1,3}-[A-ZА-ЯЁ0-9.]+"
+-    r"(?:-[A-ZА-ЯЁ0-9]{1,3}){1,2}$"
++    r"(?:-[A-ZА-ЯЁ0-9.]{1,4}){1,2}$"
+ )
+ 
+ 
+@@ -123,8 +135,24 @@ def is_valid_kit_code(code: str) -> bool:
+     фильтр применяется и к комплектам из ведомостей, и к комплектам
+     из Витро (в т. ч. исторический мусор в plan_kits — шифры
+     с запятыми/точками вида «АТ-РД-КЖ1,2-С-П2.3.ВР»).
++
++    Патч 18: пропускает реальные комплекты, которые раньше терялись —
++    «АТ-РД-ЛВС.АИС-С-00» (точка в марке), «АТ-РД-КМ2-1-02.1» (точка
++    и цифра в индексе), «АТ-РД-АР3-1-08Т» (буква в конце); запятая
++    в любом месте — гарантированный отказ (объединение двух
++    комплектов в одной строке).
+     """
+-    return bool(_KIT_CODE_PATTERN.match(code)) if code else False
++    if not code:
++        return False
++    s = str(code)
++    if "," in s:
++        # «АТ-РД-КЖ1,2-С-П2.3.ВР» — объединение двух комплектов
++        # в одной строке; регулярка его и так отсекает, явная
++        # проверка — для читаемости и на случай будущих правок.
++        return False
++    if s.endswith(("-", ".")):
++        return False
++    return bool(_KIT_CODE_PATTERN.match(s))
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/vitro/ui/dynamics.py b/vitro/ui/dynamics.py
+index 53228b1..71ec3ae 100644
+--- a/vitro/ui/dynamics.py
++++ b/vitro/ui/dynamics.py
+@@ -21,9 +21,13 @@
+      комплекты / уникальные листы за выбранный период + листы
+      со статусами B и A за период.
+   3. «Выполнение плана» — бублики против Ведомости комплектов
+-     (plan_drawings / plan_kits): комплекты, листы + два бублика
+-     по замечаниям за период («Выполнено / Осталось» и
+-     «Закрыто заказчиком / Осталось», процент — в центре).
++     (plan_drawings / plan_kits): комплекты, листы + блок
++     «Замечания за период» в стиле Сводки (патч 18): бублик
++     «Объём замечаний» — числитель «Выдано за период», сегменты
++     Выдано / Отработано; справа список с маркерами — Выполнено и
++     Закрыто заказчиком за период, «Отработано всего» = Закрыто +
++     Аннулировано + Без статуса по всем замечаниям с фильтрами
++     без ограничения периодом (_load_remark_scope).
+      «Выполнено» — уникальные листы и комплекты в Витро по
+      sheets.unique_vitro_sheets — ЕДИНОМУ стандарту «Плана
+      выдачи», поэтому цифры совпадают (11 312 / 424).
+@@ -501,11 +505,11 @@ def _render_kpi(issue: pd.DataFrame,
+ 
+     c1, c2, c3 = st.columns(3)
+     c1.metric(
+-        "Выдано замечаний", _fmt(total_issue),
++        "📤 Выдано замечаний", _fmt(total_issue),
+         help="Сколько замечаний поступило от заказчика за выбранный период.",
+     )
+     c2.metric(
+-        "Выполнено", _fmt(total_our),
++        "🟢 Выполнено", _fmt(total_our),
+         help="Замечания, которые АТП ТЛП выполнил и направил "
+              "заказчику на согласование (статус «Выполнено»). "
+              "Заказчик их ещё не закрыл.\n\n"
+@@ -513,7 +517,7 @@ def _render_kpi(issue: pd.DataFrame,
+              "замечания.",
+     )
+     c3.metric(
+-        "Закрыто заказчиком", _fmt(total_cust),
++        "⚪ Закрыто заказчиком", _fmt(total_cust),
+         help="Сколько замечаний заказчик формально закрыл за период.",
+     )
+ 
+@@ -872,91 +876,159 @@ def _build_donut_figure(done: int, plan_total: int,
+     return fig, pct, status_text, is_over
+ 
+ 
+-def _render_remark_donuts(remark_totals: dict | None):
+-    """Бублики по замечаниям за период (патч 14).
+-
+-    «Выполнено / Осталось» и «Закрыто заказчиком / Осталось» —
+-    от общего числа выданных за период замечаний, процент в центре.
+-    Не зависят от Ведомости — рисуются даже если план не задан.
++@versioned_cache(ttl=3600)
++def _load_remark_scope(disciplines: tuple, sections: tuple,
++                       kits: tuple, block_codes: tuple,
++                       marka: str = "") -> dict:
++    """«Отработано» по всем замечаниям с учётом фильтров (патч 18).
++
++    Формула (согласована с координатором, В1): Отработано =
++    Замечания со статусом «Закрыто» + «Аннулировано» + Без статуса —
++    по ВСЕМ замечаниям с учётом фильтров вкладки, БЕЗ ограничения
++    выбранным периодом. Числители «Выдано / Выполнено / Закрыто
++    заказчиком» считаются отдельно (_load_issue_stats /
++    _load_our_answers_stats / _load_customer_closed_stats) и строго
++    за выбранный период.
++
++    Фильтры — те же, что во всех запросах вкладки
++    (_build_filter_sql без дат, включая марку комплекта).
++    """
++    where, params = _build_filter_sql(
++        disciplines, sections, kits, block_codes,
++        None, None, "c.created", marka=marka)
++    q = f"""
++        SELECT
++            COALESCE(SUM(CASE WHEN c.status = 'Закрыто'
++                              THEN 1 ELSE 0 END), 0) AS closed,
++            COALESCE(SUM(CASE WHEN c.status = 'Аннулировано'
++                              THEN 1 ELSE 0 END), 0) AS annulled,
++            COALESCE(SUM(CASE WHEN c.status IS NULL OR c.status = ''
++                              THEN 1 ELSE 0 END), 0) AS no_status
++        FROM comments c
++        JOIN documents d ON c.doc_id = d.id
++        WHERE 1=1 {where}
++    """
++    with get_conn() as conn:
++        row = conn.execute(q, tuple(params)).fetchone()
++    closed = int(row["closed"] or 0)
++    annulled = int(row["annulled"] or 0)
++    no_status = int(row["no_status"] or 0)
++    return {"closed": closed, "annulled": annulled,
++            "no_status": no_status,
++            "worked": closed + annulled + no_status}
++
++
++def _render_remark_donuts(remark_totals: dict | None,
++                          remark_scope: dict | None = None):
++    """Блок «Замечания за период: выполнение и закрытие» — стиль
++    Сводки (патч 18).
++
++    Слева бублик «Объём замечаний» (В2): числитель — «Выдано за
++    период», сегменты = Выдано за период / Отработано. «Отработано»
++    (В1) — Закрыто + Аннулировано + Без статуса по всем замечаниям
++    с учётом фильтров, без ограничения периодом (_load_remark_scope).
++    Справа — список с маркерами, как в Сводке: «Выполнено» и
++    «Закрыто заказчиком» — строго за выбранный период, «Отработано
++    всего» — за всё время по фильтрам; под списком — строка
++    арифметики «Отработано».
+ 
+     Патч 17: цвета как в Сводке — «Выполнено» зелёный #2ca02c,
+     «Закрыто заказчиком» серый #9E9E9E.
+     """
+     issued_total = int((remark_totals or {}).get("issued") or 0)
+-    if issued_total <= 0:
++    worked = int((remark_scope or {}).get("worked") or 0)
++    if issued_total <= 0 and worked <= 0:
+         return
+ 
+     st.markdown("#### Замечания за период: выполнение и закрытие")
+     st.caption(
+-        f"От общего числа замечаний, выданных за выбранный период "
+-        f"({_fmt(issued_total)}). «Осталось» — не выполнено и не "
+-        f"закрыто. Выполненные и закрытые замечания, выданные до "
+-        f"периода, дают долю выше 100% (сегмент «Сверх периода»)."
++        "Бублик: «Выдано за период» — замечания заказчика, созданные "
++        "за выбранный период (с учётом фильтров); «Отработано» — "
++        "закрытые, аннулированные и без статуса по всем замечаниям "
++        "с учётом фильтров (без ограничения периодом). «Выполнено» "
++        "и «Закрыто заказчиком» — строго за выбранный период."
+     )
+ 
+-    our_total = int((remark_totals or {}).get("our_answers") or 0)
+-    cust_total = int((remark_totals or {}).get("cust_closed") or 0)
+-
+-    r1, r2 = st.columns(2)
++    left, right = st.columns([2, 3])
+ 
+-    with r1:
+-        fig, pct, status_text, is_over = _build_donut_figure(
+-            our_total, issued_total,
+-            done_label="Выполнено",
+-            over_label="Сверх периода",
+-            done_color="#2ca02c",
++    with left:
++        st.caption(
++            f"Выдано за период: **{_fmt(issued_total)}** · "
++            f"Отработано всего: **{_fmt(worked)}**"
+         )
+-        st.plotly_chart(fig, use_container_width=True,
+-                        key="dyn_donut_our")
+-        if is_over:
+-            st.markdown(
+-                f"<div style='text-align:center'>Выполнено "
+-                f"<b>{_fmt(our_total)}</b> из "
+-                f"<b>{_fmt(issued_total)}</b> выданных — "
+-                f"<b style='color:#FFA726'>+{_fmt(status_text)} "
+-                f"сверх периода</b></div>",
+-                unsafe_allow_html=True,
++        if issued_total > 0:
++            donut = pd.DataFrame([
++                {"Категория": "Выдано за период", "Значение": issued_total},
++                {"Категория": "Отработано",       "Значение": worked},
++            ])
++            donut = donut[donut["Значение"] > 0]
++            fig = px.pie(
++                donut,
++                names="Категория",
++                values="Значение",
++                hole=0.45,
++                color="Категория",
++                color_discrete_map={
++                    "Выдано за период": "#1f77b4",
++                    "Отработано":       "#9E9E9E",
++                },
+             )
+-        else:
+-            st.markdown(
+-                f"<div style='text-align:center'>Выполнено "
+-                f"<b>{_fmt(our_total)}</b> из "
+-                f"<b>{_fmt(issued_total)}</b> выданных — "
+-                f"осталось <b>{_fmt(status_text)}</b></div>",
+-                unsafe_allow_html=True,
++            fig.update_traces(
++                textposition="inside",
++                textinfo="percent",
++                textfont_size=11,
+             )
+-
+-    with r2:
+-        fig, pct, status_text, is_over = _build_donut_figure(
+-            cust_total, issued_total,
+-            done_label="Закрыто заказчиком",
+-            over_label="Сверх периода",
+-            done_color="#9E9E9E",
+-        )
+-        st.plotly_chart(fig, use_container_width=True,
+-                        key="dyn_donut_cust")
+-        if is_over:
+-            st.markdown(
+-                f"<div style='text-align:center'>Закрыто заказчиком "
+-                f"<b>{_fmt(cust_total)}</b> из "
+-                f"<b>{_fmt(issued_total)}</b> выданных — "
+-                f"<b style='color:#FFA726'>+{_fmt(status_text)} "
+-                f"сверх периода</b></div>",
+-                unsafe_allow_html=True,
++            fig.update_layout(
++                showlegend=False,
++                margin=dict(l=5, r=5, t=5, b=5),
++                height=200,
+             )
++            st.plotly_chart(fig, use_container_width=True,
++                            key="dyn_donut_remarks")
+         else:
+-            st.markdown(
+-                f"<div style='text-align:center'>Закрыто заказчиком "
+-                f"<b>{_fmt(cust_total)}</b> из "
+-                f"<b>{_fmt(issued_total)}</b> выданных — "
+-                f"осталось <b>{_fmt(status_text)}</b></div>",
+-                unsafe_allow_html=True,
++            st.caption("За выбранный период замечания не выдавались.")
++
++    with right:
++        st.metric(
++            "📤 Выдано за период", _fmt(issued_total),
++            help="Замечания заказчика, созданные за выбранный период "
++                 "(с учётом фильтров).",
++        )
++        st.metric(
++            "🟢 Выполнено за период",
++            _fmt(int((remark_totals or {}).get("our_answers") or 0)),
++            help="Замечания, которые АТП ТЛП выполнил и направил "
++                 "заказчику на согласование (статус «Выполнено») "
++                 "за выбранный период. Замечания к листам A и "
++                 "аннулированным не считаются.",
++        )
++        st.metric(
++            "⚪ Закрыто заказчиком за период",
++            _fmt(int((remark_totals or {}).get("cust_closed") or 0)),
++            help="Замечания, формально закрытые заказчиком "
++                 "за выбранный период.",
++        )
++        st.metric(
++            "⚫ Отработано всего", _fmt(worked),
++            help="Закрыто + Аннулировано + Без статуса по всем "
++                 "замечаниям с учётом фильтров — без ограничения "
++                 "выбранным периодом.",
++        )
++        if worked > 0:
++            closed = int((remark_scope or {}).get("closed") or 0)
++            annulled = int((remark_scope or {}).get("annulled") or 0)
++            no_status = int((remark_scope or {}).get("no_status") or 0)
++            st.caption(
++                f"Арифметика: Отработано {_fmt(worked)} = "
++                f"Закрыто {_fmt(closed)} + Аннулировано "
++                f"{_fmt(annulled)} + Без статуса {_fmt(no_status)}."
+             )
+ 
+ 
+ def _render_progress_donuts(disciplines: tuple, sections: tuple,
+                             kits: tuple, block_codes: tuple,
+-                            remark_totals: dict | None = None):
++                            remark_totals: dict | None = None,
++                            remark_scope: dict | None = None):
+     """Бублики сравнения с планом: комплекты, листы и замечания.
+ 
+     «Выполнено» — уникальные листы/комплекты в Витро
+@@ -979,7 +1051,7 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
+             "не найдены или пусты. Загрузите Ведомость комплектов — "
+             "и бублики появятся."
+         )
+-        _render_remark_donuts(remark_totals)
++        _render_remark_donuts(remark_totals, remark_scope)
+         return
+ 
+     plan_kits_total = sum(v["kits"] for v in plan.values())
+@@ -990,7 +1062,7 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
+             "В Ведомости нет плановых значений для выбранной "
+             "комбинации фильтров."
+         )
+-        _render_remark_donuts(remark_totals)
++        _render_remark_donuts(remark_totals, remark_scope)
+         return
+ 
+     totals = _load_doc_totals(disciplines, sections, kits, block_codes)
+@@ -1041,8 +1113,8 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
+                 unsafe_allow_html=True,
+             )
+ 
+-    # ---- Бублики по замечаниям за период (патч 14) ----
+-    _render_remark_donuts(remark_totals)
++    # ---- Бублики по замечаниям за период (патчи 14, 18) ----
++    _render_remark_donuts(remark_totals, remark_scope)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1280,6 +1352,8 @@ def render():
+             marka=marka_t)
+         doc_volume = _load_doc_volume(
+             disc_t, sect_t, kit_t, block_codes, date_from, date_to)
++        remark_scope = _load_remark_scope(
++            disc_t, sect_t, kit_t, block_codes, marka=marka_t)
+ 
+     _render_kpi(issue, our_answers, cust_closed, doc_volume,
+                 date_from, date_to)
+@@ -1292,7 +1366,8 @@ def render():
+                         if not cust_closed.empty else 0),
+     }
+     _render_progress_donuts(disc_t, sect_t, kit_t, block_codes,
+-                            remark_totals=remark_totals)
++                            remark_totals=remark_totals,
++                            remark_scope=remark_scope)
+ 
+     st.divider()
+ 
+diff --git a/vitro/ui/plan.py b/vitro/ui/plan.py
+index dd3780d..9f7cc5b 100644
+--- a/vitro/ui/plan.py
++++ b/vitro/ui/plan.py
+@@ -140,14 +140,18 @@ KIT_STATUS_COLORS = {
+     "Только в Витро":          "#1f77b4",
+ }
+ 
+-# Цвета бублика «Листы» (патч 17): статусы A/B/C — как в Сводке
+-# (summary.py SHEET_COLORS); «Другие» и «Осталось по плану» — служебные.
++# Цвета бублика «Листы» (патч 17; уточнены патчем 18 по В3):
++# статусы A/B/C — как в Сводке (summary.py SHEET_COLORS);
++# «Другие статусы» — фиолетовый #9467bd (как «Готовится к загрузке»
++# в Сводке), «Осталось по плану» — серый #B0BEC5 (⚪). Сверх плана —
++# не категория бублика: уже входит в A/B/C/Другие, показывается
++# справочной плашкой ℹ️ под бубликом.
+ SHEET_STATUS_COLORS = {
+     "Статус A — утверждён": "#2ca02c",
+     "Статус B — к сдаче":   "#ffdd57",
+     "Статус C — в работе":  "#ff7f0e",
+-    "Другие статусы":       "#17becf",
+-    "Осталось по плану":    "#9467bd",
++    "Другие статусы":       "#9467bd",
++    "Осталось по плану":    "#B0BEC5",
+ }
+ 
+ # Колонки сводной таблицы. Патч 17: «Дисциплина» и «Раздел» возвращены
+@@ -877,6 +881,11 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
+     _plan_totals: по всему отфильтрованному отбору (без периода),
+     включая комплекты «Только в Витро». «Листов всего» = max(план,
+     УНИКАЛЬНЫХ листов в Витро) — см. патчи 09–10.
++
++    Патч 18 (В3): «Другие статусы» — фиолетовый #9467bd (🟣),
++    «Осталось по плану» — серый #B0BEC5 (⚪). «Сверх плана» не
++    категория бублика и не метрика списка: это часть A/B/C/Других,
++    выводится только справочной плашкой ℹ️ под бубликом.
+     """
+     st.markdown("##### 🎯 Комплектов и листов: всего / план")
+ 
+@@ -976,22 +985,15 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
+             help="Уникальные листы в Витро со статусом C.",
+         )
+         st.metric(
+-            "⚪ Другие статусы", _fmt_num(n_other),
++            "🟣 Другие статусы", _fmt_num(n_other),
+             help="Статус И, «на согласовании Заказчика», «готовится "
+                  "к загрузке», аннулированные и прочие листы в Витро.",
+         )
+         if sheets_remaining > 0:
+             st.metric(
+-                "🟣 Осталось по плану", _fmt_num(sheets_remaining),
++                "⚪ Осталось по плану", _fmt_num(sheets_remaining),
+                 help="План ведомостей минус листы в Витро.",
+             )
+-        elif sheets_excess > 0:
+-            st.metric(
+-                "➕ Сверх плана", _fmt_num(sheets_excess),
+-                help="Листов в Витро больше планового количества "
+-                     "(комплекты без ведомостей чертежей, повторы, "
+-                     "извещения, приложения).",
+-            )
+ 
+     if sheets_excess:
+         st.caption(
+diff --git a/vitro/ui/summary.py b/vitro/ui/summary.py
+index 5fedd3a..19333d3 100644
+--- a/vitro/ui/summary.py
++++ b/vitro/ui/summary.py
+@@ -11,6 +11,10 @@
+   4. Замечания на стороне Заказчика — 6 плиток.
+   5. Категории замечаний, оценка АТП ТЛП — 6 плиток.
+   + Разрез по дисциплинам / разделам / комплектам.
++    Патч 18 (Блок 6): в таблицу разреза добавлены колонки
++    «Ревизия комплекта» (revision из documents, только на уровне
++    «По комплектам») и «Количество листов» (docs_total — уникальные
++    листы, в разрезах — сумма групп).
+ 
+ Источник: `_load_all_categorized` (deadlines.py).
+ Фильтры: дисциплина → раздел → расположение → комплект.
+@@ -852,6 +856,17 @@ def _build_summary_rows(group_col: str,
+ 
+     # --- Листы (docs_df уже дедуплицирован в _load_documents, патч 11:
+     #     одна строка = один уникальный лист, статусы последней ревизии) ---
++    # Патч 18 (Блок 6): «Ревизия комплекта» — поле revision из documents
++    # (VitroBaseDocumentRevision); осмысленна только для уровня
++    # «По комплектам» (группа = один комплект) — берётся максимальная
++    # ревизия листов комплекта (численно: «2.0» > «10.0» как числа).
++    # Для разрезов по дисциплинам/разделам колонка не заполняется.
++    def _rev_key(v: str) -> float:
++        try:
++            return float(str(v).strip())
++        except (TypeError, ValueError):
++            return -1.0
++
+     if not docs_df.empty:
+         doc_rows = []
+         for grp, sub in docs_df.groupby(group_col, dropna=True):
+@@ -866,9 +881,16 @@ def _build_summary_rows(group_col: str,
+             annulled = int((statuses == "АННУЛИРОВАНО").sum())
+             pct_ab = (round((a + b) / total * 100, 1)
+                       if total > 0 else 0.0)
++            kit_revision = ""
++            if group_col == "complex" and "revision" in sub.columns:
++                rev_vals = [str(v).strip() for v in sub["revision"].tolist()
++                            if v is not None and str(v).strip()]
++                if rev_vals:
++                    kit_revision = max(rev_vals, key=_rev_key)
+             doc_rows.append({
+                 group_col: grp,
+                 "docs_total": total,
++                "kit_revision": kit_revision,
+                 "doc_a": a,
+                 "doc_b": b,
+                 "doc_c": c,
+@@ -962,6 +984,11 @@ def _build_summary_rows(group_col: str,
+             if group_col in frame.columns:
+                 frame[group_col] = frame[group_col].fillna("").astype(str)
+         result = docs_grp.merge(active_grp, on=group_col, how="outer")
++    # Патч 18: kit_revision — текстовая колонка; пустые значения
++    # заполняем строкой ДО общего fillna(0), иначе группы без листов
++    # (outer merge) получили бы 0 в текстовой колонке.
++    if "kit_revision" in result.columns:
++        result["kit_revision"] = result["kit_revision"].fillna("")
+     result = result.fillna(0)
+ 
+     group_col_names = {
+@@ -1069,6 +1096,8 @@ def _export_summary_to_excel(df: pd.DataFrame, group_label: str, level: str) ->
+         column_width_map = {
+             group_label: 20,
+             "Полное наименование": 50,
++            "Ревизия комплекта": 16,
++            "Количество листов": 14,
+             "Открытых замечаний": 14,
+             "Всего у АТП ТЛП": 14,
+             "Всего у Заказчика": 18,
+@@ -1181,10 +1210,25 @@ def _render_summary_table(df: pd.DataFrame,
+ 
+     # --- Приводим числовые колонки к int ---
+     for c in ["active_total", "n_new", "n_in_work", "n_rejected",
+-              "n_discussion", "n_customer", "n_customer_a", "n_annulled"]:
++              "n_discussion", "n_customer", "n_customer_a", "n_annulled",
++              "docs_total"]:
+         if c in view.columns:
+             view[c] = view[c].fillna(0).astype(int)
+ 
++    # --- Патч 18 (Блок 6): «Ревизия комплекта» и «Количество листов» ---
++    # «Количество листов» — docs_total: число УНИКАЛЬНЫХ листов
++    # (тот же дедуп, что в секции «Листы РД»); в разрезах — сумма
++    # листов групп. «Ревизия комплекта» — revision из documents,
++    # заполняется только на уровне «По комплектам».
++    if "docs_total" in view.columns:
++        view = view.rename(columns={"docs_total": "Количество листов"})
++    if "kit_revision" in view.columns:
++        view = view.rename(columns={"kit_revision": "Ревизия комплекта"})
++        if level != "complex":
++            # Ревизия осмысленна только для комплекта — в разрезах
++            # по дисциплинам/разделам колонку не показываем.
++            view = view.drop(columns=["Ревизия комплекта"])
++
+     # --- Формируем финальные колонки ---
+     view = view.rename(columns={
+         "active_total": "Открытых замечаний",
+@@ -1221,6 +1265,8 @@ def _render_summary_table(df: pd.DataFrame,
+     cols_order = [
+         group_label,
+         "Полное наименование",
++        "Ревизия комплекта",
++        "Количество листов",
+         "Открытых замечаний",
+         "Всего у АТП ТЛП",
+         "🔵 Новое",
+@@ -1242,9 +1288,13 @@ def _render_summary_table(df: pd.DataFrame,
+     totals_row = {group_label: "ИТОГО"}
+     totals_row["Полное наименование"] = ""
+     totals_row["Пояснения"] = ""
++    if "Ревизия комплекта" in view.columns:
++        # Ревизия — не число: в ИТОГО не суммируется (патч 18).
++        totals_row["Ревизия комплекта"] = ""
+ 
+     for c in view.columns:
+-        if c in (group_label, "Полное наименование", "Пояснения"):
++        if c in (group_label, "Полное наименование", "Пояснения",
++                 "Ревизия комплекта"):
+             continue
+         totals_row[c] = int(view[c].fillna(0).sum())
+ 

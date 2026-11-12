@@ -1,0 +1,420 @@
+diff --git a/vitro/ui/dynamics.py b/vitro/ui/dynamics.py
+index 1502799..eb69dca 100644
+--- a/vitro/ui/dynamics.py
++++ b/vitro/ui/dynamics.py
+@@ -13,7 +13,10 @@
+   2. «Общий объём за период» — замечания + выгруженные
+      комплекты/листы за выбранный период.
+   3. «Выполнение плана» — бублики «выполнено / осталось» против
+-     Ведомости комплектов (таблица plan_kits).
++     Ведомости комплектов (plan_drawings / plan_kits).
++     «Выполнено» — уникальные листы и комплекты в Витро (дедуп
++     ревизий через vitro.sheets.dedup_document_rows, как в
++     «Плане выдачи», поэтому цифры совпадают).
+ 
+ Все НОВЫЕ запросы к БД идут через @versioned_cache — кэш,
+ инвалидируемый по версии данных (последняя синхронизация),
+@@ -384,22 +387,23 @@ def _load_customer_closed_stats(disciplines: tuple, sections: tuple,
+ def _load_doc_volume(disciplines: tuple, sections: tuple,
+                      kits: tuple, block_codes: tuple,
+                      date_from: date, date_to: date) -> dict:
+-    """Выгружено комплектов и листов за период (documents.status_date).
++    """Выгружено комплектов и УНИКАЛЬНЫХ листов за период.
+ 
+-    Учитывает каскадные фильтры. Листы без даты статуса
+-    в период не попадают (их невозможно датировать).
++    Листы дедуплицируются как в «Плане выдачи» (последняя ревизия
++    на лист), датировка — status_date этой ревизии. Учитывает
++    каскадные фильтры. Листы без даты статуса в период не
++    попадают (их невозможно датировать).
+     """
+-    where, params = _build_filter_sql(
+-        disciplines, sections, kits, block_codes,
+-        date_from, date_to, "substr(d.status_date, 1, 10)")
+-    q = f"""
+-        SELECT COUNT(DISTINCT d.complex) AS kits, COUNT(*) AS sheets
+-        FROM documents d
+-        WHERE d.complex IS NOT NULL {where}
+-    """
+-    with get_conn() as conn:
+-        row = conn.execute(q, tuple(params)).fetchone()
+-    return {"kits": int(row["kits"] or 0), "sheets": int(row["sheets"] or 0)}
++    df = _load_unique_documents()
++    df = _filter_doc_frame(df, disciplines, sections, kits, block_codes)
++    if date_from:
++        df = df[df["status_day"] >= date_from.isoformat()]
++    if date_to:
++        df = df[df["status_day"] <= date_to.isoformat()]
++    if df.empty:
++        return {"kits": 0, "sheets": 0}
++    return {"kits": int(df["complex"].nunique()),
++            "sheets": int(len(df))}
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -502,99 +506,247 @@ def _render_kpi(issue: pd.DataFrame,
+     k1.metric(
+         "🏗 Выгружено комплектов", _fmt(doc_volume["kits"]),
+         help="Комплекты, у которых за выбранный период изменился статус "
+-             "в Витро (по дате статуса листа).",
++             "в Витро (по дате статуса листа последней ревизии).",
+     )
+     k2.metric(
+         "📄 Выгружено листов", _fmt(doc_volume["sheets"]),
+-        help="Листы РД, чей статус в Витро изменился за выбранный период "
+-             "(по дате статуса листа).",
++        help="Уникальные листы РД (последняя ревизия, дедуп как в "
++             "«Плане выдачи»), чей статус в Витро изменился "
++             "за выбранный период.",
+     )
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  План (Ведомость комплектов) и бублики выполнения
++#  Уникальные листы, план (Ведомость) и бублики выполнения
+ # ---------------------------------------------------------------------------
+-_PLAN_TABLE = "plan_kits"
++_PLAN_TABLE = "plan_kits"              # Ведомость комплектов (по комплектам)
++_PLAN_DRAWINGS_TABLE = "plan_drawings"  # Ведомость: чертежи по комплектам
+ 
+ 
+-@versioned_cache(ttl=600)
+-def _load_plan() -> dict:
+-    """План комплектов/листов из Ведомости комплектов (plan_kits).
++def _builtin_dedup(rows: list) -> list[dict]:
++    """Встроенный дедуп: последняя ревизия на (complex, leaf)."""
++    best: dict = {}
++    for r in rows:
++        d = dict(r) if not isinstance(r, dict) else r
++        key = (d.get("complex"), d.get("leaf"))
++        rank = (int(d.get("vitro_version") or 0), int(d.get("id") or 0))
++        if key not in best or rank > best[key][0]:
++            best[key] = (rank, d)
++    return [v[1] for v in best.values()]
+ 
+-    Ожидаемая структура таблицы:
+ 
+-        CREATE TABLE plan_kits (
+-            complex     TEXT PRIMARY KEY,  -- шифр комплекта (как documents.complex)
+-            plan_kits   INTEGER,           -- план, комплектов
+-            plan_sheets INTEGER            -- план, листов
+-        );
++def _dedup_document_rows(rows: list) -> list[dict]:
++    """Уникальные листы из строк documents — как в «Плане выдачи».
+ 
+-    Колонки распознаются автоматически по именам. Если таблицы нет
+-    или в ней нет колонки с шифром — возвращается пустой словарь
+-    (вкладка показывает подсказку вместо бубликов).
++    Основной путь — vitro.sheets.dedup_document_rows (единый
++    механизм дедупликации проекта). Если модуля нет или сигнатура
++    другая — встроенный дедуп по (complex, leaf): последняя ревизия
++    по max(vitro_version), затем max(id).
++    """
++    if not rows:
++        return []
++
++    try:
++        from vitro.sheets import dedup_document_rows as _dedup
++    except Exception:
++        _dedup = None
++
++    if _dedup is not None:
++        attempts = (
++            lambda: _dedup(rows),
++            lambda: _dedup(pd.DataFrame([dict(r) for r in rows])),
++        )
++        for call in attempts:
++            try:
++                out = call()
++            except Exception:
++                continue
++            if out is None:
++                continue
++            if isinstance(out, pd.DataFrame):
++                out = out.to_dict("records")
++            try:
++                out = [dict(r) if not isinstance(r, dict) else r
++                       for r in out]
++            except (TypeError, ValueError):
++                continue
++            if out:
++                return out
++        print("[dynamics] vitro.sheets.dedup_document_rows недоступен или "
++              "вернул пусто — встроенный дедуп по (complex, leaf)")
++
++    return _builtin_dedup(rows)
++
++
++@versioned_cache(ttl=3600)
++def _load_unique_documents() -> pd.DataFrame:
++    """Уникальные листы Витро (последняя ревизия) одним кадром.
++
++    Единый источник «факта» для бубликов и метрик «Выгружено …»:
++    дедуп убирает повторные ревизии, поэтому «Листов всего»
++    совпадает с «Планом выдачи».
+     """
+     with get_conn() as conn:
+-        exists = conn.execute(
+-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+-            (_PLAN_TABLE,),
+-        ).fetchone()
+-        if not exists:
+-            return {}
+-
+-        cols = [r[1] for r in conn.execute(
+-            f"PRAGMA table_info({_PLAN_TABLE})")]
+-        code_col = next(
+-            (c for c in ("complex", "code", "kit", "cipher", "kit_code")
+-             if c in cols), None)
+-        kits_col = next(
+-            (c for c in ("plan_kits", "kits", "kits_plan", "kit_plan")
+-             if c in cols), None)
+-        sheets_col = next(
+-            (c for c in ("plan_sheets", "sheets", "sheets_plan", "sheet_plan")
+-             if c in cols), None)
+-        if not code_col:
+-            return {}
+-
+-        parts = [f'"{code_col}" AS code']
+-        parts.append(f'COALESCE("{kits_col}", 0) AS kits' if kits_col
+-                     else "0 AS kits")
+-        parts.append(f'COALESCE("{sheets_col}", 0) AS sheets' if sheets_col
+-                     else "0 AS sheets")
+-        rows = conn.execute(
+-            f"SELECT {', '.join(parts)} FROM {_PLAN_TABLE}").fetchall()
++        rows = conn.execute("""
++            SELECT id, complex, discipline, section, status,
++                   revision, status_date, leaf, vitro_guid, vitro_version
++            FROM documents
++            WHERE complex IS NOT NULL
++        """).fetchall()
++
++    df = pd.DataFrame(_dedup_document_rows(rows))
++    if df.empty:
++        return pd.DataFrame(columns=["complex", "discipline",
++                                     "section", "status_day"])
++    df["status_day"] = df["status_date"].fillna("").astype(str).str[:10]
++    return df
++
++
++def _filter_doc_frame(df: pd.DataFrame,
++                      disciplines: tuple, sections: tuple,
++                      kits: tuple, block_codes: tuple) -> pd.DataFrame:
++    """Фильтры Дисциплина → Раздел → Комплект → Расположение (pandas).
++
++    Расположение — по 4-му блоку шифра (как в deadlines._apply_filters).
++    """
++    out = df
++    if out.empty:
++        return out
++    if disciplines:
++        out = out[out["discipline"].isin(disciplines)]
++    if sections:
++        out = out[out["section"].isin(sections)]
++    if kits:
++        out = out[out["complex"].isin(kits)]
++    if block_codes:
++        blocks = out["complex"].apply(_extract_4th_block)
++        out = out[blocks.isin(block_codes)]
++    return out
++
++
++@versioned_cache(ttl=600)
++def _load_plan(disciplines: tuple, sections: tuple,
++               kits: tuple, block_codes: tuple) -> dict:
++    """План комплектов/листов из Ведомости — с учётом фильтров.
++
++    Комплекты — ВСЕ шифры из plan_drawings, включая комплекты без
++    чертежей (как в «Плане выдачи»): общее число комплектов
++    совпадает с ним. План листов — число чертежей на комплект.
++    Комплекты из plan_kits, которых нет в plan_drawings,
++    добавляются с планом листов 0 (чтобы не задваивать план).
++    Если plan_drawings нет — fallback на plan_kits целиком
++    (complex / plan_kits / plan_sheets), как раньше.
++
++    Фильтры применяются внутри:
++      kits и block_codes — по шифру комплекта;
++      disciplines и sections — через пересечение с documents
++      (_load_scope_codes): в ведомости этих колонок нет.
++    """
++    scope = None
++    if disciplines or sections:
++        scope = _load_scope_codes(disciplines, sections)
+ 
+     plan: dict[str, dict] = {}
+-    for r in rows:
+-        code = str(r["code"] or "").strip()
+-        if not code:
++
++    with get_conn() as conn:
++        tables = {r[0] for r in conn.execute(
++            "SELECT name FROM sqlite_master WHERE type='table' "
++            "AND name IN (?, ?)",
++            (_PLAN_DRAWINGS_TABLE, _PLAN_TABLE),
++        ).fetchall()}
++
++        def _code_column(table: str):
++            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
++            return next(
++                (c for c in ("complex", "code", "kit", "cipher", "kit_code")
++                 if c in cols), None)
++
++        drawings_used = False
++        if _PLAN_DRAWINGS_TABLE in tables:
++            code_col = _code_column(_PLAN_DRAWINGS_TABLE)
++            if code_col:
++                drawings_used = True
++                for r in conn.execute(f"""
++                        SELECT "{code_col}" AS code, COUNT(*) AS sheets
++                        FROM {_PLAN_DRAWINGS_TABLE}
++                        GROUP BY 1
++                """):
++                    code = str(r["code"] or "").strip()
++                    if code:
++                        plan[code] = {"kits": 1,
++                                      "sheets": max(0, int(r["sheets"] or 0))}
++
++        if drawings_used:
++            # Комплекты ведомости без чертежей — из plan_kits,
++            # план листов для них 0 (план листов уже учтён строками
++            # plan_drawings, задваивать нельзя)
++            if _PLAN_TABLE in tables:
++                code_col = _code_column(_PLAN_TABLE)
++                if code_col:
++                    for r in conn.execute(
++                            f'SELECT "{code_col}" AS code FROM {_PLAN_TABLE}'):
++                        code = str(r["code"] or "").strip()
++                        if code and code not in plan:
++                            plan[code] = {"kits": 1, "sheets": 0}
++        elif _PLAN_TABLE in tables:
++            # plan_drawings нет/пуста — старый путь: план из plan_kits
++            cols = [r[1] for r in conn.execute(
++                f"PRAGMA table_info({_PLAN_TABLE})")]
++            code_col = next(
++                (c for c in ("complex", "code", "kit", "cipher", "kit_code")
++                 if c in cols), None)
++            kits_col = next(
++                (c for c in ("plan_kits", "kits", "kits_plan", "kit_plan")
++                 if c in cols), None)
++            sheets_col = next(
++                (c for c in ("plan_sheets", "sheets", "sheets_plan",
++                             "sheet_plan") if c in cols), None)
++            if code_col:
++                parts = [f'"{code_col}" AS code']
++                parts.append(f'COALESCE("{kits_col}", 0) AS kits' if kits_col
++                             else "0 AS kits")
++                parts.append(f'COALESCE("{sheets_col}", 0) AS sheets'
++                             if sheets_col else "0 AS sheets")
++                for r in conn.execute(
++                        f"SELECT {', '.join(parts)} FROM {_PLAN_TABLE}"):
++                    code = str(r["code"] or "").strip()
++                    if not code:
++                        continue
++                    try:
++                        k = int(float(r["kits"] or 0))
++                        s = int(float(r["sheets"] or 0))
++                    except (ValueError, TypeError):
++                        k, s = 0, 0
++                    plan[code] = {"kits": max(0, k), "sheets": max(0, s)}
++
++    # Фильтры — Дисциплина → Раздел → Комплект → Расположение
++    out: dict[str, dict] = {}
++    for code, vals in plan.items():
++        if kits and code not in kits:
+             continue
+-        try:
+-            k = int(float(r["kits"] or 0))
+-            s = int(float(r["sheets"] or 0))
+-        except (ValueError, TypeError):
+-            k, s = 0, 0
+-        plan[code] = {"kits": max(0, k), "sheets": max(0, s)}
+-    return plan
++        if block_codes and _extract_4th_block(code) not in block_codes:
++            continue
++        if scope is not None and code not in scope:
++            continue
++        out[code] = vals
++    return out
+ 
+ 
+ @versioned_cache(ttl=3600)
+ def _load_doc_totals(disciplines: tuple, sections: tuple,
+                      kits: tuple, block_codes: tuple) -> dict:
+-    """Сколько комплектов и листов УЖЕ есть в Витро (всего, без периода).
++    """Сколько комплектов и УНИКАЛЬНЫХ листов уже есть в Витро.
+ 
+-    «Выполнено» для бубликов сравнения с планом.
++    «Выполнено» для бубликов сравнения с планом. Дедуп ревизий —
++    vitro.sheets.dedup_document_rows (как в «Плане выдачи»),
++    поэтому цифры сходятся с ним.
+     """
+-    where, params = _build_filter_sql(
+-        disciplines, sections, kits, block_codes,
+-        None, None, "d.status_date")
+-    q = f"""
+-        SELECT COUNT(DISTINCT d.complex) AS kits, COUNT(*) AS sheets
+-        FROM documents d
+-        WHERE d.complex IS NOT NULL {where}
+-    """
+-    with get_conn() as conn:
+-        row = conn.execute(q, tuple(params)).fetchone()
+-    return {"kits": int(row["kits"] or 0), "sheets": int(row["sheets"] or 0)}
++    df = _load_unique_documents()
++    df = _filter_doc_frame(df, disciplines, sections, kits, block_codes)
++    if df.empty:
++        return {"kits": 0, "sheets": 0}
++    return {"kits": int(df["complex"].nunique()),
++            "sheets": int(len(df))}
+ 
+ 
+ @versioned_cache(ttl=600)
+@@ -665,36 +817,30 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
+                             kits: tuple, block_codes: tuple):
+     """Бублики сравнения с планом: комплекты и листы.
+ 
+-    «Выполнено» — сколько уже есть в Витро (_load_doc_totals),
+-    «Осталось» — план из Ведомости комплектов (plan_kits) минус
+-    выполненное. План фильтруется по комплекту, расположению
+-    (4-й блок шифра) и дисциплинам/разделам (через documents).
++    «Выполнено» — уникальные листы/комплекты в Витро
++    (_load_doc_totals: дедуп ревизий как в «Плане выдачи»),
++    «Осталось» — план из Ведомости минус выполненное.
++    Фильтры (Дисциплина, Раздел, Комплект, Расположение)
++    передаются и в план (_load_plan), и в факт (_load_doc_totals).
+     """
+     st.markdown("### 🎯 Выполнение плана (Ведомость комплектов)")
+ 
+-    plan = _load_plan()
++    plan = _load_plan(disciplines, sections, kits, block_codes)
+     if not plan:
+         st.info(
+-            "План не задан: таблица `plan_kits` не найдена или пуста. "
+-            "Загрузите Ведомость комплектов — и бублики появятся."
++            "План не задан: таблицы `plan_drawings` / `plan_kits` "
++            "не найдены или пусты. Загрузите Ведомость комплектов — "
++            "и бублики появятся."
+         )
+         return
+ 
+-    scope = _load_scope_codes(disciplines, sections)
+-    items = [
+-        (code, vals) for code, vals in plan.items()
+-        if (not kits or code in kits)
+-        and (not block_codes or _extract_4th_block(code) in block_codes)
+-        and ((not disciplines and not sections) or code in scope)
+-    ]
+-
+-    plan_kits_total = sum(v["kits"] for _, v in items)
+-    plan_sheets_total = sum(v["sheets"] for _, v in items)
++    plan_kits_total = sum(v["kits"] for v in plan.values())
++    plan_sheets_total = sum(v["sheets"] for v in plan.values())
+ 
+     if plan_kits_total == 0 and plan_sheets_total == 0:
+         st.info(
+-            "В таблице `plan_kits` нет плановых значений для "
+-            "выбранной комбинации фильтров."
++            "В Ведомости нет плановых значений для выбранной "
++            "комбинации фильтров."
+         )
+         return
+ 
