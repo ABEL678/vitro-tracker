@@ -32,6 +32,10 @@ LIST_DOC_STATUSES = "a00854d8-6130-4f26-89ea-6f4f940350e3"
 ATP_ROOT = "/okhta/DocProjectLib/01_РД/02_АТП"
 ATP_WORK = ATP_ROOT + "/01_В процессе"
 
+# Папка ГИС (патч 20)
+GIS_ROOT = "/okhta/DocProjectLib/01_РД/02_ГИС"
+GIS_WORK = GIS_ROOT + "/01_В процессе"
+
 # ---------------------------------------------------------------------------
 #  Исключения (TECT/, сервисные рендеры, аннулированные, архив)
 # ---------------------------------------------------------------------------
@@ -148,9 +152,16 @@ def parse_path(file_dir_ref: str) -> tuple[str, str, str]:
     ЛЮБОЙ организации (looks_like_rd_code: «АТ-РД-…», «ГИС-РД-…» и
     др.), а не только начинающаяся с «АТ-РД-».
     """
-    if not file_dir_ref or not file_dir_ref.startswith(ATP_WORK + "/"):
+    # Патч 20: поддержка путей АТП и ГИС
+    work_prefixes = (ATP_WORK + "/", GIS_WORK + "/")
+    if not file_dir_ref or not any(file_dir_ref.startswith(p) for p in work_prefixes):
         return ("", "", "")
-    rel = file_dir_ref[len(ATP_WORK) + 1:].strip("/")
+    # Определяем, какой префикс совпал, и обрезаем его
+    rel = file_dir_ref
+    for prefix in work_prefixes:
+        if file_dir_ref.startswith(prefix):
+            rel = file_dir_ref[len(prefix):].strip("/")
+            break
     parts = [p for p in rel.split("/") if p]
     if len(parts) < 2:
         return ("", "", "")
@@ -207,21 +218,32 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
     PDF-листы РД-комплектов из /01_В процессе/ — ЛЮБОЙ организации:
     «АТ-РД-*», «ГИС-РД-*» и др. (патч 19, looks_like_rd_code).
     Исключает TECT/ТЕСТ, служебные рендеры, файлы без папки комплекта.
+
+    Патч 20: запрашивает из двух папок — АТП и ГИС, объединяет с
+    дедупликацией по UniqueId (последняя ревизия побеждает).
     """
-    flt = (f"startswith(FileDirRef, '{ATP_WORK}/') "
-           f"and substringof('.pdf', FileLeafRef)")
-    raw = _fetch_all(
-        VITRO_OKHTA_URL, LIST_DOCS,
-        ["Id", "UniqueId", "OData__UIVersionString",
-         "FileLeafRef", "FileDirRef",
-         "VitroBaseStatus", "VitroBaseDocumentRevision",
-         "VitroBaseFullName", "VitroBaseStatusDate",
-         "VitroBaseDocSheetNumber"],
-        flt=flt, max_items=max_items,
-    )
+    work_paths = (ATP_WORK, GIS_WORK)  # патч 20
+
+    raw: list[dict] = []
+    for wp in work_paths:
+        flt = (f"startswith(FileDirRef, '{wp}/') "
+               f"and substringof('.pdf', FileLeafRef)")
+        raw.extend(
+            _fetch_all(
+                VITRO_OKHTA_URL, LIST_DOCS,
+                ["Id", "UniqueId", "OData__UIVersionString",
+                 "FileLeafRef", "FileDirRef",
+                 "VitroBaseStatus", "VitroBaseDocumentRevision",
+                 "VitroBaseFullName", "VitroBaseStatusDate",
+                 "VitroBaseDocSheetNumber"],
+                flt=flt, max_items=max_items,
+            )
+        )
 
     doc_statuses = fetch_doc_statuses()
     docs: list[dict] = []
+    # Дедупликация по UniqueId (патч 20): последняя ревизия побеждает
+    seen: dict[str, dict] = {}
     for it in raw:
         leaf = (it.get("FileLeafRef") or "").strip()
         dir_ref = it.get("FileDirRef") or ""
@@ -241,7 +263,7 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
         except (ValueError, TypeError):
             vitro_version = 1
 
-        docs.append({
+        record = {
             "id": it.get("Id"),
             "leaf": leaf,
             "discipline": disc,
@@ -255,7 +277,15 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             "sheet_number": it.get("VitroBaseDocSheetNumber"),
             "vitro_guid": it.get("UniqueId"),
             "vitro_version": vitro_version,
-        })
+        }
+        # Дедуп по UniqueId: оставляем последнюю ревизию
+        guid = record["vitro_guid"]
+        if guid:
+            existing = seen.get(guid)
+            if existing is None or vitro_version >= existing.get("vitro_version", 0):
+                seen[guid] = record
+
+    docs = list(seen.values())
     return docs
 
 
