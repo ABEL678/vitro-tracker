@@ -1,0 +1,4 @@
+fix: UnicodeEncodeError in sync.py - emoji output in Windows cp1251
+
+Function log now catches UnicodeEncodeError — emojis are replaced
+with '?' when printing to Windows cp1251 console. Sync logic unchanged.

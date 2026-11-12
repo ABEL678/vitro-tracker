@@ -44,7 +44,11 @@ def refresh_data(verbose: bool = True) -> dict:
 
     def log(msg):
         if verbose:
-            print(msg)
+            try:
+                print(msg)
+            except UnicodeEncodeError:
+                # Windows cp1251 не поддерживает эмодзи — выводим без них
+                print(msg.encode('ascii', 'replace').decode('ascii'))
 
     # 1. Документы
     log("📄 Загрузка документов из SharePoint...")
