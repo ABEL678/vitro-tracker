@@ -10,6 +10,7 @@ from vitro.config import (
     VITRO_USER, VITRO_PASSWORD, VITRO_BASE_URL, VITRO_OKHTA_URL,
     VITRO_VERIFY_SSL, HEADERS,
 )
+from vitro.sheets import looks_like_rd_code
 
 # Гасим предупреждение InsecureRequestWarning ТОЛЬКО когда проверка
 # сертификата осознанно отключена (.env: VITRO_VERIFY_SSL=false).
@@ -142,6 +143,10 @@ def parse_path(file_dir_ref: str) -> tuple[str, str, str]:
     """
     По пути родительской папки определяет (дисциплина, раздел, комплект).
     Ожидает путь внутри /01_В процессе/.
+
+    Патч 19: комплектом считается папка, чьё имя похоже на РД-код
+    ЛЮБОЙ организации (looks_like_rd_code: «АТ-РД-…», «ГИС-РД-…» и
+    др.), а не только начинающаяся с «АТ-РД-».
     """
     if not file_dir_ref or not file_dir_ref.startswith(ATP_WORK + "/"):
         return ("", "", "")
@@ -152,7 +157,7 @@ def parse_path(file_dir_ref: str) -> tuple[str, str, str]:
 
     discipline = parts[0]
     complex_idx = next(
-        (i for i in range(1, len(parts)) if parts[i].startswith("АТ-РД-")),
+        (i for i in range(1, len(parts)) if looks_like_rd_code(parts[i])),
         None,
     )
     if complex_idx is None:
@@ -199,7 +204,8 @@ def fetch_authors() -> dict[int, str]:
 # ---------------------------------------------------------------------------
 def fetch_atp_documents(max_items: int = 0) -> list[dict]:
     """
-    PDF-листы АТ-РД-* из /01_В процессе/.
+    PDF-листы РД-комплектов из /01_В процессе/ — ЛЮБОЙ организации:
+    «АТ-РД-*», «ГИС-РД-*» и др. (патч 19, looks_like_rd_code).
     Исключает TECT/ТЕСТ, служебные рендеры, файлы без папки комплекта.
     """
     flt = (f"startswith(FileDirRef, '{ATP_WORK}/') "
@@ -220,7 +226,7 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
         leaf = (it.get("FileLeafRef") or "").strip()
         dir_ref = it.get("FileDirRef") or ""
 
-        if not leaf.startswith("АТ-РД-"):
+        if not looks_like_rd_code(leaf):
             continue
         if _is_excluded(dir_ref, leaf):
             continue
@@ -432,7 +438,8 @@ def build_dashboard(docs: list[dict], comments: list[dict]) -> list[dict]:
 
 def fetch_complex_names() -> list[dict]:
     """
-    Возвращает список комплектов с названиями:
+    Возвращает список комплектов с названиями (патч 19: организации
+    любые — «АТ-РД-…», «ГИС-РД-…» и др., фильтр looks_like_rd_code):
       [{"code": "АТ-РД-КЖ0-С-П2.1", "name": "...", "discipline": "02_КР"}]
     Комплекты берутся из путей PDF-файлов; названия — из VitroBaseFullName папок.
     """
@@ -461,7 +468,7 @@ def fetch_complex_names() -> list[dict]:
     complex_codes: dict[str, str] = {}   # code → discipline
     for f in pdf_files:
         leaf = f.get("FileLeafRef") or ""
-        if not leaf.startswith("АТ-РД-"):
+        if not looks_like_rd_code(leaf):
             continue
         dir_ref = f.get("FileDirRef") or ""
         disc, sec, comp = parse_path(dir_ref)
@@ -474,7 +481,7 @@ def fetch_complex_names() -> list[dict]:
     folder_names: dict[str, str] = {}
     for fol in folders:
         leaf = (fol.get("FileLeafRef") or "").strip()
-        if not leaf.startswith("АТ-РД-"):
+        if not looks_like_rd_code(leaf):
             continue
         code = normalize_complex(leaf)
         # Если название ещё не задано и есть в VitroBaseFullName
