@@ -951,15 +951,19 @@ def _render_remark_donuts(remark_totals: dict | None,
 
     left, right = st.columns([2, 3])
 
+    our_total = int((remark_totals or {}).get("our_answers") or 0)
+    cust_total = int((remark_totals or {}).get("cust_closed") or 0)
+    remaining = max(0, issued_total - our_total - cust_total)
+
     with left:
         st.caption(
             f"Выдано за период: **{_fmt(issued_total)}** · "
-            f"Отработано всего: **{_fmt(worked)}**"
+            f"Выполнено за период: **{_fmt(our_total)}**"
         )
         if issued_total > 0:
             donut = pd.DataFrame([
-                {"Категория": "Выдано за период", "Значение": issued_total},
-                {"Категория": "Отработано",       "Значение": worked},
+                {"Категория": "Выполнено за период", "Значение": our_total},
+                {"Категория": "Осталось",            "Значение": remaining},
             ])
             donut = donut[donut["Значение"] > 0]
             fig = px.pie(
@@ -969,13 +973,13 @@ def _render_remark_donuts(remark_totals: dict | None,
                 hole=0.45,
                 color="Категория",
                 color_discrete_map={
-                    "Выдано за период": "#1f77b4",
-                    "Отработано":       "#9E9E9E",
+                    "Выполнено за период": "#2ca02c",
+                    "Осталось":            "#9E9E9E",
                 },
             )
             fig.update_traces(
                 textposition="inside",
-                textinfo="percent",
+                textinfo="value",
                 textfont_size=11,
             )
             fig.update_layout(
