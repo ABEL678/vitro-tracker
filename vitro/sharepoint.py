@@ -163,16 +163,25 @@ def parse_path(file_dir_ref: str) -> tuple[str, str, str]:
             rel = file_dir_ref[len(prefix):].strip("/")
             break
     parts = [p for p in rel.split("/") if p]
-    if len(parts) < 2:
+    # Патч 20: комплект может идти сразу после папки «В процессе»
+    # (без дисциплины): «01_В процессе/ГИС-РД-СБ-АСЗП-0-00»
+    if not parts:
         return ("", "", "")
 
-    discipline = parts[0]
+    # Ищем индекс комплекта
     complex_idx = next(
-        (i for i in range(1, len(parts)) if looks_like_rd_code(parts[i])),
+        (i for i in range(len(parts)) if looks_like_rd_code(parts[i])),
         None,
     )
     if complex_idx is None:
-        return (discipline, "/".join(parts[1:]), "")
+        # Нет комплекта — возвращаем дисциплину (если есть)
+        return (parts[0], "/".join(parts[1:]), "")
+
+    # Всё, что до complex_idx — это дисциплина/раздел
+    discipline = parts[0] if complex_idx == 0 else parts[0]
+    section = "/".join(parts[1:complex_idx]) if complex_idx > 1 else ""
+    comp = parts[complex_idx]
+    return (discipline, section, comp)
 
     comp = parts[complex_idx]
     section = "/".join(parts[1:complex_idx]) if complex_idx > 1 else ""
