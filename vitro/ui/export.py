@@ -12,6 +12,7 @@
 Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
 """
 
+import copy
 import io
 from datetime import datetime
 
@@ -1184,34 +1185,34 @@ def _xlsx_add_kit_status(
                                 keep_vba=False)
     ws = wb[sheet_name]
 
-    # Находим номер колонки шифров по заголовку
-    kit_col_letter = None
+    # --- 1. Находим строку заголовка и колонку шифров ---
     header_row_idx = None
+    kit_col_num = None
     for cell_row in ws.iter_rows(min_row=1, max_row=50, max_col=ws.max_column):
         for cell in cell_row:
             if cell.value is not None and str(cell.value).replace("\xa0", " ").strip():
                 norm = _norm_header(str(cell.value))
                 for want in _KIT_CODE_HEADERS:
                     if norm == want:
-                        kit_col_letter = cell.column_letter
                         header_row_idx = cell.row
+                        kit_col_num = cell.column
                         break
-                if kit_col_letter:
+                if header_row_idx:
                     break
-            if kit_col_letter:
+            if header_row_idx:
                 break
-        if kit_col_letter:
+        if header_row_idx:
             break
 
-    if kit_col_letter is None:
+    if header_row_idx is None:
         # Fallback: используем имя колонки из pandas
-        for cell in ws[1]:
+        for col_num, cell in enumerate(ws[header_row_idx or 1], start=1):
             if cell.value and str(cell.value) == kit_col:
-                kit_col_letter = cell.column_letter
                 header_row_idx = cell.row
+                kit_col_num = col_num
                 break
 
-    if kit_col_letter is None:
+    if header_row_idx is None:
         # Не нашли — fallback к pandas
         return _df_to_xlsx(
             _apply_kit_statuses(
@@ -1221,62 +1222,49 @@ def _xlsx_add_kit_status(
             sheet_name[:31],
         )
 
-    # Определяем последнюю заполненную строку на колонке шифров
-    kit_col_num = ws[col_letter_to_int(kit_col_letter)]
+    # --- 2. Определяем последнюю колонку и последнюю строку данных ---
+    max_col = ws.max_column
     last_row = 0
-    for cell in kit_col_num:
-        if cell.value is not None and not pd.isna(cell.value):
-            last_row = cell.row
+    for r in range(header_row_idx + 1, ws.max_row + 1):
+        val = ws.cell(row=r, column=kit_col_num).value
+        if val is not None and not pd.isna(val):
+            last_row = r
 
-    # Определяем последнюю заполненную колонку на header-строке
-    header_row = ws[header_row_idx]
-    last_col = 0
-    for cell in header_row:
-        if cell.value is not None:
-            last_col = cell.column
+    # --- 3. Новая колонка для статуса ---
+    new_col = max_col + 1
 
-    # Новая колонка для статуса
-    new_col = last_col + 1
-    new_col_letter = _int_to_column_letter(new_col)
-
-    # --- Копируем стиль заголовка с соседней ячейки ---
-    ref_cell = ws.cell(row=header_row_idx, column=last_col)
-    style = None
-    if ref_cell.fill or ref_cell.font or ref_cell.border:
-        style = openpyxl.styles.Style(
-            fill=ref_cell.fill,
-            font=ref_cell.font,
-            border=ref_cell.border,
-            alignment=ref_cell.alignment,
-        )
-
-    # Пишем заголовок
+    # --- 4. Копируем стиль заголовка с соседней ячейки ---
+    ref_cell = ws.cell(row=header_row_idx, column=max_col)
     header_cell = ws.cell(row=header_row_idx, column=new_col,
                           value=status_col_name)
-    if style:
-        header_cell.fill = style.fill
-        header_cell.font = style.font
-        header_cell.border = style.border
-        header_cell.alignment = style.alignment
+    if ref_cell.fill:
+        header_cell.fill = copy.copy(ref_cell.fill)
+    if ref_cell.font:
+        header_cell.font = copy.copy(ref_cell.font)
+    if ref_cell.border:
+        header_cell.border = copy.copy(ref_cell.border)
+    if ref_cell.alignment:
+        header_cell.alignment = copy.copy(ref_cell.alignment)
+    if ref_cell.number_format:
+        header_cell.number_format = ref_cell.number_format
 
-    # Батч-вычисление статусов для всех шифров в таблице
+    # --- 5. Батч-вычисление статусов для всех шифров в таблице ---
     codes = []
     for r in range(header_row_idx + 1, last_row + 1):
-        code_cell = ws.cell(row=r, column=kit_col_num)
-        val = code_cell.value
+        val = ws.cell(row=r, column=kit_col_num).value
         if val is not None and not pd.isna(val):
             codes.append(val)
 
     kit_statuses = get_kit_statuses(codes)
 
-    # Пишем статусы
+    # --- 6. Пишем статусы ---
     for idx, code in enumerate(codes):
         r = header_row_idx + 1 + idx
         ws.cell(row=r, column=new_col,
                 value=kit_statuses.get(normalize_kit_code(code),
                                        KIT_STATUS_NOT_LOADED))
 
-    # Сохраняем в буфер
+    # --- 7. Сохраняем в буфер ---
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
