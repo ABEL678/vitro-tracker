@@ -5,6 +5,10 @@
 Вся аналитика синхронизирована с дашбордом через `_load_all_categorized`.
 Колонки по ответственным: 🔴 АТП ТЛП / 🔵 Ждут заказчика / 🔴 Хроника / 🟢 Учтено A/B.
 
+Подвкладка «🔄 Обновить статусы» (патч 21): во внешний перечень
+комплектов (Excel) добавляется колонка «Статус комплекта» —
+логика в vitro/sheets.py (get_kit_status / get_kit_statuses).
+
 Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
 """
 
@@ -16,7 +20,12 @@ import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
-from vitro.sheets import unique_vitro_sheets
+from vitro.sheets import (
+    KIT_STATUS_NOT_LOADED,
+    get_kit_statuses,
+    normalize_kit_code,
+    unique_vitro_sheets,
+)
 from vitro.pdf_builder import build_pdf
 from vitro.ui._filters import render_standard_filters
 
@@ -906,18 +915,164 @@ def _render_analytics():
 
 
 # ---------------------------------------------------------------------------
+#  Секция 4: Обновить статусы комплектов (патч 21)
+# ---------------------------------------------------------------------------
+KIT_STATUS_COL = "Статус комплекта"
+
+# Заголовки колонки шифров в порядке приоритета (ТЗ патча 21);
+# сравнение — по канонической форме _norm_header
+_KIT_CODE_HEADERS = ("ШИФР РД", "ШИФР КОМПЛЕКТА", "КОМПЛЕКТ")
+
+
+def _norm_header(h) -> str:
+    """Заголовок колонки Excel → каноническая форма для сравнения:
+    неразрывный пробел → пробел, сжатие повторов, trim, верхний
+    регистр, латинские двойники → кириллица (normalize_kit_code)."""
+    s = " ".join(str(h).replace("\xa0", " ").split())
+    return normalize_kit_code(s)
+
+
+def _find_kit_code_column(df: pd.DataFrame):
+    """Колонка с шифрами комплектов во внешнем перечне (патч 21).
+
+    Ищет заголовок «Шифр РД» / «Шифр комплекта» / «Комплект» (в
+    порядке приоритета), фолбэк — первый заголовок, содержащий
+    «ШИФР». Возвращает имя колонки или None (UI покажет ошибку со
+    списком найденных заголовков).
+    """
+    norm = {_norm_header(h): h for h in df.columns}
+    for want in _KIT_CODE_HEADERS:
+        if want in norm:
+            return norm[want]
+    for h_norm, h in norm.items():
+        if "ШИФР" in h_norm:
+            return h
+    return None
+
+
+@versioned_cache(600)
+def _load_all_kit_statuses() -> dict:
+    """{шифр комплекта: статус} — один срез БД (патч 21).
+
+    sheets.get_kit_statuses(None): unique_vitro_sheets (последние
+    ревизии, «липкое» аннулирование, нормализация шифров) + правила
+    статусов патча 21. versioned_cache — сброс при синке, как у
+    остальных загрузчиков вкладки.
+    """
+    return get_kit_statuses()
+
+
+def _apply_kit_statuses(df: pd.DataFrame, col: str,
+                        statuses: dict) -> pd.DataFrame:
+    """Добавляет колонку «Статус комплекта» В КОНЕЦ таблицы (патч 21).
+
+    col — колонка шифров (результат _find_kit_code_column); шифры
+    нормализуются перед сопоставлением со словарём статусов
+    (латинские двойники, регистр, пробелы). Комплекта нет в Витро /
+    пустой шифр → «План (не загружен)» (правило 2, согласовано).
+    Исходный DataFrame не мутируется.
+    """
+    out = df.copy()
+    out[KIT_STATUS_COL] = [
+        statuses.get(normalize_kit_code(code), KIT_STATUS_NOT_LOADED)
+        for code in out[col].tolist()
+    ]
+    return out
+
+
+def _render_kit_status_update():
+    """Подвкладка «🔄 Обновить статусы» (патч 21).
+
+    Пользователь загружает Excel с перечнем комплектов — для каждого
+    шифра подставляется статус комплекта по актуальным листам Витро;
+    предпросмотр — первые 10 строк, выгрузка — обновлённый Excel.
+    """
+    st.markdown("### 🔄 Обновить статусы комплектов")
+    st.caption(
+        "Загрузите перечень комплектов (Excel) — для каждого шифра "
+        "подставится статус комплекта по листам Витро: «A» / «B» / "
+        "«C» / «План (не загружен)»."
+    )
+
+    uploaded = st.file_uploader(
+        "Загрузите Excel с перечнем комплектов",
+        type=["xlsx"],
+        key="kit_status_upload",
+    )
+    if uploaded is None:
+        st.info(
+            "Файл не загружен. Формат: .xlsx; шифры — в колонке "
+            "«Шифр РД» (или «Шифр комплекта», «Комплект»)."
+        )
+        return
+
+    try:
+        df = pd.read_excel(uploaded)
+    except Exception:
+        st.error(
+            "Не удалось прочитать файл. Нужен Excel в формате .xlsx."
+        )
+        return
+
+    if df.empty:
+        st.warning("Файл прочитан, но таблица пуста.")
+        return
+
+    col = _find_kit_code_column(df)
+    if col is None:
+        st.error(
+            "Не найдена колонка с шифрами. Ожидался заголовок "
+            "«Шифр РД» (или «Шифр комплекта», «Комплект»). "
+            "Заголовки в файле: "
+            + ", ".join(f"«{h}»" for h in df.columns)
+        )
+        return
+
+    statuses = _load_all_kit_statuses()
+    result = _apply_kit_statuses(df, col, statuses)
+
+    n_found = int((result[KIT_STATUS_COL] != KIT_STATUS_NOT_LOADED).sum())
+    st.success(
+        f"Колонка «{KIT_STATUS_COL}» добавлена (шифры — «{col}»). "
+        f"Строк: {len(result)}, из них в Витро: {n_found}."
+    )
+
+    st.dataframe(
+        result.head(10),
+        use_container_width=True,
+        hide_index=True,
+        height=300,
+    )
+    if len(result) > 10:
+        st.caption("Показаны первые 10 строк. В выгрузку попадут все.")
+
+    st.divider()
+    st.download_button(
+        "📥 Скачать обновлённый Excel",
+        data=_df_to_xlsx(result, "Комплекты"),
+        file_name=f"Комплекты_со_статусами_{datetime.now():%Y%m%d}.xlsx",
+        mime=("application/vnd.openxmlformats-officedocument"
+              ".spreadsheetml.sheet"),
+        use_container_width=True,
+        key="dl_kit_status_xlsx",
+    )
+
+
+# ---------------------------------------------------------------------------
 #  Точка входа
 # ---------------------------------------------------------------------------
 def render():
     st.header("📄 Экспорт")
     st.caption(
-        "Выгрузка данных в Excel и PDF: сводки, замечания, аналитика."
+        "Выгрузка данных в Excel и PDF: сводки, замечания, "
+        "аналитика, статусы комплектов."
     )
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Сводные отчёты",
         "📋 Замечания",
         "📈 Аналитика",
+        "🔄 Обновить статусы",
     ])
 
     with tab1:
@@ -926,3 +1081,5 @@ def render():
         _render_comments_export()
     with tab3:
         _render_analytics()
+    with tab4:
+        _render_kit_status_update()
