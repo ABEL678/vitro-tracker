@@ -1010,25 +1010,63 @@ def _find_kit_code_sheet(uploaded_file) -> tuple:
     """Найти лист и колонку с шифрами комплектов (патч 21.2).
 
     Файлы могут содержать несколько листов (например «Легенда от
-    Заказчика» без таблицы и «График РД» с данными). Функция читает
-    все листы и ищет тот, где есть колонка «Шифр РД» / «Шифр комплекта» /
-    «Комплект».
+    Заказчика» без таблицы и «График РД» с данными). Для каждого листа:
+    1) читает без header и ищет строку с «шифр»/«комплект»;
+    2) если строка найдена — перечитывает с правильным header;
+    3) проверяет наличие колонки шифров.
 
     Возвращает (имя_листа, DataFrame, имя_колонки) или (None, None, None).
     """
     try:
-        sheets = pd.read_excel(uploaded_file, sheet_name=None)
+        # Получаем список всех листов
+        xl = pd.ExcelFile(uploaded_file)
+        sheet_names = xl.sheet_names
     except Exception:
         return None, None, None
 
-    for sheet_name, df in sheets.items():
+    for sheet_name in sheet_names:
+        # Шаг 1: ищем строку заголовка БЕЗ header
+        header_row = _find_header_row_in_excel_for_sheet(
+            uploaded_file, sheet_name
+        )
+
+        # Шаг 2: перечитываем с правильным header
+        try:
+            df = pd.read_excel(uploaded_file, sheet_name=sheet_name,
+                               header=header_row)
+        except Exception:
+            continue
+
         if df.empty:
             continue
+
+        # Шаг 3: проверяем наличие колонки шифров
         col = _find_kit_code_column(df)
         if col is not None:
             return sheet_name, df, col
 
     return None, None, None
+
+
+def _find_header_row_in_excel_for_sheet(uploaded_file, sheet_name: str) -> int:
+    """Найти строку заголовков на конкретном листе Excel.
+
+    Аналог _find_header_row_in_excel, но для конкретного листа.
+    """
+    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name,
+                        header=None, nrows=50)
+    target_patterns = ("шифр", "комплект")
+
+    for row_idx in range(len(raw)):
+        for val in raw.iloc[row_idx].tolist():
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            s = str(val).replace("\xa0", " ").lower()
+            for pat in target_patterns:
+                if pat in s:
+                    return row_idx
+
+    return 0  # fallback: первая строка
 
 
 def _render_kit_status_update():
