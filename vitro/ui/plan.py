@@ -633,7 +633,7 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
 
     edited = st.data_editor(
         display_before,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         num_rows="fixed",
         height=min(max(len(display_before) * 42 + 40, 300), 700),
@@ -704,7 +704,7 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
         data=excel_bytes,
         file_name=f"Сводный_план_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=False,
+        width='content',
         key="plan_overview_export",
         help="Выгрузка сводного плана готовности в Excel с форматированием.",
     )
@@ -939,7 +939,7 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
             x=0.5, y=0.5,
         )],
     )
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    st.plotly_chart(fig, width='stretch', key=key)
 
 
 def _fmt_num(n) -> str:
@@ -1327,7 +1327,7 @@ def _render_export_button(sheets_table: pd.DataFrame,
         data=export_bytes,
         file_name=f"План_выдачи_листы_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime=MIME_XLSX,
-        use_container_width=False,
+        width='content',
         key="plan_export_excel",
         help="Файл повторяет таблицу «Детальный план по листам "
              "комплекта» с учётом фильтров и периода; второй лист — "
@@ -1360,7 +1360,7 @@ def _render_sheet_plan_table(sheets_table: pd.DataFrame,
     shown = sheets_table.head(MAX_DETAIL_ROWS)
     st.dataframe(
         shown,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=min(max(len(shown) * 36 + 40, 300), 700),
         column_config={
@@ -1513,7 +1513,7 @@ def _render_import_block() -> None:
                         "updated_at": "Обновлён",
                         "updated_by": "Кем",
                     }),
-                    use_container_width=True, hide_index=True, height=200)
+                    width='stretch', hide_index=True, height=200)
                 replace_plan = st.checkbox(
                     "🔄 Заменить план: удалить комплекты, которых "
                     "нет в загружаемой ведомости",
@@ -1608,7 +1608,7 @@ def _render_import_block() -> None:
                         "section": "Раздел",
                         "source_file": "Файл",
                     }),
-                    use_container_width=True, hide_index=True, height=200)
+                    width='stretch', hide_index=True, height=200)
                 if st.button("💾 Сохранить чертежи в план",
                              type="primary", key="plan_save_drawings"):
                     user = ensure_user()
@@ -1746,7 +1746,7 @@ def _render_import_log() -> None:
             return
         st.dataframe(
             pd.DataFrame(data),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
             height=min(max(len(data) * 36 + 40, 200), 420),
             column_config={
                 "Дата (МСК)": st.column_config.TextColumn(width="medium"),

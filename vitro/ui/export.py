@@ -727,7 +727,7 @@ def _make_download(df: pd.DataFrame, filename_base: str, key_suffix: str,
                 data=data,
                 file_name=f"{filename_base}_{datetime.now():%Y%m%d}.{ext}",
                 mime=mime,
-                use_container_width=True,
+                width='stretch',
                 key=f"dl_{key_suffix}_{fmt}",
             )
 
@@ -751,7 +751,7 @@ def _render_summaries():
     with tab1:
         df = _load_discipline_summary()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Сводка_по_дисциплинам", "sum_disc",
                         subtitle="Сводка замечаний по дисциплинам проекта")
@@ -759,7 +759,7 @@ def _render_summaries():
     with tab2:
         df = _load_complex_summary()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Сводка_по_комплектам", "sum_kit",
                         subtitle="Сводка замечаний по комплектам проекта")
@@ -767,7 +767,7 @@ def _render_summaries():
     with tab3:
         df = _load_section_summary()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Сводка_по_разделам", "sum_sect",
                         subtitle="Сводка замечаний по разделам проекта")
@@ -860,7 +860,7 @@ def _render_comments_export():
         if sel_cols:
             df = df[sel_cols]
 
-    st.dataframe(df.head(200), use_container_width=True,
+    st.dataframe(df.head(200), width='stretch',
                   hide_index=True, height=400)
     if len(df) > 200:
         st.caption("Показаны первые 200 строк. В выгрузку попадут все.")
@@ -892,7 +892,7 @@ def _render_analytics():
     with tab1:
         df = _load_authors_analytics()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Аналитика_авторов", "authors",
                         subtitle="Аналитика по авторам (активные замечания)")
@@ -900,7 +900,7 @@ def _render_analytics():
     with tab2:
         df = _load_monthly_dynamics()
         st.caption(f"Месяцев: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
         _make_download(df, "Динамика_по_месяцам", "monthly",
                         subtitle="Динамика: выдача, выполнено АТП ТЛП, "
                                   "закрытие заказчиком")
@@ -908,7 +908,7 @@ def _render_analytics():
     with tab3:
         df = _load_lagging_complexes(limit=50)
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Топ_просрочек_АТП_ТЛП", "lagging",
                         subtitle="Комплекты с наибольшим числом "
@@ -1135,8 +1135,8 @@ def _render_kit_status_update():
     )
 
     st.dataframe(
-        result.head(10),
-        use_container_width=True,
+        result.head(10).astype(str),
+        width='stretch',
         hide_index=True,
         height=300,
     )
@@ -1153,7 +1153,7 @@ def _render_kit_status_update():
         file_name=f"{_extract_filename(uploaded)}_статусы_{datetime.now():%Y%m%d}.xlsx",
         mime=("application/vnd.openxmlformats-officedocument"
               ".spreadsheetml.sheet"),
-        use_container_width=True,
+        width='stretch',
         key="dl_kit_status_xlsx",
     )
 

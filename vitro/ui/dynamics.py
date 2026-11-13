@@ -993,7 +993,7 @@ def _render_remark_donuts(remark_totals: dict | None,
                 margin=dict(l=5, r=5, t=5, b=5),
                 height=200,
             )
-            st.plotly_chart(fig, use_container_width=True,
+            st.plotly_chart(fig, width='stretch',
                             key="dyn_donut_remarks")
         else:
             st.caption("За выбранный период замечания не выдавались.")
@@ -1082,7 +1082,7 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
     with col1:
         fig, pct, status_text, is_over = _build_donut_figure(
             totals["kits"], plan_kits_total)
-        st.plotly_chart(fig, use_container_width=True, key="dyn_donut_kits")
+        st.plotly_chart(fig, width='stretch', key="dyn_donut_kits")
         if is_over:
             st.markdown(
                 f"<div style='text-align:center'>Выполнено "
@@ -1104,7 +1104,7 @@ def _render_progress_donuts(disciplines: tuple, sections: tuple,
     with col2:
         fig, pct, status_text, is_over = _build_donut_figure(
             totals["sheets"], plan_sheets_total)
-        st.plotly_chart(fig, use_container_width=True, key="dyn_donut_sheets")
+        st.plotly_chart(fig, width='stretch', key="dyn_donut_sheets")
         if is_over:
             st.markdown(
                 f"<div style='text-align:center'>Выполнено "
@@ -1189,7 +1189,7 @@ def _render_cumulative(issue: pd.DataFrame,
             xanchor="right", x=1,
         ),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 # ---------------------------------------------------------------------------

@@ -301,7 +301,7 @@ def _render_authors_table(df: pd.DataFrame):
 
     st.dataframe(
         table,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=600,
         column_config={
@@ -547,7 +547,7 @@ def _render_drilldown(df: pd.DataFrame, df_ours: pd.DataFrame):
                 margin=dict(l=10, r=10, t=40, b=10),
                 height=320,
             )
-            st.plotly_chart(fig, use_container_width=True,
+            st.plotly_chart(fig, width='stretch',
                             key="authors_drill_cat_pie")
 
     with col2:
@@ -568,7 +568,7 @@ def _render_drilldown(df: pd.DataFrame, df_ours: pd.DataFrame):
             )
             fig.update_traces(textposition="outside")
             fig.update_layout(height=max(300, 25 * len(by_disc)))
-            st.plotly_chart(fig, use_container_width=True,
+            st.plotly_chart(fig, width='stretch',
                             key="authors_drill_disc_bar")
 
     st.divider()
@@ -597,7 +597,7 @@ def _render_drilldown(df: pd.DataFrame, df_ours: pd.DataFrame):
         st.info("У автора нет замечаний.")
         return
     st.dataframe(
-        details, use_container_width=True, hide_index=True,
+        details, width='stretch', hide_index=True,
         height=500,
         column_config={
             "Замечание": st.column_config.TextColumn(width="large"),
@@ -798,7 +798,7 @@ def _render_waiting_review():
                   "comment", "author", "fix_date", "days_waiting",
                   "category_user", "category_date"],
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         height=600,
         key="waiting_review_editor",
     )
@@ -807,7 +807,7 @@ def _render_waiting_review():
 
     with col_save:
         if st.button("💾 Сохранить изменения", type="primary",
-                      use_container_width=True, key="wait_save"):
+                      width='stretch', key="wait_save"):
             user = ensure_user()
             if user is None:
                 st.warning("⚠️ Введите имя в диалоге, чтобы сохранить изменения.")
@@ -1120,13 +1120,13 @@ def _render_customer_a_annulled():
         ),
         mime="application/vnd.openxmlformats-officedocument."
              "spreadsheetml.sheet",
-        use_container_width=True,
+        width='stretch',
         key="ca_export",
     )
 
     st.dataframe(
         table,
-        use_container_width=True, hide_index=True, height=600,
+        width='stretch', hide_index=True, height=600,
         column_config={
             "Группа": st.column_config.TextColumn(width="medium"),
             "ID": st.column_config.NumberColumn(width="small"),
