@@ -319,7 +319,7 @@ def _pie(fig_data: pd.DataFrame,
         margin=dict(l=5, r=5, t=5, b=5),
         height=180,
     )
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    st.plotly_chart(fig, width='stretch', key=key)
 
 
 # ===========================================================================
@@ -1320,14 +1320,14 @@ def _render_summary_table(df: pd.DataFrame,
         data=_export_summary_to_excel(view_with_total, group_label, level),
         file_name=f"Разрез_{group_label}_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width='stretch',
         key=f"export_{level}",
     )
 
     # --- Таблица с пагинацией ---
     st.dataframe(
         display_df,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=max(500, min(display_count * 45 + 100, 1200)),
     )

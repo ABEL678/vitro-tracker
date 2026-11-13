@@ -354,7 +354,7 @@ def _render_analysis():
     if not cross.empty:
         st.dataframe(
             cross,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Категория": st.column_config.TextColumn(
@@ -382,7 +382,7 @@ def _render_analysis():
                 color_discrete_map=CAT_COLORS,
                 title="По категориям",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with col2:
         by_disc = _load_by_discipline()
@@ -398,7 +398,7 @@ def _render_analysis():
                 xaxis_tickangle=-45,
                 height=400,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     st.divider()
 
@@ -409,7 +409,7 @@ def _render_analysis():
     st.markdown("### 🎯 Активность специалистов по категоризации")
     activity = _load_user_activity()
     if not activity.empty:
-        st.dataframe(activity, use_container_width=True, hide_index=True)
+        st.dataframe(activity, width='stretch', hide_index=True)
 
         fig = px.bar(
             activity.sort_values("Изменений", ascending=True),
@@ -419,7 +419,7 @@ def _render_analysis():
         )
         fig.update_traces(textposition="outside")
         fig.update_layout(height=max(300, 30 * len(activity)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.info("Пока никто не назначал категории.")
 
@@ -599,14 +599,14 @@ def _render_editor():
                   "sheet_name", "comment", "api_status", "author",
                   "created", "category_user", "category_date"],
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         key="categorization_editor",
     )
 
     col_save, _ = st.columns([1, 3])
     with col_save:
         save_clicked = st.button("💾 Сохранить изменения", type="primary",
-                                 use_container_width=True)
+                                 width='stretch')
 
     if save_clicked:
         user = ensure_user()
@@ -857,7 +857,7 @@ def _render_import():
         if file_stats:
             st.markdown("**Диагностика файлов:**")
             st.dataframe(pd.DataFrame(file_stats),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
         if not all_rows:
             st.warning("Ни в одном файле не найдено колонок «ИД» и «Категория».")
@@ -879,14 +879,14 @@ def _render_import():
 
         dist = combined_unique["category"].value_counts(dropna=False).reset_index()
         dist.columns = ["Категория", "Количество"]
-        st.dataframe(dist, use_container_width=True, hide_index=True)
+        st.dataframe(dist, width='stretch', hide_index=True)
 
         if unknown_cat > 0:
             st.warning("Значения, которые не удалось распознать:")
             unknown_df = combined_unique[combined_unique["category"].isna()][
                 ["id", "category_raw", "source_file", "source_sheet"]
             ].head(20)
-            st.dataframe(unknown_df, use_container_width=True, hide_index=True)
+            st.dataframe(unknown_df, width='stretch', hide_index=True)
 
     st.divider()
     st.markdown("#### 👤 Автор импорта")
@@ -908,7 +908,7 @@ def _render_import():
     apply = st.button(
         "✅ Применить категории к базе",
         type="primary",
-        use_container_width=True,
+        width='stretch',
         disabled=not import_user.strip(),
     )
 

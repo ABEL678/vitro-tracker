@@ -5,18 +5,30 @@
 Вся аналитика синхронизирована с дашбордом через `_load_all_categorized`.
 Колонки по ответственным: 🔴 АТП ТЛП / 🔵 Ждут заказчика / 🔴 Хроника / 🟢 Учтено A/B.
 
+Подвкладка «🔄 Обновить статусы» (патч 21): во внешний перечень
+комплектов (Excel) добавляется колонка «Статус комплекта» —
+логика в vitro/sheets.py (get_kit_status / get_kit_statuses).
+
 Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
 """
 
+import copy
 import io
 from datetime import datetime
 
+import openpyxl
+from openpyxl.styles import Border, Font, PatternFill, Side
 import pandas as pd
 import streamlit as st
 
 from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
-from vitro.sheets import unique_vitro_sheets
+from vitro.sheets import (
+    KIT_STATUS_NOT_LOADED,
+    get_kit_statuses,
+    normalize_kit_code,
+    unique_vitro_sheets,
+)
 from vitro.pdf_builder import build_pdf
 from vitro.ui._filters import render_standard_filters
 
@@ -717,7 +729,7 @@ def _make_download(df: pd.DataFrame, filename_base: str, key_suffix: str,
                 data=data,
                 file_name=f"{filename_base}_{datetime.now():%Y%m%d}.{ext}",
                 mime=mime,
-                use_container_width=True,
+                width='stretch',
                 key=f"dl_{key_suffix}_{fmt}",
             )
 
@@ -741,7 +753,7 @@ def _render_summaries():
     with tab1:
         df = _load_discipline_summary()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Сводка_по_дисциплинам", "sum_disc",
                         subtitle="Сводка замечаний по дисциплинам проекта")
@@ -749,7 +761,7 @@ def _render_summaries():
     with tab2:
         df = _load_complex_summary()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Сводка_по_комплектам", "sum_kit",
                         subtitle="Сводка замечаний по комплектам проекта")
@@ -757,7 +769,7 @@ def _render_summaries():
     with tab3:
         df = _load_section_summary()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Сводка_по_разделам", "sum_sect",
                         subtitle="Сводка замечаний по разделам проекта")
@@ -850,7 +862,7 @@ def _render_comments_export():
         if sel_cols:
             df = df[sel_cols]
 
-    st.dataframe(df.head(200), use_container_width=True,
+    st.dataframe(df.head(200), width='stretch',
                   hide_index=True, height=400)
     if len(df) > 200:
         st.caption("Показаны первые 200 строк. В выгрузку попадут все.")
@@ -882,7 +894,7 @@ def _render_analytics():
     with tab1:
         df = _load_authors_analytics()
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Аналитика_авторов", "authors",
                         subtitle="Аналитика по авторам (активные замечания)")
@@ -890,7 +902,7 @@ def _render_analytics():
     with tab2:
         df = _load_monthly_dynamics()
         st.caption(f"Месяцев: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
         _make_download(df, "Динамика_по_месяцам", "monthly",
                         subtitle="Динамика: выдача, выполнено АТП ТЛП, "
                                   "закрытие заказчиком")
@@ -898,11 +910,382 @@ def _render_analytics():
     with tab3:
         df = _load_lagging_complexes(limit=50)
         st.caption(f"Строк: **{len(df)}**")
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       height=400)
         _make_download(df, "Топ_просрочек_АТП_ТЛП", "lagging",
                         subtitle="Комплекты с наибольшим числом "
                                   "просрочек АТП ТЛП")
+
+
+# ---------------------------------------------------------------------------
+#  Секция 4: Обновить статусы комплектов (патч 21)
+# ---------------------------------------------------------------------------
+KIT_STATUS_COL = "Статус комплекта"
+
+# Заголовки колонки шифров в порядке приоритета (ТЗ патча 21);
+# сравнение — по канонической форме _norm_header
+_KIT_CODE_HEADERS = ("ШИФР РД", "ШИФР КОМПЛЕКТА", "КОМПЛЕКТ")
+
+
+def _norm_header(h) -> str:
+    """Заголовок колонки Excel → каноническая форма для сравнения:
+    неразрывный пробел → пробел, сжатие повторов, trim, верхний
+    регистр, латинские двойники → кириллица (normalize_kit_code)."""
+    s = " ".join(str(h).replace("\xa0", " ").split())
+    return normalize_kit_code(s)
+
+
+def _find_kit_code_column(df: pd.DataFrame):
+    """Колонка с шифрами комплектов во внешнем перечне (патч 21).
+
+    Ищет заголовок «Шифр РД» / «Шифр комплекта» / «Комплект» (в
+    порядке приоритета), фолбэк — первый заголовок, содержащий
+    «ШИФР». Возвращает имя колонки или None (UI покажет ошибку со
+    списком найденных заголовков).
+    """
+    norm = {_norm_header(h): h for h in df.columns}
+    for want in _KIT_CODE_HEADERS:
+        if want in norm:
+            return norm[want]
+    for h_norm, h in norm.items():
+        if "ШИФР" in h_norm:
+            return h
+    return None
+
+
+@versioned_cache(600)
+def _load_all_kit_statuses() -> dict:
+    """{шифр комплекта: статус} — один срез БД (патч 21).
+
+    sheets.get_kit_statuses(None): unique_vitro_sheets (последние
+    ревизии, «липкое» аннулирование, нормализация шифров) + правила
+    статусов патча 21. versioned_cache — сброс при синке, как у
+    остальных загрузчиков вкладки.
+    """
+    return get_kit_statuses()
+
+
+def _apply_kit_statuses(df: pd.DataFrame, col: str,
+                        statuses: dict) -> pd.DataFrame:
+    """Добавляет колонку «Статус комплекта» В КОНЕЦ таблицы (патч 21).
+
+    col — колонка шифров (результат _find_kit_code_column); шифры
+    нормализуются перед сопоставлением со словарём статусов
+    (латинские двойники, регистр, пробелы). Комплекта нет в Витро /
+    пустой шифр → «План (не загружен)» (правило 2, согласовано).
+    Исходный DataFrame не мутируется.
+    """
+    out = df.copy()
+    out[KIT_STATUS_COL] = [
+        statuses.get(normalize_kit_code(code), KIT_STATUS_NOT_LOADED)
+        for code in out[col].tolist()
+    ]
+    return out
+
+
+def _find_header_row_in_excel(uploaded_file) -> int:
+    """Найти строку заголовков в загруженном Excel (патч 21.1).
+
+    Файлы с шапкой проекта (например «График… 18.11.xlsx») имеют
+    заголовки таблицы не в строке 0, а в строке 7-15. Функция читает
+    первые 50 строк без header и ищет ту, где есть ячейка, содержащая
+    «шифр» / «комплект» (регистронезависимо).
+
+    Возвращает номер строки (0-based). Если не найдено — 0.
+    """
+    raw = pd.read_excel(uploaded_file, header=None, nrows=50)
+    target_patterns = ("шифр", "комплект")
+
+    for row_idx in range(len(raw)):
+        for val in raw.iloc[row_idx].tolist():
+            # Пустые ячейки (NaN) → пропускаем
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            s = str(val).replace("\xa0", " ").lower()
+            for pat in target_patterns:
+                if pat in s:
+                    return row_idx
+
+    return 0  # fallback: первая строка
+
+
+def _find_kit_code_sheet(uploaded_file) -> tuple:
+    """Найти лист и колонку с шифрами комплектов (патч 21.2).
+
+    Файлы могут содержать несколько листов (например «Легенда от
+    Заказчика» без таблицы и «График РД» с данными). Для каждого листа:
+    1) читает без header и ищет строку с «шифр»/«комплект»;
+    2) если строка найдена — перечитывает с правильным header;
+    3) проверяет наличие колонки шифров.
+
+    Возвращает (имя_листа, DataFrame, имя_колонки) или (None, None, None).
+    """
+    try:
+        # Получаем список всех листов
+        xl = pd.ExcelFile(uploaded_file)
+        sheet_names = xl.sheet_names
+    except Exception:
+        return None, None, None
+
+    for sheet_name in sheet_names:
+        # Шаг 1: ищем строку заголовка БЕЗ header
+        header_row = _find_header_row_in_excel_for_sheet(
+            uploaded_file, sheet_name
+        )
+
+        # Шаг 2: перечитываем с правильным header
+        try:
+            df = pd.read_excel(uploaded_file, sheet_name=sheet_name,
+                               header=header_row)
+        except Exception:
+            continue
+
+        if df.empty:
+            continue
+
+        # Шаг 3: проверяем наличие колонки шифров
+        col = _find_kit_code_column(df)
+        if col is not None:
+            return sheet_name, df, col
+
+    return None, None, None
+
+
+def _find_header_row_in_excel_for_sheet(uploaded_file, sheet_name: str) -> int:
+    """Найти строку заголовков на конкретном листе Excel.
+
+    Аналог _find_header_row_in_excel, но для конкретного листа.
+    """
+    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name,
+                        header=None, nrows=50)
+    target_patterns = ("шифр", "комплект")
+
+    for row_idx in range(len(raw)):
+        for val in raw.iloc[row_idx].tolist():
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            s = str(val).replace("\xa0", " ").lower()
+            for pat in target_patterns:
+                if pat in s:
+                    return row_idx
+
+    return 0  # fallback: первая строка
+
+
+def _render_kit_status_update():
+    """Подвкладка «🔄 Обновить статусы» (патч 21).
+
+    Пользователь загружает Excel с перечнем комплектов — для каждого
+    шифра подставляется статус комплекта по актуальным листам Витро;
+    предпросмотр — первые 10 строк, выгрузка — обновлённый Excel
+    (через openpyxl, сохраняя исходное форматирование).
+    """
+    st.markdown("### 🔄 Обновить статусы комплектов")
+    st.caption(
+        "Загрузите перечень комплектов (Excel) — для каждого шифра "
+        "подставится статус комплекта по листам Витро: «A» / «B» / "
+        "«C» / «План (не загружен)»."
+    )
+
+    uploaded = st.file_uploader(
+        "Загрузите Excel с перечнем комплектов",
+        type=["xlsx"],
+        key="kit_status_upload",
+    )
+    if uploaded is None:
+        st.info(
+            "Файл не загружен. Формат: .xlsx; шифры — в колонке "
+            "«Шифр РД» (или «Шифр комплекта», «Комплект»)."
+        )
+        return
+
+    # --- Поиск листа с таблицей (патч 21.2) ---
+    sheet_name, df, col = _find_kit_code_sheet(uploaded)
+
+    if sheet_name is None:
+        # Покажем список листов и заголовки для диагностики
+        try:
+            sheets = pd.read_excel(uploaded, sheet_name=None)
+            st.error(
+                "Не найдена колонка с шифрами ни на одном листе. "
+                "Ожидался заголовок «Шифр РД» (или «Шифр комплекта», «Комплект»)."
+            )
+            st.markdown("**Листы в файле:**")
+            for name, dframe in sheets.items():
+                hdrs = ", ".join(f"«{h}»" for h in dframe.columns[:10])
+                if len(dframe.columns) > 10:
+                    hdrs += " ..."
+                st.caption(f"• «{name}» ({len(dframe)} строк): {hdrs}")
+        except Exception:
+            st.error("Не удалось прочитать файл. Нужен Excel в формате .xlsx.")
+        return
+
+    if df.empty:
+        st.warning("Файл прочитан, но таблица пуста.")
+        return
+
+    st.info(f"Найден лист «{sheet_name}» с колонкой «{col}».")
+
+    # --- Предпросмотр через pandas ---
+    statuses = _load_all_kit_statuses()
+    result = _apply_kit_statuses(df, col, statuses)
+
+    n_found = int((result[KIT_STATUS_COL] != KIT_STATUS_NOT_LOADED).sum())
+    st.success(
+        f"Колонка «{KIT_STATUS_COL}» добавлена (шифры — «{col}»). "
+        f"Строк: {len(result)}, из них в Витро: {n_found}."
+    )
+
+    result = result.astype(str)
+    st.dataframe(
+        result.head(10).astype(str),
+        width='stretch',
+        hide_index=True,
+        height=300,
+    )
+    if len(result) > 10:
+        st.caption("Показаны первые 10 строк. В выгрузку попадут все.")
+
+    # --- Выгрузка через openpyxl (сохраняет форматирование) ---
+    st.divider()
+    st.download_button(
+        "📥 Скачать обновлённый Excel",
+        data=_xlsx_add_kit_status(
+            uploaded, sheet_name, col, statuses, KIT_STATUS_COL
+        ),
+        file_name=f"{_extract_filename(uploaded)}_статусы_{datetime.now():%Y%m%d}.xlsx",
+        mime=("application/vnd.openxmlformats-officedocument"
+              ".spreadsheetml.sheet"),
+        width='stretch',
+        key="dl_kit_status_xlsx",
+    )
+
+
+def _extract_filename(uploaded_file) -> str:
+    """Извлечь имя файла без расширения (патч 21.3)."""
+    name = uploaded_file.name
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    return name
+
+
+def _xlsx_add_kit_status(
+    uploaded_file,
+    sheet_name: str,
+    kit_col: str,
+    statuses: dict,
+    status_col_name: str,
+) -> bytes:
+    """Добавить колонку «Статус комплекта» в исходный Excel через openpyxl.
+
+    Сохраняет все цвета, ширины, формулы, объединения — модифицирует
+    только добавленную колонку. Возвращает байты для скачивания.
+    """
+    wb = openpyxl.load_workbook(uploaded_file, read_only=False,
+                                keep_vba=False)
+    ws = wb[sheet_name]
+
+    # --- 1. Находим строку заголовка и колонку шифров ---
+    header_row_idx = None
+    kit_col_num = None
+    for cell_row in ws.iter_rows(min_row=1, max_row=50, max_col=ws.max_column):
+        for cell in cell_row:
+            if cell.value is not None and str(cell.value).replace("\xa0", " ").strip():
+                norm = _norm_header(str(cell.value))
+                for want in _KIT_CODE_HEADERS:
+                    if norm == want:
+                        header_row_idx = cell.row
+                        kit_col_num = cell.column
+                        break
+                if header_row_idx:
+                    break
+            if header_row_idx:
+                break
+        if header_row_idx:
+            break
+
+    if header_row_idx is None:
+        # Fallback: используем имя колонки из pandas
+        for col_num, cell in enumerate(ws[header_row_idx or 1], start=1):
+            if cell.value and str(cell.value) == kit_col:
+                header_row_idx = cell.row
+                kit_col_num = col_num
+                break
+
+    if header_row_idx is None:
+        # Не нашли — fallback к pandas
+        return _df_to_xlsx(
+            _apply_kit_statuses(
+                pd.read_excel(uploaded_file, sheet_name=sheet_name),
+                kit_col, statuses
+            ),
+            sheet_name[:31],
+        )
+
+    # --- 2. Определяем последнюю колонку и последнюю строку данных ---
+    max_col = ws.max_column
+    last_row = 0
+    for r in range(header_row_idx + 1, ws.max_row + 1):
+        val = ws.cell(row=r, column=kit_col_num).value
+        if val is not None and not pd.isna(val):
+            last_row = r
+
+    # --- 3. Новая колонка для статуса ---
+    new_col = max_col + 1
+
+    # --- 4. Копируем стиль заголовка с соседней ячейки ---
+    ref_cell = ws.cell(row=header_row_idx, column=max_col)
+    header_cell = ws.cell(row=header_row_idx, column=new_col,
+                          value=status_col_name)
+    if ref_cell.fill:
+        header_cell.fill = copy.copy(ref_cell.fill)
+    if ref_cell.font:
+        header_cell.font = copy.copy(ref_cell.font)
+    if ref_cell.border:
+        header_cell.border = copy.copy(ref_cell.border)
+    if ref_cell.alignment:
+        header_cell.alignment = copy.copy(ref_cell.alignment)
+    if ref_cell.number_format:
+        header_cell.number_format = ref_cell.number_format
+
+    # --- 5. Батч-вычисление статусов для всех шифров в таблице ---
+    codes = []
+    for r in range(header_row_idx + 1, last_row + 1):
+        val = ws.cell(row=r, column=kit_col_num).value
+        if val is not None and not pd.isna(val):
+            codes.append(val)
+
+    kit_statuses = get_kit_statuses(codes)
+
+    # --- 6. Пишем статусы ---
+    for idx, code in enumerate(codes):
+        r = header_row_idx + 1 + idx
+        ws.cell(row=r, column=new_col,
+                value=kit_statuses.get(normalize_kit_code(code),
+                                       KIT_STATUS_NOT_LOADED))
+
+    # --- 7. Сохраняем в буфер ---
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _int_to_column_letter(col_num: int) -> str:
+    """Преобразовать номер колонки Excel в буквенное обозначение."""
+    letter = ""
+    while col_num > 0:
+        col_num, remainder = divmod(col_num - 1, 26)
+        letter = chr(65 + remainder) + letter
+    return letter
+
+
+def col_letter_to_int(col_letter: str) -> int:
+    """Преобразовать буквенную обозначение колонки Excel в номер."""
+    result = 0
+    for ch in col_letter.upper():
+        result = result * 26 + (ord(ch) - ord("A") + 1)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -911,13 +1294,15 @@ def _render_analytics():
 def render():
     st.header("📄 Экспорт")
     st.caption(
-        "Выгрузка данных в Excel и PDF: сводки, замечания, аналитика."
+        "Выгрузка данных в Excel и PDF: сводки, замечания, "
+        "аналитика, статусы комплектов."
     )
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Сводные отчёты",
         "📋 Замечания",
         "📈 Аналитика",
+        "🔄 Обновить статусы",
     ])
 
     with tab1:
@@ -926,3 +1311,5 @@ def render():
         _render_comments_export()
     with tab3:
         _render_analytics()
+    with tab4:
+        _render_kit_status_update()

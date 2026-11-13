@@ -87,7 +87,7 @@ def _render_db_stats():
         st.markdown("**Последние снимки истории:**")
         snap_df = pd.DataFrame([dict(r) for r in last_snapshots])
         snap_df.columns = ["Дата снимка", "Комплектов"]
-        st.dataframe(snap_df, use_container_width=True, hide_index=True)
+        st.dataframe(snap_df, width='stretch', hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ def _render_sync():
     )
 
     if st.button("🚀 Запустить синхронизацию", type="primary",
-                 use_container_width=True, key="btn_sync"):
+                 width='stretch', key="btn_sync"):
         _run_sync()
 
 
@@ -141,7 +141,7 @@ def _render_xlsx():
         "цветными процентами и выпадающими списками категорий."
     )
 
-    if st.button("📊 Сгенерировать все XLSX", use_container_width=True,
+    if st.button("📊 Сгенерировать все XLSX", width='stretch',
                  key="btn_xlsx"):
         with st.spinner("Генерация отчётов... (~1 минута)"):
             try:
@@ -171,7 +171,7 @@ def _render_xlsx():
                     mime=("application/vnd.openxmlformats-officedocument"
                           ".spreadsheetml.sheet"),
                     key=f"dl_admin_{path.name}",
-                    use_container_width=True,
+                    width='stretch',
                 )
 
 
@@ -348,7 +348,7 @@ def _render_logs_tab():
             stats = _load_events_stats()
             if not stats.empty:
                 st.markdown("##### Сводка по событиям")
-                st.dataframe(stats, use_container_width=True, hide_index=True)
+                st.dataframe(stats, width='stretch', hide_index=True)
 
                 fig = px.bar(
                     stats.sort_values("Количество", ascending=True),
@@ -359,13 +359,13 @@ def _render_logs_tab():
                 )
                 fig.update_traces(textposition="outside")
                 fig.update_layout(height=max(250, 40 * len(stats)))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
             st.divider()
             st.markdown(f"##### Последние {len(df)} записей")
 
             styled = _apply_status_style(df)
-            st.dataframe(styled, use_container_width=True,
+            st.dataframe(styled, width='stretch',
                          hide_index=True, height=500)
 
     # ======================================================================
@@ -400,12 +400,12 @@ def _render_logs_tab():
         )
         fig.update_traces(textposition="outside")
         fig.update_layout(height=max(200, 40 * len(by_user)))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         st.divider()
         st.markdown(f"##### Последние {len(activity)} изменений категорий")
 
-        st.dataframe(activity, use_container_width=True,
+        st.dataframe(activity, width='stretch',
                      hide_index=True, height=500)
 
 

@@ -1,0 +1,721 @@
+diff --git a/scripts/test_patch21.py b/scripts/test_patch21.py
+new file mode 100644
+index 0000000..67420fd
+--- /dev/null
++++ b/scripts/test_patch21.py
+@@ -0,0 +1,322 @@
++# scripts/test_patch21.py
++"""Тесты патча 21 «Статус комплекта во внешнем Excel (Экспорт)».
++
++Блок 1: get_kit_status / get_kit_statuses — статус комплекта по
++        последним ревизиям листов (unique_vitro_sheets):
++        правила 2, 4, 5, 6, 7, 8 ТЗ; дедуп ревизий; «липкое»
++        аннулирование; латинские двойники шифра; мусорные шифры;
++        эквивалентность одиночного и батчевого вызова.
++Блок 2: чтение внешнего Excel и добавление колонки
++        «Статус комплекта»: _find_kit_code_column (варианты
++        заголовков + промах + приоритет), _apply_kit_statuses
++        (колонка в конце таблицы, значения, пустой шифр).
++
++СТОП-ЛИСТ: реальная data/vitro.db не открывается — временная БД
++назначается через SQLITE_PATH ДО импорта vitro.sqlite_db (путь
++читается при импорте модуля).
++
++Запуск: python scripts/test_patch21.py
++"""
++import io
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++
++# --- Временная БД ДО импорта vitro.* (СТОП-ЛИСТ патча 21) ---
++_TMPDIR = tempfile.mkdtemp(prefix="vitro_test_patch21_")
++os.environ["SQLITE_PATH"] = str(Path(_TMPDIR) / "test_vitro.db")
++
++import openpyxl  # noqa: E402
++import pandas as pd  # noqa: E402
++
++import vitro.sqlite_db as sqlite_db  # noqa: E402
++from vitro.sheets import (  # noqa: E402
++    KIT_STATUS_NOT_LOADED,
++    get_kit_status,
++    get_kit_statuses,
++    normalize_kit_code,
++)
++from vitro.ui.export import (  # noqa: E402
++    KIT_STATUS_COL,
++    _apply_kit_statuses,
++    _find_kit_code_column,
++)
++
++# Схема временной БД (таблица documents)
++sqlite_db.init_db()
++
++FAILED: list[str] = []
++
++
++def check(name: str, cond: bool, detail: str = "") -> None:
++    status = "OK  " if cond else "FAIL"
++    msg = f"[{status}] {name}" + (f" — {detail}" if detail and not cond else "")
++    try:
++        print(msg)
++    except UnicodeEncodeError:
++        print(msg.encode("ascii", "replace").decode("ascii"))
++    if not cond:
++        FAILED.append(name)
++
++
++# ---------------------------------------------------------------------------
++#  Подготовка: временная БД documents
++# ---------------------------------------------------------------------------
++def seed_documents(rows) -> None:
++    """rows: (id, leaf, complex, status, sheet_number, status_date)."""
++    with sqlite_db.get_conn() as conn:
++        conn.execute("DELETE FROM documents")
++        conn.executemany(
++            "INSERT INTO documents (id, leaf, complex, status, "
++            "sheet_number, status_date) VALUES (?, ?, ?, ?, ?, ?)",
++            list(rows),
++        )
++
++
++KIT = "АТ-РД-КЖ1-1-00"        # 5-блочный шифр (кириллица)
++KIT2 = "АТ-РД-ОВ2-С-00"       # для латинских двойников
++KIT3 = "АТ-РД-КМ2-1-02"       # для батчевых проверок
++KIT_ABSENT = "АТ-РД-ХХ9-9-99"  # заведомо отсутствует в БД
++
++
++def kit_rows(complex_code, statuses, sheet_numbers=None, start_id=1):
++    """(complex, [статусы]) → строки documents по одному листу на статус."""
++    sn = sheet_numbers or [str(i + 1) for i in range(len(statuses))]
++    return [
++        (start_id + i, f"{complex_code}-{sn[i]}.PDF", complex_code,
++         statuses[i], sn[i], f"2025-06-{i + 1:02d}")
++        for i in range(len(statuses))
++    ]
++
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.1 — правила статусов 6/7/8 и игнор (правила 4/5)
++# ---------------------------------------------------------------------------
++RULES = [
++    # (статусы листов комплекта, ожидаемый статус комплекта)
++    (["A", "A", "A"], "A"),                                   # правило 6
++    (["A", "B"], "B"),                                        # правило 7
++    (["B"], "B"),                                             # только B
++    (["A", "C"], "C"),                                        # правило 8
++    (["C"], "C"),
++    (["A", "ДЛЯ СОГЛАСОВАНИЯ"], "C"),
++    (["B", "НА РАССМОТРЕНИИ"], "C"),
++    (["A", "НА КОРРЕКТИРОВКЕ"], "C"),
++    (["B", "РАЗМЕЩЕНО"], "C"),
++    # правило 4: «И» и «АННУЛИРОВАНО» игнорируются
++    (["И"], KIT_STATUS_NOT_LOADED),
++    (["АННУЛИРОВАНО"], KIT_STATUS_NOT_LOADED),
++    (["И", "АННУЛИРОВАНО"], KIT_STATUS_NOT_LOADED),
++    (["A", "И"], "A"),
++    (["B", "Аннулировано"], "B"),
++    # правило 3: нормализация (регистр, пробелы)
++    ([" a ", "b"], "B"),
++    # согласованное дополнение: неизвестные статусы → «C»
++    (["ОТМЕНА"], "C"),
++    (["A", "ОТМЕНА"], "C"),
++]
++for sts, expected in RULES:
++    seed_documents(kit_rows(KIT, sts))
++    got = get_kit_status(KIT)
++    check(f"правило: листы {sts} → «{expected}»",
++          got == expected, f"получено «{got}»")
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.2 — правило 2: листов нет
++# ---------------------------------------------------------------------------
++seed_documents([])
++check("пустая БД → «План (не загружен)»",
++      get_kit_status(KIT) == KIT_STATUS_NOT_LOADED)
++
++# мусорные шифры отсекаются unique_vitro_sheets — комплект не находится
++seed_documents(kit_rows("ИТОГО", ["A"], sheet_numbers=["1"]))
++check("мусорные шифры в БД не влияют на поиск комплекта",
++      get_kit_status(KIT) == KIT_STATUS_NOT_LOADED)
++
++# пустой шифр на входе
++check("пустой шифр → «План (не загружен)»",
++      get_kit_status("") == KIT_STATUS_NOT_LOADED)
++check("None на входе → «План (не загружен)»",
++      get_kit_status(None) == KIT_STATUS_NOT_LOADED)
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.3 — дедуп ревизий и «липкое» аннулирование
++# ---------------------------------------------------------------------------
++# последняя ревизия листа побеждает: старая C, свежая A
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "C", "1", "2025-01-01"),
++    (2, f"{KIT}-1.PDF", KIT, "A", "1", "2025-06-01"),
++    (3, f"{KIT}-2.PDF", KIT, "A", "2", "2025-06-01"),
++])
++check("дедуп ревизий: свежая ревизия листа побеждает → «A»",
++      get_kit_status(KIT) == "A")
++
++# равные даты → побеждает больший id
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "C", "1", "2025-06-01"),
++    (2, f"{KIT}-1.PDF", KIT, "A", "1", "2025-06-01"),
++])
++check("равные даты ревизий: больший id побеждает → «A»",
++      get_kit_status(KIT) == "A")
++
++# «липкое» аннулирование: аннулированная ревизия листа игнорируется
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "Аннулировано", "1", "2025-01-01"),
++    (2, f"{KIT}-1.PDF", KIT, "A", "1", "2025-06-01"),
++    (3, f"{KIT}-2.PDF", KIT, "B", "2", "2025-06-01"),
++])
++check("«липкое» аннулирование: аннулированный лист игнорируется → «B»",
++      get_kit_status(KIT) == "B")
++
++# листы без sheet_number: каждый файл — самостоятельный лист
++seed_documents([
++    (1, f"{KIT}-a.PDF", KIT, "A", None, "2025-06-01"),
++    (2, f"{KIT}-b.PDF", KIT, "B", None, "2025-06-02"),
++])
++check("пустой sheet_number: каждый файл — лист → «B»",
++      get_kit_status(KIT) == "B")
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.4 — латинские двойники шифра
++# ---------------------------------------------------------------------------
++seed_documents(kit_rows(KIT2, ["A", "B"]))
++latin_mix = "AT-PД-OB2-C-00"  # латиница: A, T, P, O, B, C; кириллица: Д
++check("латинские двойники шифра нормализуются",
++      normalize_kit_code(latin_mix) == KIT2,
++      f"получено «{normalize_kit_code(latin_mix)}»")
++check("статус по латинской записи шифра совпадает",
++      get_kit_status(latin_mix)
++      == get_kit_status(KIT2) == "B")
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.5 — батчевый вызов get_kit_statuses
++# ---------------------------------------------------------------------------
++seed_documents(kit_rows(KIT, ["A"]) + kit_rows(KIT2, ["A", "B"], start_id=10)
++               + kit_rows(KIT3, ["C"], start_id=20))
++
++single = {c: get_kit_status(c) for c in (KIT, KIT2, KIT3)}
++batch = get_kit_statuses([KIT, KIT2, KIT3, KIT_ABSENT])
++check("батчевый вызов ≡ одиночному для каждого шифра",
++      all(batch.get(c) == s for c, s in single.items())
++      and batch.get(KIT_ABSENT) == KIT_STATUS_NOT_LOADED,
++      f"batch={batch}, single={single}")
++check("ключи батчевого вызова — канонические шифры",
++      set(batch) == {KIT, KIT2, KIT3, KIT_ABSENT})
++
++all_map = get_kit_statuses()
++check("codes=None → все комплекты базы",
++      all_map.get(KIT) == "A" and all_map.get(KIT2) == "B"
++      and all_map.get(KIT3) == "C" and KIT_ABSENT not in all_map)
++
++check("строка вместо списка трактуется как один шифр",
++      get_kit_statuses(KIT3) == {KIT3: "C"})
++
++check("пустой шифр в батче пропускается",
++      get_kit_statuses(["", "   "]) == {})
++
++# один проход БД не мутирует базу (строк: 1 + 2 + 1)
++with sqlite_db.get_conn() as conn:
++    n_docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
++check("чтение статусов не меняет documents", n_docs == 4,
++      f"строк в documents: {n_docs}")
++
++# ---------------------------------------------------------------------------
++#  БЛОК 2.1 — _find_kit_code_column: варианты заголовков
++# ---------------------------------------------------------------------------
++HEADERS_OK = [
++    ["Шифр РД"],
++    ["Шифр комплекта"],
++    ["Комплект"],
++    ["шифр  РД "],          # регистр + двойной пробел
++    ["Шифр\u00a0РД"],       # неразрывный пробел
++    ["шифр комплекта"],     # нижний регистр
++]
++for headers in HEADERS_OK:
++    df = pd.DataFrame({h: ["АТ-РД-КЖ1-1-00"] for h in headers})
++    check(f"заголовок {headers!r} находится",
++          _find_kit_code_column(df) == headers[0])
++
++# промах — колонки с шифрами нет
++df_miss = pd.DataFrame({"Наименование": ["x"], "Кол-во": [1]})
++check("без колонки шифров → None", _find_kit_code_column(df_miss) is None)
++
++# фолбэк: первый заголовок, содержащий «ШИФР»
++df_fallback = pd.DataFrame({"Шифр узла": ["x"], "Наименование": ["y"]})
++check("фолбэк по подстроке «ШИФР»",
++      _find_kit_code_column(df_fallback) == "Шифр узла")
++
++# приоритет: «Шифр РД» сильнее «Комплект»
++df_priority = pd.DataFrame({
++    "Комплект": ["АТ-РД-ОВ2-С-00"],
++    "Шифр РД": ["АТ-РД-КЖ1-1-00"],
++})
++check("приоритет заголовков: «Шифр РД» выбран первым",
++      _find_kit_code_column(df_priority) == "Шифр РД")
++
++# ---------------------------------------------------------------------------
++#  БЛОК 2.2 — чтение синтетического Excel и добавление колонки
++# ---------------------------------------------------------------------------
++def build_xlsx(headers, rows) -> bytes:
++    wb = openpyxl.Workbook()
++    ws = wb.active
++    ws.title = "Комплекты"
++    ws.append(headers)
++    for r in rows:
++        ws.append(r)
++    buf = io.BytesIO()
++    wb.save(buf)
++    return buf.getvalue()
++
++
++xlsx = build_xlsx(
++    ["Наименование", "Шифр РД", "Примечание"],
++    [
++        ["Комплект КЖ1", KIT, ""],
++        ["Комплект ОВ2 (латиница)", "AT-PД-OB2-C-00", "двойники"],
++        ["Нет в Витро", KIT_ABSENT, ""],
++        ["Пустой шифр", "", ""],
++    ],
++)
++df_x = pd.read_excel(io.BytesIO(xlsx))
++col = _find_kit_code_column(df_x)
++check("колонка шифров найдена в синтетическом Excel", col == "Шифр РД")
++
++# статусы — как вернул бы get_kit_status (в тесте подставляем напрямую)
++statuses = {
++    KIT: "A",
++    KIT2: "B",
++    KIT_ABSENT: KIT_STATUS_NOT_LOADED,
++}
++result = _apply_kit_statuses(df_x, col, statuses)
++
++check("колонка «Статус комплекта» добавлена последней",
++      list(result.columns)
++      == ["Наименование", "Шифр РД", "Примечание", KIT_STATUS_COL])
++check("исходная таблица не мутируется",
++      list(df_x.columns)
++      == ["Наименование", "Шифр РД", "Примечание"])
++
++expected_col = ["A", "B", KIT_STATUS_NOT_LOADED, KIT_STATUS_NOT_LOADED]
++check("значения статусов корректны (в т.ч. латиница и пустой шифр)",
++      list(result[KIT_STATUS_COL]) == expected_col,
++      f"получено {list(result[KIT_STATUS_COL])}")
++
++# чтение файла и статусы из БД — сквозной сценарий
++db_statuses = get_kit_statuses(df_x[col].tolist())
++result_db = _apply_kit_statuses(df_x, col, db_statuses)
++check("сквозной сценарий: Excel → БД → колонка совпадает",
++      list(result_db[KIT_STATUS_COL]) == expected_col,
++      f"получено {list(result_db[KIT_STATUS_COL])}")
++
++# ---------------------------------------------------------------------------
++#  Итог
++# ---------------------------------------------------------------------------
++if FAILED:
++    print(f"\nПРОВАЛЕНО проверок: {len(FAILED)}")
++    sys.exit(1)
++print("\nВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
++sys.exit(0)
+diff --git a/vitro/sheets.py b/vitro/sheets.py
+index 23a422d..86335c4 100644
+--- a/vitro/sheets.py
++++ b/vitro/sheets.py
+@@ -54,9 +54,22 @@
+     «Листов всего» везде совпадает с «Листов в Витро».
+   * sql_count_sheets(alias) — SQL-выражение COUNT(DISTINCT ...) для
+     подсчёта уникальных листов прямо в SQL-запросе.
++  * normalize_kit_code(code) — каноническая форма шифра комплекта;
++    публичная обёртка _norm_complex (патч 21).
++  * get_kit_status(complex_code) — статус комплекта «A» / «B» / «C» /
++    «План (не загружен)» по последним ревизиям его листов из БД
++    (патч 21, подвкладка «Обновить статусы» вкладки «Экспорт»).
++  * get_kit_statuses(codes) — батчевый вариант get_kit_status: один
++    проход по БД на весь список шифров, codes=None → все комплекты
++    базы (патч 21).
+ 
+ Изменения структуры базы НЕ требуются: дедупликация выполняется на
+ уровне SQL-выражений и pandas; таблицы/представления не создаются.
++
++ПАТЧ 21 — статус комплекта для внешних перечней (Экспорт):
++функции get_kit_status / get_kit_statuses сводят статусы УНИКАЛЬНЫХ
++листов комплекта (тот же unique_vitro_sheets, что во вкладках) к
++одному значению: «A» / «B» / «C» / «План (не загружен)».
+ """
+ 
+ import re
+@@ -382,3 +395,158 @@ def sql_count_sheets(alias: str = "d") -> str:
+         f"CHAR(9), ' '), CHAR(160), ' ')) "
+         f"ELSE 'row:' || {a}.id END)"
+     )
++
++
++# ---------------------------------------------------------------------------
++#  Статус комплекта по листам Витро (патч 21)
++# ---------------------------------------------------------------------------
++# Статус комплекта — сводка по статусам его УНИКАЛЬНЫХ листов
++# (unique_vitro_sheets: последние ревизии, «липкое» аннулирование,
++# нормализация шифров). Используется подвкладкой «🔄 Обновить статусы»
++# вкладки «Экспорт» (vitro/ui/export.py) для внешних перечней
++# комплектов Excel.
++#
++# Правила (ТЗ патча 21, согласованы):
++#   1. Листы комплекта берутся из БД по последним ревизиям.
++#   2. Листов нет → «План (не загружен)».
++#   3. Статусы нормализуются (strip, верхний регистр).
++#   4. «И» и «АННУЛИРОВАНО» игнорируются.
++#   5. После игнора пусто → «План (не загружен)».
++#   6. Все статусы == «A» → «A».
++#   7. Все статусы в {A, B} и есть хотя бы один «B» → «B».
++#   8. Иначе → «C»: есть «C», служебные статусы («ДЛЯ СОГЛАСОВАНИЯ»,
++#      «НА РАССМОТРЕНИИ», «НА КОРРЕКТИРОВКЕ», «РАЗМЕЩЕНО») или
++#      неизвестный статус — комплект в работе.
++# Статусы A/B/C сравниваются с ЛАТИНСКИМИ буквами — тот же стандарт,
++# что во всех вкладках (plan.py, export.py, Сводка).
++KIT_STATUS_NOT_LOADED = "План (не загружен)"
++
++# Статусы, НЕ влияющие на статус комплекта (правило 4):
++# «И» — информационный лист, «АННУЛИРОВАНО» — лист выведен из состава.
++_KIT_IGNORED_STATUSES = ("И", "АННУЛИРОВАНО")
++
++
++def normalize_kit_code(code) -> str:
++    """Каноническая форма шифра комплекта (патч 21): trim (включая
++    неразрывный пробел \xa0), верхний регистр, латинские двойники →
++    кириллица. None/NaN → ''.
++
++    Публичная обёртка _norm_complex: шифры из внешних Excel-перечней
++    («Обновить статусы», export.py) сопоставляются с базой именно
++    через эту функцию — один комплект, написанный латиницей и
++    кириллицей, даёт один ключ (тот же стандарт, что в дедупликации).
++    """
++    return _norm_complex(code)
++
++
++def _kit_status_from_statuses(statuses) -> str:
++    """Чистое ядро правил патча 21 (без обращения к БД).
++
++    statuses — любые статусы листов комплекта (сырые из documents:
++    «A», «b », «И», «Аннулировано», «ДЛЯ СОГЛАСОВАНИЯ»…). Каждый
++    нормализуется (strip, nbsp → пробел, верхний регистр), «И» и
++    «АННУЛИРОВАНО» игнорируются, по оставшимся уникальным значениям
++    возвращается статус комплекта (см. правила в шапке секции).
++    Пустой вход / всё проигнорировано → «План (не загружен)».
++
++    Согласованное дополнение: статусы, не входящие в A/B/C/И/
++    АННУЛИРОВАНО и служебные, трактуются как «C» (комплект в работе).
++    """
++    uniq = set()
++    for s in (statuses or []):
++        v = _s(s).replace("\xa0", " ").upper()
++        if v:
++            uniq.add(v)
++    uniq -= set(_KIT_IGNORED_STATUSES)
++    if not uniq:
++        return KIT_STATUS_NOT_LOADED
++    if uniq == {"A"}:
++        return "A"
++    if uniq <= {"A", "B"}:
++        # Подмножество {A, B}, не равное {A} — значит, есть хотя бы один B
++        return "B"
++    return "C"
++
++
++def _load_vitro_sheets_raw() -> list:
++    """Строки documents (dict) для расчёта статусов комплектов.
++
++    Тот же срез, что в _vitro_sheet_counts «Плана выдачи» (plan.py):
++    id, complex, sheet_number, status, status_date по всем строкам
++    с непустым complex. Дедупликация — на стороне unique_vitro_sheets,
++    БД не изменяется.
++
++    get_conn импортируется ВНУТРИ функции: sqlite_db импортирует
++    sheets на уровне модуля (vitro/sqlite_db.py), прямой импорт в
++    шапке sheets.py дал бы цикл.
++    """
++    from vitro.sqlite_db import get_conn
++
++    with get_conn() as conn:
++        rows = conn.execute(
++            "SELECT id, complex, sheet_number, status, status_date "
++            "FROM documents "
++            "WHERE complex IS NOT NULL"
++        ).fetchall()
++    return [dict(r) for r in rows]
++
++
++def get_kit_status(complex_code: str) -> str:
++    """Статус комплекта по последним ревизиям его листов (патч 21).
++
++    Возвращает «A», «B», «C» или «План (не загружен)» — правила в
++    шапке секции. Листы комплекта = unique_vitro_sheets (дедуп
++    ревизий, «липкое» аннулирование, нормализация шифров, отсечение
++    мусорных), отфильтрованные по каноническому шифру.
++
++    Одиночный вызов делает полный срез documents (как все вкладки):
++    для перечней из Excel использовать батчевый get_kit_statuses —
++    один проход БД на весь список шифров.
++    """
++    code = normalize_kit_code(complex_code)
++    if not code:
++        return KIT_STATUS_NOT_LOADED
++    kit_sheets = [
++        r for r in unique_vitro_sheets(_load_vitro_sheets_raw())
++        if str(r.get("complex") or "") == code
++    ]
++    return _kit_status_from_statuses(
++        r.get("status") for r in kit_sheets)
++
++
++def get_kit_statuses(codes=None) -> dict:
++    """Батчевый вариант get_kit_status (патч 21): ОДИН проход по БД
++    на весь список шифров.
++
++    codes=None → статусы всех комплектов базы ({шифр: статус}).
++    Иначе — список/кортеж шифров (строка трактуется как один шифр):
++    шифры нормализуются, отсутствующие в Витро → «План (не загружен)»,
++    пустые шифры в результат не включаются. Ключи результата —
++    канонические шифры (normalize_kit_code), значения — «A» / «B» /
++    «C» / «План (не загружен)» — ровно то, что вернул бы
++    get_kit_status для каждого шифра (общее ядро правил).
++    """
++    statuses_by_kit: dict = {}
++    for r in unique_vitro_sheets(_load_vitro_sheets_raw()):
++        cx = str(r.get("complex") or "")
++        if not cx:
++            continue
++        statuses_by_kit.setdefault(cx, []).append(r.get("status"))
++
++    result = {
++        cx: _kit_status_from_statuses(sts)
++        for cx, sts in statuses_by_kit.items()
++    }
++
++    if codes is None:
++        return result
++
++    if isinstance(codes, str):
++        codes = [codes]
++    out: dict = {}
++    for c in codes or []:
++        key = normalize_kit_code(c)
++        if not key:
++            continue  # пустой шифр — не комплект; UI подставит дефолт
++        out[key] = result.get(key, KIT_STATUS_NOT_LOADED)
++    return out
+diff --git a/vitro/ui/export.py b/vitro/ui/export.py
+index af8bdce..13da867 100644
+--- a/vitro/ui/export.py
++++ b/vitro/ui/export.py
+@@ -5,6 +5,10 @@
+ Вся аналитика синхронизирована с дашбордом через `_load_all_categorized`.
+ Колонки по ответственным: 🔴 АТП ТЛП / 🔵 Ждут заказчика / 🔴 Хроника / 🟢 Учтено A/B.
+ 
++Подвкладка «🔄 Обновить статусы» (патч 21): во внешний перечень
++комплектов (Excel) добавляется колонка «Статус комплекта» —
++логика в vitro/sheets.py (get_kit_status / get_kit_statuses).
++
+ Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
+ """
+ 
+@@ -16,7 +20,12 @@ import streamlit as st
+ 
+ from vitro.sqlite_db import get_conn
+ from vitro._cache import versioned_cache
+-from vitro.sheets import unique_vitro_sheets
++from vitro.sheets import (
++    KIT_STATUS_NOT_LOADED,
++    get_kit_statuses,
++    normalize_kit_code,
++    unique_vitro_sheets,
++)
+ from vitro.pdf_builder import build_pdf
+ from vitro.ui._filters import render_standard_filters
+ 
+@@ -905,19 +914,165 @@ def _render_analytics():
+                                   "просрочек АТП ТЛП")
+ 
+ 
++# ---------------------------------------------------------------------------
++#  Секция 4: Обновить статусы комплектов (патч 21)
++# ---------------------------------------------------------------------------
++KIT_STATUS_COL = "Статус комплекта"
++
++# Заголовки колонки шифров в порядке приоритета (ТЗ патча 21);
++# сравнение — по канонической форме _norm_header
++_KIT_CODE_HEADERS = ("ШИФР РД", "ШИФР КОМПЛЕКТА", "КОМПЛЕКТ")
++
++
++def _norm_header(h) -> str:
++    """Заголовок колонки Excel → каноническая форма для сравнения:
++    неразрывный пробел → пробел, сжатие повторов, trim, верхний
++    регистр, латинские двойники → кириллица (normalize_kit_code)."""
++    s = " ".join(str(h).replace("\xa0", " ").split())
++    return normalize_kit_code(s)
++
++
++def _find_kit_code_column(df: pd.DataFrame):
++    """Колонка с шифрами комплектов во внешнем перечне (патч 21).
++
++    Ищет заголовок «Шифр РД» / «Шифр комплекта» / «Комплект» (в
++    порядке приоритета), фолбэк — первый заголовок, содержащий
++    «ШИФР». Возвращает имя колонки или None (UI покажет ошибку со
++    списком найденных заголовков).
++    """
++    norm = {_norm_header(h): h for h in df.columns}
++    for want in _KIT_CODE_HEADERS:
++        if want in norm:
++            return norm[want]
++    for h_norm, h in norm.items():
++        if "ШИФР" in h_norm:
++            return h
++    return None
++
++
++@versioned_cache(600)
++def _load_all_kit_statuses() -> dict:
++    """{шифр комплекта: статус} — один срез БД (патч 21).
++
++    sheets.get_kit_statuses(None): unique_vitro_sheets (последние
++    ревизии, «липкое» аннулирование, нормализация шифров) + правила
++    статусов патча 21. versioned_cache — сброс при синке, как у
++    остальных загрузчиков вкладки.
++    """
++    return get_kit_statuses()
++
++
++def _apply_kit_statuses(df: pd.DataFrame, col: str,
++                        statuses: dict) -> pd.DataFrame:
++    """Добавляет колонку «Статус комплекта» В КОНЕЦ таблицы (патч 21).
++
++    col — колонка шифров (результат _find_kit_code_column); шифры
++    нормализуются перед сопоставлением со словарём статусов
++    (латинские двойники, регистр, пробелы). Комплекта нет в Витро /
++    пустой шифр → «План (не загружен)» (правило 2, согласовано).
++    Исходный DataFrame не мутируется.
++    """
++    out = df.copy()
++    out[KIT_STATUS_COL] = [
++        statuses.get(normalize_kit_code(code), KIT_STATUS_NOT_LOADED)
++        for code in out[col].tolist()
++    ]
++    return out
++
++
++def _render_kit_status_update():
++    """Подвкладка «🔄 Обновить статусы» (патч 21).
++
++    Пользователь загружает Excel с перечнем комплектов — для каждого
++    шифра подставляется статус комплекта по актуальным листам Витро;
++    предпросмотр — первые 10 строк, выгрузка — обновлённый Excel.
++    """
++    st.markdown("### 🔄 Обновить статусы комплектов")
++    st.caption(
++        "Загрузите перечень комплектов (Excel) — для каждого шифра "
++        "подставится статус комплекта по листам Витро: «A» / «B» / "
++        "«C» / «План (не загружен)»."
++    )
++
++    uploaded = st.file_uploader(
++        "Загрузите Excel с перечнем комплектов",
++        type=["xlsx"],
++        key="kit_status_upload",
++    )
++    if uploaded is None:
++        st.info(
++            "Файл не загружен. Формат: .xlsx; шифры — в колонке "
++            "«Шифр РД» (или «Шифр комплекта», «Комплект»)."
++        )
++        return
++
++    try:
++        df = pd.read_excel(uploaded)
++    except Exception:
++        st.error(
++            "Не удалось прочитать файл. Нужен Excel в формате .xlsx."
++        )
++        return
++
++    if df.empty:
++        st.warning("Файл прочитан, но таблица пуста.")
++        return
++
++    col = _find_kit_code_column(df)
++    if col is None:
++        st.error(
++            "Не найдена колонка с шифрами. Ожидался заголовок "
++            "«Шифр РД» (или «Шифр комплекта», «Комплект»). "
++            "Заголовки в файле: "
++            + ", ".join(f"«{h}»" for h in df.columns)
++        )
++        return
++
++    statuses = _load_all_kit_statuses()
++    result = _apply_kit_statuses(df, col, statuses)
++
++    n_found = int((result[KIT_STATUS_COL] != KIT_STATUS_NOT_LOADED).sum())
++    st.success(
++        f"Колонка «{KIT_STATUS_COL}» добавлена (шифры — «{col}»). "
++        f"Строк: {len(result)}, из них в Витро: {n_found}."
++    )
++
++    st.dataframe(
++        result.head(10),
++        use_container_width=True,
++        hide_index=True,
++        height=300,
++    )
++    if len(result) > 10:
++        st.caption("Показаны первые 10 строк. В выгрузку попадут все.")
++
++    st.divider()
++    st.download_button(
++        "📥 Скачать обновлённый Excel",
++        data=_df_to_xlsx(result, "Комплекты"),
++        file_name=f"Комплекты_со_статусами_{datetime.now():%Y%m%d}.xlsx",
++        mime=("application/vnd.openxmlformats-officedocument"
++              ".spreadsheetml.sheet"),
++        use_container_width=True,
++        key="dl_kit_status_xlsx",
++    )
++
++
+ # ---------------------------------------------------------------------------
+ #  Точка входа
+ # ---------------------------------------------------------------------------
+ def render():
+     st.header("📄 Экспорт")
+     st.caption(
+-        "Выгрузка данных в Excel и PDF: сводки, замечания, аналитика."
++        "Выгрузка данных в Excel и PDF: сводки, замечания, "
++        "аналитика, статусы комплектов."
+     )
+ 
+-    tab1, tab2, tab3 = st.tabs([
++    tab1, tab2, tab3, tab4 = st.tabs([
+         "📊 Сводные отчёты",
+         "📋 Замечания",
+         "📈 Аналитика",
++        "🔄 Обновить статусы",
+     ])
+ 
+     with tab1:
+@@ -925,4 +1080,6 @@ def render():
+     with tab2:
+         _render_comments_export()
+     with tab3:
+-        _render_analytics()
+\ No newline at end of file
++        _render_analytics()
++    with tab4:
++        _render_kit_status_update()
+\ No newline at end of file

@@ -633,7 +633,7 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
 
     edited = st.data_editor(
         display_before,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         num_rows="fixed",
         height=min(max(len(display_before) * 42 + 40, 300), 700),
@@ -704,7 +704,7 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
         data=excel_bytes,
         file_name=f"Сводный_план_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=False,
+        width='content',
         key="plan_overview_export",
         help="Выгрузка сводного плана готовности в Excel с форматированием.",
     )
@@ -939,7 +939,7 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
             x=0.5, y=0.5,
         )],
     )
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    st.plotly_chart(fig, width='stretch', key=key)
 
 
 def _fmt_num(n) -> str:
@@ -1195,6 +1195,16 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
     else:
         df = pd.concat([df_dwg, df_vitro], ignore_index=True)
 
+    # ---- 5. Безопасная инициализация всех колонок ----
+    default_cols = [
+        "due_date", "kit_discipline", "kit_section",
+        "dwg_discipline", "dwg_section",
+        "planned_date", "sheet_no", "status",
+    ]
+    for col in default_cols:
+        if col not in df.columns:
+            df[col] = "" if col not in ("due_date", "planned_date") else None
+
     # Для листов из Витро (без Ведомости) — заполняем поля
     if "_source" in df.columns:
         is_vitro = df["_source"] == "vitro"
@@ -1215,12 +1225,29 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
             if col not in df.columns:
                 df[col] = ""
 
-    # Дисциплина/раздел: значение строки листа, а если пусто — комплекта.
-    row_disc = df["dwg_discipline"].fillna("")
-    df["Дисциплина"] = row_disc.where(row_disc != "", df["kit_discipline"]
-                                      .fillna(""))
-    row_sect = df["dwg_section"].fillna("")
-    df["Раздел"] = row_sect.where(row_sect != "", df["kit_section"].fillna(""))
+    # Дисциплина/раздел: безопасное получение колонок
+    if "kit_discipline" in df.columns:
+        kit_disc = df["kit_discipline"].fillna("")
+    else:
+        kit_disc = pd.Series([""] * len(df), index=df.index)
+
+    if "kit_section" in df.columns:
+        kit_sect = df["kit_section"].fillna("")
+    else:
+        kit_sect = pd.Series([""] * len(df), index=df.index)
+
+    if "dwg_discipline" in df.columns:
+        row_disc = df["dwg_discipline"].fillna("")
+    else:
+        row_disc = pd.Series([""] * len(df), index=df.index)
+
+    if "dwg_section" in df.columns:
+        row_sect = df["dwg_section"].fillna("")
+    else:
+        row_sect = pd.Series([""] * len(df), index=df.index)
+
+    df["Дисциплина"] = row_disc.where(row_disc != "", kit_disc)
+    df["Раздел"] = row_sect.where(row_sect != "", kit_sect)
 
     # ---- Стандартные фильтры ----
     if flt["disc"]:
@@ -1327,7 +1354,7 @@ def _render_export_button(sheets_table: pd.DataFrame,
         data=export_bytes,
         file_name=f"План_выдачи_листы_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime=MIME_XLSX,
-        use_container_width=False,
+        width='content',
         key="plan_export_excel",
         help="Файл повторяет таблицу «Детальный план по листам "
              "комплекта» с учётом фильтров и периода; второй лист — "
@@ -1360,7 +1387,7 @@ def _render_sheet_plan_table(sheets_table: pd.DataFrame,
     shown = sheets_table.head(MAX_DETAIL_ROWS)
     st.dataframe(
         shown,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=min(max(len(shown) * 36 + 40, 300), 700),
         column_config={
@@ -1513,7 +1540,7 @@ def _render_import_block() -> None:
                         "updated_at": "Обновлён",
                         "updated_by": "Кем",
                     }),
-                    use_container_width=True, hide_index=True, height=200)
+                    width='stretch', hide_index=True, height=200)
                 replace_plan = st.checkbox(
                     "🔄 Заменить план: удалить комплекты, которых "
                     "нет в загружаемой ведомости",
@@ -1608,27 +1635,46 @@ def _render_import_block() -> None:
                         "section": "Раздел",
                         "source_file": "Файл",
                     }),
-                    use_container_width=True, hide_index=True, height=200)
+                    width='stretch', hide_index=True, height=200)
                 if st.button("💾 Сохранить чертежи в план",
                              type="primary", key="plan_save_drawings"):
                     user = ensure_user()
                     if user:
                         try:
-                            # Названия комплектов из шапок регистров —
-                            # в план (пустые существующие поля заполняются).
-                            # Патч 12: шифры проходят нормализацию/валидацию
-                            # перед записью в plan_kits.
+                            # Патч 21.1: НЕ создавать новые комплекты
+                            # из файлов чертежей. Обновляем plan_kits
+                            # только для тех шифров, которые уже есть
+                            # в ведомости основных комплектов.
+                            with get_conn() as conn:
+                                existing_codes = {
+                                    r["code"] for r in
+                                    conn.execute(
+                                        "SELECT code FROM plan_kits"
+                                    )
+                                }
+                            filtered_kits = {
+                                c: n for c, n in drawings_kits.items()
+                                if c in existing_codes
+                            }
+                            # Фильтруем чертежи: только для существующих комплектов
+                            drawings_rows = [
+                                r for r in drawings_rows
+                                if r["kit_code"] in existing_codes
+                            ]
                             stub_rows, stub_warns = _norm_kit_rows(
                                 [{"code": c, "name": n} for c, n
-                                 in drawings_kits.items()])
+                                 in filtered_kits.items()])
                             for w in stub_warns:
                                 st.warning(w)
                             if stub_rows:
                                 upsert_plan_kits(stub_rows, user)
                             n = replace_plan_drawings_for_kits(drawings_rows, user)
                             n_kits = len({r["kit_code"] for r in drawings_rows})
-                            st.success(f"✅ Сохранено листов: {n} "
-                                       f"({n_kits} компл.)")
+                            skipped = len(drawings_kits) - len(filtered_kits)
+                            msg = f"✅ Сохранено листов: {n} ({n_kits} компл.)"
+                            if skipped:
+                                msg += f" · пропущено новых комплектов: {skipped}"
+                            st.success(msg)
                             files_str = ", ".join(f.name for f in up_drawings)
                             log_event("plan_import",
                                       f"Ведомости чертежей: {n} листов; "
@@ -1746,7 +1792,7 @@ def _render_import_log() -> None:
             return
         st.dataframe(
             pd.DataFrame(data),
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
             height=min(max(len(data) * 36 + 40, 200), 420),
             column_config={
                 "Дата (МСК)": st.column_config.TextColumn(width="medium"),

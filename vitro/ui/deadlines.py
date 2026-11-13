@@ -405,7 +405,7 @@ def _pie_with_legend(data: pd.DataFrame,
         margin=dict(l=5, r=5, t=5, b=5),
         height=260,
     )
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    st.plotly_chart(fig, width='stretch', key=key)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +653,7 @@ def render():
 
     st.dataframe(
         table.head(500),
-        use_container_width=True, hide_index=True, height=600,
+        width='stretch', hide_index=True, height=600,
         column_config={
             "ID": st.column_config.NumberColumn(width="small"),
             "Комплект": st.column_config.TextColumn(width="medium"),

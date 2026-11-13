@@ -88,7 +88,7 @@ def download_plotly(fig, filename_base: str, key_suffix: str,
         file_name=f"{filename_base}.png",
         mime="image/png",
         key=key_suffix,
-        use_container_width=True,
+        width='stretch',
     )
 
 

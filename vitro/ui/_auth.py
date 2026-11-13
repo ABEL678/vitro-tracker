@@ -34,7 +34,7 @@ def ask_user_name_dialog():
 
     with col1:
         if st.button("💾 Сохранить", type="primary",
-                     use_container_width=True,
+                     width='stretch',
                      key="dialog_save_btn"):
             if name.strip():
                 st.session_state["user"] = name.strip()
@@ -44,7 +44,7 @@ def ask_user_name_dialog():
                 st.error("Введите имя")
 
     with col2:
-        if st.button("Отмена", use_container_width=True,
+        if st.button("Отмена", width='stretch',
                      key="dialog_cancel_btn"):
             st.session_state["user"] = ""
             st.session_state["user_confirmed"] = False

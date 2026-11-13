@@ -327,7 +327,7 @@ def render():
 
     st.dataframe(
         table_df,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=600,
         column_config={
@@ -352,7 +352,7 @@ def render():
     st.divider()
     c1, c2 = st.columns([1, 3])
     with c1:
-        if st.button("📥 Подготовить выгрузку", use_container_width=True,
+        if st.button("📥 Подготовить выгрузку", width='stretch',
                      key="search_prepare_export"):
             xlsx_bytes = _export_to_excel(df, query)
             st.session_state["search_export_bytes"] = xlsx_bytes
@@ -370,7 +370,7 @@ def render():
                     "search_export_filename", "search.xlsx"),
                 mime=("application/vnd.openxmlformats-officedocument"
                       ".spreadsheetml.sheet"),
-                use_container_width=True,
+                width='stretch',
                 key="search_download_export",
             )
 
