@@ -1614,21 +1614,40 @@ def _render_import_block() -> None:
                     user = ensure_user()
                     if user:
                         try:
-                            # Названия комплектов из шапок регистров —
-                            # в план (пустые существующие поля заполняются).
-                            # Патч 12: шифры проходят нормализацию/валидацию
-                            # перед записью в plan_kits.
+                            # Патч 21.1: НЕ создавать новые комплекты
+                            # из файлов чертежей. Обновляем plan_kits
+                            # только для тех шифров, которые уже есть
+                            # в ведомости основных комплектов.
+                            with get_conn() as conn:
+                                existing_codes = {
+                                    r["code"] for r in
+                                    conn.execute(
+                                        "SELECT code FROM plan_kits"
+                                    )
+                                }
+                            filtered_kits = {
+                                c: n for c, n in drawings_kits.items()
+                                if c in existing_codes
+                            }
+                            # Фильтруем чертежи: только для существующих комплектов
+                            drawings_rows = [
+                                r for r in drawings_rows
+                                if r["kit_code"] in existing_codes
+                            ]
                             stub_rows, stub_warns = _norm_kit_rows(
                                 [{"code": c, "name": n} for c, n
-                                 in drawings_kits.items()])
+                                 in filtered_kits.items()])
                             for w in stub_warns:
                                 st.warning(w)
                             if stub_rows:
                                 upsert_plan_kits(stub_rows, user)
                             n = replace_plan_drawings_for_kits(drawings_rows, user)
                             n_kits = len({r["kit_code"] for r in drawings_rows})
-                            st.success(f"✅ Сохранено листов: {n} "
-                                       f"({n_kits} компл.)")
+                            skipped = len(drawings_kits) - len(filtered_kits)
+                            msg = f"✅ Сохранено листов: {n} ({n_kits} компл.)"
+                            if skipped:
+                                msg += f" · пропущено новых комплектов: {skipped}"
+                            st.success(msg)
                             files_str = ", ".join(f.name for f in up_drawings)
                             log_event("plan_import",
                                       f"Ведомости чертежей: {n} листов; "
