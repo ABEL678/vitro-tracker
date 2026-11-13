@@ -15,6 +15,7 @@
 import io
 from datetime import datetime
 
+import openpyxl
 import pandas as pd
 import streamlit as st
 
@@ -1074,7 +1075,8 @@ def _render_kit_status_update():
 
     Пользователь загружает Excel с перечнем комплектов — для каждого
     шифра подставляется статус комплекта по актуальным листам Витро;
-    предпросмотр — первые 10 строк, выгрузка — обновлённый Excel.
+    предпросмотр — первые 10 строк, выгрузка — обновлённый Excel
+    (через openpyxl, сохраняя исходное форматирование).
     """
     st.markdown("### 🔄 Обновить статусы комплектов")
     st.caption(
@@ -1122,6 +1124,7 @@ def _render_kit_status_update():
 
     st.info(f"Найден лист «{sheet_name}» с колонкой «{col}».")
 
+    # --- Предпросмотр через pandas ---
     statuses = _load_all_kit_statuses()
     result = _apply_kit_statuses(df, col, statuses)
 
@@ -1140,16 +1143,139 @@ def _render_kit_status_update():
     if len(result) > 10:
         st.caption("Показаны первые 10 строк. В выгрузку попадут все.")
 
+    # --- Выгрузка через openpyxl (сохраняет форматирование) ---
     st.divider()
     st.download_button(
         "📥 Скачать обновлённый Excel",
-        data=_df_to_xlsx(result, "Комплекты"),
-        file_name=f"Комплекты_со_статусами_{datetime.now():%Y%m%d}.xlsx",
+        data=_xlsx_add_kit_status(
+            uploaded, sheet_name, col, statuses, KIT_STATUS_COL
+        ),
+        file_name=f"{_extract_filename(uploaded)}_статусы_{datetime.now():%Y%m%d}.xlsx",
         mime=("application/vnd.openxmlformats-officedocument"
               ".spreadsheetml.sheet"),
         use_container_width=True,
         key="dl_kit_status_xlsx",
     )
+
+
+def _extract_filename(uploaded_file) -> str:
+    """Извлечь имя файла без расширения (патч 21.3)."""
+    name = uploaded_file.name
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    return name
+
+
+def _xlsx_add_kit_status(
+    uploaded_file,
+    sheet_name: str,
+    kit_col: str,
+    statuses: dict,
+    status_col_name: str,
+) -> bytes:
+    """Добавить колонку «Статус комплекта» в исходный Excel через openpyxl.
+
+    Сохраняет все цвета, ширины, формулы, объединения — модифицирует
+    только добавленную колонку. Возвращает байты для скачивания.
+    """
+    wb = openpyxl.load_workbook(uploaded_file, read_only=False,
+                                keep_vba=False)
+    ws = wb[sheet_name]
+
+    # Находим номер колонки шифров по заголовку
+    kit_col_letter = None
+    header_row_idx = None
+    for cell_row in ws.iter_rows(min_row=1, max_row=50, max_col=ws.max_column):
+        for cell in cell_row:
+            if cell.value is not None and str(cell.value).replace("\xa0", " ").strip():
+                norm = _norm_header(str(cell.value))
+                for want in _KIT_CODE_HEADERS:
+                    if norm == want:
+                        kit_col_letter = cell.column_letter
+                        header_row_idx = cell.row
+                        break
+                if kit_col_letter:
+                    break
+            if kit_col_letter:
+                break
+        if kit_col_letter:
+            break
+
+    if kit_col_letter is None:
+        # Fallback: используем имя колонки из pandas
+        for cell in ws[1]:
+            if cell.value and str(cell.value) == kit_col:
+                kit_col_letter = cell.column_letter
+                header_row_idx = cell.row
+                break
+
+    if kit_col_letter is None:
+        # Не нашли — fallback к pandas
+        return _df_to_xlsx(
+            _apply_kit_statuses(
+                pd.read_excel(uploaded_file, sheet_name=sheet_name),
+                kit_col, statuses
+            ),
+            sheet_name[:31],
+        )
+
+    # Определяем последнюю заполненную строку на колонке шифров
+    last_row = 0
+    for cell in ws[col_letter_to_int(kit_col_letter)]:
+        if cell.value is not None:
+            last_row = cell.row
+
+    # Последняя заполненная колонка на header-строке
+    last_col = 0
+    for cell in ws[header_row_idx]:
+        if cell.value is not None:
+            last_col = cell.column
+
+    # Новая колонка для статуса
+    new_col = last_col + 1
+    new_col_letter = _int_to_column_letter(new_col)
+
+    # Пишем заголовок
+    ws.cell(row=header_row_idx, column=new_col,
+            value=status_col_name)
+
+    # Батч-вычисление статусов для всех шифров в таблице
+    codes = []
+    for r in range(header_row_idx + 1, last_row + 1):
+        code_cell = ws.cell(row=r, column=ws[col_letter_to_int(kit_col_letter)])
+        codes.append(code_cell.value)
+
+    kit_statuses = get_kit_statuses(codes)
+
+    # Пишем статусы
+    for idx, code in enumerate(codes):
+        r = header_row_idx + 1 + idx
+        ws.cell(row=r, column=new_col,
+                value=kit_statuses.get(normalize_kit_code(code),
+                                       KIT_STATUS_NOT_LOADED))
+
+    # Сохраняем в буфер
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _int_to_column_letter(col_num: int) -> str:
+    """Преобразовать номер колонки Excel в буквенное обозначение."""
+    letter = ""
+    while col_num > 0:
+        col_num, remainder = divmod(col_num - 1, 26)
+        letter = chr(65 + remainder) + letter
+    return letter
+
+
+def col_letter_to_int(col_letter: str) -> int:
+    """Преобразовать буквенную обозначение колонки Excel в номер."""
+    result = 0
+    for ch in col_letter.upper():
+        result = result * 26 + (ord(ch) - ord("A") + 1)
+    return result
 
 
 # ---------------------------------------------------------------------------
