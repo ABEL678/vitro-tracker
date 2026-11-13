@@ -1006,6 +1006,31 @@ def _find_header_row_in_excel(uploaded_file) -> int:
     return 0  # fallback: первая строка
 
 
+def _find_kit_code_sheet(uploaded_file) -> tuple:
+    """Найти лист и колонку с шифрами комплектов (патч 21.2).
+
+    Файлы могут содержать несколько листов (например «Легенда от
+    Заказчика» без таблицы и «График РД» с данными). Функция читает
+    все листы и ищет тот, где есть колонка «Шифр РД» / «Шифр комплекта» /
+    «Комплект».
+
+    Возвращает (имя_листа, DataFrame, имя_колонки) или (None, None, None).
+    """
+    try:
+        sheets = pd.read_excel(uploaded_file, sheet_name=None)
+    except Exception:
+        return None, None, None
+
+    for sheet_name, df in sheets.items():
+        if df.empty:
+            continue
+        col = _find_kit_code_column(df)
+        if col is not None:
+            return sheet_name, df, col
+
+    return None, None, None
+
+
 def _render_kit_status_update():
     """Подвкладка «🔄 Обновить статусы» (патч 21).
 
@@ -1032,40 +1057,32 @@ def _render_kit_status_update():
         )
         return
 
-    # --- Поиск строки заголовков (патч 21.1) ---
-    header_row = _find_header_row_in_excel(uploaded)
+    # --- Поиск листа с таблицей (патч 21.2) ---
+    sheet_name, df, col = _find_kit_code_sheet(uploaded)
 
-    try:
-        df = pd.read_excel(uploaded, header=header_row)
-    except Exception:
-        st.error(
-            "Не удалось прочитать файл. Нужен Excel в формате .xlsx."
-        )
+    if sheet_name is None:
+        # Покажем список листов и заголовки для диагностики
+        try:
+            sheets = pd.read_excel(uploaded, sheet_name=None)
+            st.error(
+                "Не найдена колонка с шифрами ни на одном листе. "
+                "Ожидался заголовок «Шифр РД» (или «Шифр комплекта», «Комплект»)."
+            )
+            st.markdown("**Листы в файле:**")
+            for name, dframe in sheets.items():
+                hdrs = ", ".join(f"«{h}»" for h in dframe.columns[:10])
+                if len(dframe.columns) > 10:
+                    hdrs += " ..."
+                st.caption(f"• «{name}» ({len(dframe)} строк): {hdrs}")
+        except Exception:
+            st.error("Не удалось прочитать файл. Нужен Excel в формате .xlsx.")
         return
 
     if df.empty:
         st.warning("Файл прочитан, но таблица пуста.")
         return
 
-    col = _find_kit_code_column(df)
-    if col is None:
-        # Показываем первые 5 строк для диагностики
-        st.error(
-            "Не найдена колонка с шифрами. Ожидался заголовок "
-            "«Шифр РД» (или «Шифр комплекта», «Комплект»). "
-            "Заголовки в файле (строка " + str(header_row) + "): "
-            + ", ".join(f"«{h}»" for h in df.columns)
-        )
-        st.markdown("Первые 5 строк файла (без header):")
-        st.code(pd.read_excel(uploaded, header=None, nrows=5).to_string())
-    if col is None:
-        st.error(
-            "Не найдена колонка с шифрами. Ожидался заголовок "
-            "«Шифр РД» (или «Шифр комплекта», «Комплект»). "
-            "Заголовки в файле: "
-            + ", ".join(f"«{h}»" for h in df.columns)
-        )
-        return
+    st.info(f"Найден лист «{sheet_name}» с колонкой «{col}».")
 
     statuses = _load_all_kit_statuses()
     result = _apply_kit_statuses(df, col, statuses)
