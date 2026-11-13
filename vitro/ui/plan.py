@@ -1215,12 +1215,29 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
             if col not in df.columns:
                 df[col] = ""
 
-    # Дисциплина/раздел: значение строки листа, а если пусто — комплекта.
-    row_disc = df["dwg_discipline"].fillna("")
-    df["Дисциплина"] = row_disc.where(row_disc != "", df["kit_discipline"]
-                                      .fillna(""))
-    row_sect = df["dwg_section"].fillna("")
-    df["Раздел"] = row_sect.where(row_sect != "", df["kit_section"].fillna(""))
+    # Дисциплина/раздел: безопасное получение колонок
+    if "kit_discipline" in df.columns:
+        kit_disc = df["kit_discipline"].fillna("")
+    else:
+        kit_disc = pd.Series([""] * len(df), index=df.index)
+
+    if "kit_section" in df.columns:
+        kit_sect = df["kit_section"].fillna("")
+    else:
+        kit_sect = pd.Series([""] * len(df), index=df.index)
+
+    if "dwg_discipline" in df.columns:
+        row_disc = df["dwg_discipline"].fillna("")
+    else:
+        row_disc = pd.Series([""] * len(df), index=df.index)
+
+    if "dwg_section" in df.columns:
+        row_sect = df["dwg_section"].fillna("")
+    else:
+        row_sect = pd.Series([""] * len(df), index=df.index)
+
+    df["Дисциплина"] = row_disc.where(row_disc != "", kit_disc)
+    df["Раздел"] = row_sect.where(row_sect != "", kit_sect)
 
     # ---- Стандартные фильтры ----
     if flt["disc"]:
