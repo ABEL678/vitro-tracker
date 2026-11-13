@@ -90,6 +90,10 @@ sheet_number — отдельные листы (пример СМИК: 44, а н
 
 from datetime import date, datetime
 
+import io
+import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -532,6 +536,71 @@ def _save_due_dates(display_before: pd.DataFrame,
     return update_plan_due_dates(changes, user)
 
 
+# ---------------------------------------------------------------------------
+#  Экспорт сводного плана в Excel
+# ---------------------------------------------------------------------------
+_HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+_TOTAL_FILL = PatternFill("solid", fgColor="D9D9D9")
+_TOTAL_FONT = Font(bold=True, size=11)
+_THIN = Side(style="thin", color="B0B0B0")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_WRAP = Alignment(wrap_text=True, vertical="top")
+
+
+@st.cache_data(show_spinner=False)
+def _export_overview_excel(df: pd.DataFrame) -> bytes:
+    """Сводный план готовности → Excel с форматированием."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Сводный план"
+
+    headers = list(df.columns)
+    n_cols = len(headers)
+
+    # Заголовки
+    for j, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=j, value=h)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        cell.border = _BORDER
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+
+    # Данные
+    for i, row in enumerate(df.itertuples(index=False), start=2):
+        for j, v in enumerate(row, start=1):
+            cell = ws.cell(row=i, column=j, value=v)
+            cell.border = _BORDER
+            cell.alignment = _WRAP
+            # Подсветка служебных строк (группы и ИТОГО)
+            first_val = str(v).strip()
+            if first_val.startswith(_GROUP_MARK) or first_val == _TOTAL_MARK:
+                cell.font = _TOTAL_FONT
+                cell.fill = _TOTAL_FILL
+
+    # Ширина колонок: под содержимое (макс 60)
+    for j, h in enumerate(headers, start=1):
+        col_letter = get_column_letter(j)
+        max_w = max(
+            len(str(h)) + 2,
+            max(
+                (len(str(ws.cell(row=i, column=j).value or ""))
+                 for i in range(2, ws.max_row + 1)),
+                default=10,
+            ),
+        )
+        ws.column_dimensions[col_letter].width = min(max_w, 60)
+
+    # Заморозка заголовка и автофильтр
+    ws.freeze_panes = "A2"
+    if ws.max_row >= 2:
+        ws.auto_filter.ref = f"A1:{get_column_letter(n_cols)}{ws.max_row}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def _render_overview_table(overview_filtered: pd.DataFrame,
                            date_from=None, date_to=None) -> None:
     """Секция 4. «Сводный план готовности комплектов и количества
@@ -627,6 +696,18 @@ def _render_overview_table(overview_filtered: pd.DataFrame,
             f"Учтён период: **{_period_label(date_from, date_to)}** "
             "(по «Сроку готовности»)."
         )
+
+    # ---- Кнопка выгрузки в Excel ----
+    excel_bytes = _export_overview_excel(display_before)
+    st.download_button(
+        "📥 Выгрузить в Excel: Сводный план",
+        data=excel_bytes,
+        file_name=f"Сводный_план_{datetime.now():%Y%m%d_%H%M}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=False,
+        key="plan_overview_export",
+        help="Выгрузка сводного плана готовности в Excel с форматированием.",
+    )
 
 
 # ---------------------------------------------------------------------------
