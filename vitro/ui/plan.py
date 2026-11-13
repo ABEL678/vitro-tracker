@@ -1188,6 +1188,13 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
     if df_dwg.empty and df_vitro.empty:
         return pd.DataFrame(columns=SHEET_PLAN_COLUMNS)
 
+    if df_dwg.empty:
+        df = df_vitro
+    elif df_vitro.empty:
+        df = df_dwg
+    else:
+        df = pd.concat([df_dwg, df_vitro], ignore_index=True)
+
     # ---- 5. Безопасная инициализация всех колонок ----
     default_cols = [
         "due_date", "kit_discipline", "kit_section",
@@ -1197,13 +1204,6 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
     for col in default_cols:
         if col not in df.columns:
             df[col] = "" if col not in ("due_date", "planned_date") else None
-
-    if df_dwg.empty:
-        df = df_vitro
-    elif df_vitro.empty:
-        df = df_dwg
-    else:
-        df = pd.concat([df_dwg, df_vitro], ignore_index=True)
 
     # Для листов из Витро (без Ведомости) — заполняем поля
     if "_source" in df.columns:
