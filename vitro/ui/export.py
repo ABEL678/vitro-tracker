@@ -12,12 +12,12 @@
 Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
 """
 
-import copy
 import io
 from datetime import datetime
 
 import openpyxl
-from openpyxl.styles import Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import streamlit as st
 
@@ -1178,8 +1178,9 @@ def _xlsx_add_kit_status(
 ) -> bytes:
     """Добавить колонку «Статус комплекта» в исходный Excel через openpyxl.
 
-    Сохраняет все цвета, ширины, формулы, объединения — модифицирует
-    только добавленную колонку. Возвращает байты для скачивания.
+    Максимально простая реализация: находит строку заголовка «Шифр РД»,
+    добавляет колонку справа с заголовком и статусами. Стиль заголовка
+    — простой синий (без копирования с соседних ячеек).
     """
     wb = openpyxl.load_workbook(uploaded_file, read_only=False,
                                 keep_vba=False)
@@ -1205,14 +1206,6 @@ def _xlsx_add_kit_status(
             break
 
     if header_row_idx is None:
-        # Fallback: используем имя колонки из pandas
-        for col_num, cell in enumerate(ws[header_row_idx or 1], start=1):
-            if cell.value and str(cell.value) == kit_col:
-                header_row_idx = cell.row
-                kit_col_num = col_num
-                break
-
-    if header_row_idx is None:
         # Не нашли — fallback к pandas
         return _df_to_xlsx(
             _apply_kit_statuses(
@@ -1233,20 +1226,19 @@ def _xlsx_add_kit_status(
     # --- 3. Новая колонка для статуса ---
     new_col = max_col + 1
 
-    # --- 4. Копируем стиль заголовка с соседней ячейки ---
-    ref_cell = ws.cell(row=header_row_idx, column=max_col)
+    # --- 4. Заголовок с простым стилем (без копирования) ---
     header_cell = ws.cell(row=header_row_idx, column=new_col,
                           value=status_col_name)
-    if ref_cell.fill:
-        header_cell.fill = copy.copy(ref_cell.fill)
-    if ref_cell.font:
-        header_cell.font = copy.copy(ref_cell.font)
-    if ref_cell.border:
-        header_cell.border = copy.copy(ref_cell.border)
-    if ref_cell.alignment:
-        header_cell.alignment = copy.copy(ref_cell.alignment)
-    if ref_cell.number_format:
-        header_cell.number_format = ref_cell.number_format
+    header_cell.font = Font(bold=True, color="FFFFFF")
+    header_cell.fill = PatternFill("solid", fgColor="1F4E78")
+    header_cell.border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin"),
+    )
+    header_cell.alignment = Alignment(wrap_text=True, vertical="center")
+
+    # Ширина колонки — 16 символов (A/B/C/«План» помещаются)
+    ws.column_dimensions[get_column_letter(new_col)].width = 16
 
     # --- 5. Батч-вычисление статусов для всех шифров в таблице ---
     codes = []
@@ -1257,12 +1249,13 @@ def _xlsx_add_kit_status(
 
     kit_statuses = get_kit_statuses(codes)
 
-    # --- 6. Пишем статусы ---
+    # --- 6. Пишем статусы с выравниванием по центру ---
     for idx, code in enumerate(codes):
         r = header_row_idx + 1 + idx
-        ws.cell(row=r, column=new_col,
-                value=kit_statuses.get(normalize_kit_code(code),
-                                       KIT_STATUS_NOT_LOADED))
+        cell = ws.cell(row=r, column=new_col,
+                       value=kit_statuses.get(normalize_kit_code(code),
+                                              KIT_STATUS_NOT_LOADED))
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
     # --- 7. Сохраняем в буфер ---
     buf = io.BytesIO()
