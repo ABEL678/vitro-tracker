@@ -1188,6 +1188,16 @@ def _build_sheet_plan_table(overview_filtered: pd.DataFrame,
     if df_dwg.empty and df_vitro.empty:
         return pd.DataFrame(columns=SHEET_PLAN_COLUMNS)
 
+    # ---- 5. Безопасная инициализация всех колонок ----
+    default_cols = [
+        "due_date", "kit_discipline", "kit_section",
+        "dwg_discipline", "dwg_section",
+        "planned_date", "sheet_no", "status",
+    ]
+    for col in default_cols:
+        if col not in df.columns:
+            df[col] = "" if col not in ("due_date", "planned_date") else None
+
     if df_dwg.empty:
         df = df_vitro
     elif df_vitro.empty:
