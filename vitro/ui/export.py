@@ -980,6 +980,30 @@ def _apply_kit_statuses(df: pd.DataFrame, col: str,
     return out
 
 
+def _find_header_row_in_excel(uploaded_file) -> int:
+    """Найти строку заголовков в загруженном Excel (патч 21.1).
+
+    Файлы с шапкой проекта (например «График… 18.11.xlsx») имеют
+    заголовки таблицы не в строке 0, а в строке 7-9. Функция читает
+    первые 30 строк без header и ищет ту, где есть ячейка, содержащая
+    «шифр» / «комплект» (регистронезависимо).
+
+    Возвращает номер строки (0-based). Если не найдено — 0.
+    """
+    raw = pd.read_excel(uploaded_file, header=None, nrows=30)
+    target_patterns = ("шифр", "комплект")
+
+    for row_idx in range(len(raw)):
+        row_vals = raw.iloc[row_idx].astype(str)
+        for val in row_vals:
+            v = val.replace("\xa0", " ").lower()
+            for pat in target_patterns:
+                if pat in v:
+                    return row_idx
+
+    return 0  # fallback: первая строка
+
+
 def _render_kit_status_update():
     """Подвкладка «🔄 Обновить статусы» (патч 21).
 
@@ -1006,8 +1030,11 @@ def _render_kit_status_update():
         )
         return
 
+    # --- Поиск строки заголовков (патч 21.1) ---
+    header_row = _find_header_row_in_excel(uploaded)
+
     try:
-        df = pd.read_excel(uploaded)
+        df = pd.read_excel(uploaded, header=header_row)
     except Exception:
         st.error(
             "Не удалось прочитать файл. Нужен Excel в формате .xlsx."
@@ -1019,6 +1046,16 @@ def _render_kit_status_update():
         return
 
     col = _find_kit_code_column(df)
+    if col is None:
+        # Показываем первые 5 строк для диагностики
+        st.error(
+            "Не найдена колонка с шифрами. Ожидался заголовок "
+            "«Шифр РД» (или «Шифр комплекта», «Комплект»). "
+            "Заголовки в файле (строка " + str(header_row) + "): "
+            + ", ".join(f"«{h}»" for h in df.columns)
+        )
+        st.markdown("Первые 5 строк файла (без header):")
+        st.code(pd.read_excel(uploaded, header=None, nrows=5).to_string())
     if col is None:
         st.error(
             "Не найдена колонка с шифрами. Ожидался заголовок "
