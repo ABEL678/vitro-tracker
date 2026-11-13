@@ -994,11 +994,13 @@ def _find_header_row_in_excel(uploaded_file) -> int:
     target_patterns = ("шифр", "комплект")
 
     for row_idx in range(len(raw)):
-        row_vals = raw.iloc[row_idx].astype(str)
-        for val in row_vals:
-            v = val.replace("\xa0", " ").lower()
+        for val in raw.iloc[row_idx].tolist():
+            # Пустые ячейки (NaN) → пропускаем
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            s = str(val).replace("\xa0", " ").lower()
             for pat in target_patterns:
-                if pat in v:
+                if pat in s:
                     return row_idx
 
     return 0  # fallback: первая строка
