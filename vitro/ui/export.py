@@ -16,6 +16,7 @@ import io
 from datetime import datetime
 
 import openpyxl
+from openpyxl.styles import Border, Font, PatternFill, Side
 import pandas as pd
 import streamlit as st
 
@@ -1134,6 +1135,7 @@ def _render_kit_status_update():
         f"Строк: {len(result)}, из них в Витро: {n_found}."
     )
 
+    result = result.astype(str)
     st.dataframe(
         result.head(10).astype(str),
         width='stretch',
@@ -1220,14 +1222,16 @@ def _xlsx_add_kit_status(
         )
 
     # Определяем последнюю заполненную строку на колонке шифров
+    kit_col_num = ws[col_letter_to_int(kit_col_letter)]
     last_row = 0
-    for cell in ws[col_letter_to_int(kit_col_letter)]:
-        if cell.value is not None:
+    for cell in kit_col_num:
+        if cell.value is not None and not pd.isna(cell.value):
             last_row = cell.row
 
-    # Последняя заполненная колонка на header-строке
+    # Определяем последнюю заполненную колонку на header-строке
+    header_row = ws[header_row_idx]
     last_col = 0
-    for cell in ws[header_row_idx]:
+    for cell in header_row:
         if cell.value is not None:
             last_col = cell.column
 
@@ -1235,15 +1239,33 @@ def _xlsx_add_kit_status(
     new_col = last_col + 1
     new_col_letter = _int_to_column_letter(new_col)
 
+    # --- Копируем стиль заголовка с соседней ячейки ---
+    ref_cell = ws.cell(row=header_row_idx, column=last_col)
+    style = None
+    if ref_cell.fill or ref_cell.font or ref_cell.border:
+        style = openpyxl.styles.Style(
+            fill=ref_cell.fill,
+            font=ref_cell.font,
+            border=ref_cell.border,
+            alignment=ref_cell.alignment,
+        )
+
     # Пишем заголовок
-    ws.cell(row=header_row_idx, column=new_col,
-            value=status_col_name)
+    header_cell = ws.cell(row=header_row_idx, column=new_col,
+                          value=status_col_name)
+    if style:
+        header_cell.fill = style.fill
+        header_cell.font = style.font
+        header_cell.border = style.border
+        header_cell.alignment = style.alignment
 
     # Батч-вычисление статусов для всех шифров в таблице
     codes = []
     for r in range(header_row_idx + 1, last_row + 1):
-        code_cell = ws.cell(row=r, column=ws[col_letter_to_int(kit_col_letter)])
-        codes.append(code_cell.value)
+        code_cell = ws.cell(row=r, column=kit_col_num)
+        val = code_cell.value
+        if val is not None and not pd.isna(val):
+            codes.append(val)
 
     kit_statuses = get_kit_statuses(codes)
 
