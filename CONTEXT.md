@@ -10,8 +10,7 @@
 
 - **Python 3.14**
 - **Streamlit 1.64** (ленивая загрузка вкладок через radio)
-- **SQLite** (`data/vitro.db`, ~35 МБ, ~68 000 замечаний)
-- **Plotly 7.1** (все графики — с `key=`, иначе DuplicateElementId)
+- **SQLite** (`data/vitro.db`, ~35 МБ, ~68 000 замечаний)- **Plotly 7.1** (все графики — с `key=`, иначе DuplicateElementId)
 - **pandas 3.0**, **openpyxl 3.1**, **reportlab 5.0**
 - **Git** + приватный GitHub: https://github.com/ABEL678/vitro-tracker
 
@@ -37,43 +36,56 @@ streamlit run app.py
 git status
 git add -A
 git commit -m "..."
-git push origin feature/analytics-rework
+git push origin release/1.5-plan
 ```
 
 ## Структура проекта
 
 ```
 Vitro_tracker/
-├── app.py                     # Главный Streamlit (8 вкладок)
+├── app.py                     # Главный Streamlit (9 вкладок, План выдачи — первая)
 ├── sync_runner.py             # Синхронизация по расписанию
 ├── requirements.txt
 ├── .env                       # НЕ в git
 ├── data/vitro.db              # НЕ в git
 ├── assets/logo.png
-├── scripts/check.py           # Диагностика
+├── AGENTS.md                  # Инструкции для AI-агентов
+├── CONTEXT.md                 # Этот файл
+├── HANDOFF.md                 # Передача смены
+├── README.md
+├── patches/                   # Патчи по релизам (release_1.5/…)
+├── scripts/                   # Диагностика + регресс-тесты патчей
+│   ├── check.py
+│   ├── test_patch21.py
+│   ├── test_patch22.py
+│   └── test_patch22_3.py
 └── vitro/
     ├── config.py              # .env + переменные (APP_VERSION)
     ├── disciplines.py         # Справочник дисциплин
     ├── sharepoint.py          # Загрузка из Витрокад
-    ├── sqlite_db.py           # Работа с БД
+    ├── sqlite_db.py           # Работа с БД (+ plan_kits, plan_drawings)
+    ├── plan_xlsx.py           # Шаблоны/парсеры/выгрузка ведомостей плана
     ├── sync.py                # Логика синхронизации
     ├── workdays.py            # Производственный календарь РФ
     ├── text_utils.py          # clean_leaf_key, normalize_homoglyphs
     ├── time_utils.py          # Время UTC → МСК
+    ├── _cache.py              # versioned_cache (TTL + PRAGMA data_version)
     ├── xlsx_builder.py        # Генерация XLSX
     ├── pdf_builder.py         # Генерация PDF
+    ├── sheets.py              # Листы + статусы/ревизии комплектов
     └── ui/
         ├── _auth.py           # Авторизация по требованию
-        ├── _filters.py        # Общие фильтры (статусы, марка)
+        ├── _filters.py        # ОБЩИЕ ФИЛЬТРЫ (единый стандарт + справочники)
         ├── _urls.py           # Ссылки на Витро
         ├── _utils.py          # download_plotly (только для Экспорта)
         ├── summary.py         # Сводка по проекту
         ├── dynamics.py        # Динамика (потоки по месяцам)
         ├── authors.py         # Авторы замечаний
         ├── deadlines.py       # Сроки + единый источник
+        ├── plan.py            # План выдачи комплектов
         ├── categories.py      # Категории (ручная разметка)
         ├── search.py          # Поиск по тексту
-        ├── export.py          # Экспорт
+        ├── export.py          # Экспорт (+ «Обновить статусы»)
         └── admin.py           # Управление + Логи
 ```
 
@@ -101,6 +113,7 @@ Vitro_tracker/
 ### 3. Кэш
 
 `@st.cache_data(ttl=3600, show_spinner=False)` — для загрузчиков.
+`@versioned_cache(ttl)` (`vitro/_cache.py`) — кэш, сбрасываемый по `PRAGMA data_version` при изменении БД (синхронизация, правки категорий). Используется в `export.py`, `summary.py`, `deadlines.py`.
 `ttl=600` — для справочников (дисциплины, разделы, комплекты).
 **Никаких `st.cache_data.clear()` в кнопках «Обновить»** (кроме `admin.py`).
 
@@ -178,6 +191,28 @@ Vitro_tracker/
 - Диалог показывается через `ensure_user()` ТОЛЬКО при сохранении.
 - Если пользователь отменил — `ensure_user()` возвращает `None`, сохранение прерывается.
 
+#### «Экспорт» → «🔄 Обновить статусы» (патчи 21/22)
+
+Не строит отчёт с нуля — **дописывает колонки в чужой Excel**.
+
+- Вход: `.xlsx` с колонкой шифров («Шифр РД» / «Шифр комплекта» / «Комплект»; лист и строка шапки определяются автоматически).
+- Выход: три колонки справа — «Статус комплекта», «Ревизия комплекта», «Дата ревизии».
+- Логика значений — `vitro/sheets.py`: `get_kit_statuses()` (худший из A/B/C по листам) и `get_kit_revision_info()` (максимальная ревизия, крайняя дата ДД.ММ.ГГГГ).
+- Код выгрузки — `vitro/ui/export.py`: `_xlsx_add_kit_status` → `_styled_upload_to_xlsx` (правка файла) или `_styled_df_to_xlsx` (сборка с нуля).
+
+**Полоса «База актуальна на …»** — строка **прямо над шапкой таблицы** (`strip_row = header_row_idx`, затем `ws.insert_rows`). Титульные строки бланка выше шапки НЕ сдвигаются. Заливка `E8F0F8` + рамка `#808080` по всей ширине; ТЕКСТ объединён ровно над шапками трёх kit-колонок (`col_status..col_date`), жирный, по центру, высота 22.
+
+Автофильтр — `A{шапка}:{последняя}{последняя строка данных}`; полоса в него не входит; без данных не ставится.
+
+**Два обязательных фикса против «Ошибки в части содержимого»** (работают только вместе):
+
+1. **ListObject:** таблицы снимаются с целевого листа до правок (`del ws.tables[name]`), иначе `table.ref` остаётся старым → Excel удаляет `table1.xml`.
+2. **Merge:** диапазоны снимаются ДО `insert_rows` и возвращаются ПОСЛЕ через `range_boundaries`: ниже полосы — сдвиг +1, выше — без сдвига, накрывающий место вставки — расширение вниз.
+
+Тесты: `scripts/test_patch22.py` (73, режим DataFrame) и `scripts/test_patch22_3.py` (61, правка файла).
+
+⚠️ Применение патчей: `git checkout <base> -- vitro/sheets.py vitro/ui/export.py`, затем удалить тестовые файлы, затем `git apply`. Команда «в лоб» с `scripts/test_patch22.py` падает — в базовых коммитах его нет.
+
 ### 5. Терминология в UI
 
 - «мы» / «наше» → **«АТП ТЛП»**
@@ -221,22 +256,28 @@ Vitro_tracker/
 2. **Вкладки работают** — 9 штук.
 3. **Никаких traceback** в терминале.
 4. **Цифры сходятся** — Сводка / Сроки / Авторы / Категории / Динамика.
+5. **«План выдачи»** — загрузка ведомостей, правка срока, выгрузка Excel.
+6. **«Экспорт» → «Обновить статусы»** — выгрузка открывается в Excel без диалога восстановления.
+7. **Регресс-тесты** — `scripts/test_patch22.py` и `scripts/test_patch22_3.py`, оба `EXIT=0`.
 
 ## Безопасность
 
 - **`.env`** — НЕ в git.
 - **`data/vitro.db`** — НЕ в git.
 - **Пароли, токены** — только в `.env`.
+- **TLS-проверка Витро** — включена по умолчанию (`VITRO_VERIFY_SSL=true`).
+- **`showErrorDetails = false`** — traceback не виден пользователям.
 - **`_utils.py` → `download_plotly`** — только для будущего Экспорта.
 
 ## Что можно трогать
 
 - **`vitro/ui/`** — вкладки.
 - **`vitro/ui/_filters.py`**, **`_urls.py`**, **`_auth.py`** — общие модули.
+- **`vitro/sheets.py`** — листы, статусы и ревизии комплектов.
 - **`vitro/time_utils.py`** — утилиты времени.
 - **`vitro/text_utils.py`**, **`vitro/workdays.py`** — утилиты.
 - **`vitro/config.py`** — константы (в т.ч. `APP_VERSION`).
-- **`scripts/`** — диагностика.
+- **`scripts/`** — диагностика и регресс-тесты.
 
 ## Что НЕЛЬЗЯ трогать без явной просьбы
 
@@ -245,10 +286,3 @@ Vitro_tracker/
 - **`vitro/sqlite_db.py`** — работа с БД.
 - **`sync_runner.py`** — планировщик.
 - **`.env`**, **`data/vitro.db`**.
-
-## Проверка после правки
-
-1. **Приложение открывается** — `streamlit run app.py`.
-2. **Вкладки работают** — 8 штук.
-3. **Никаких traceback** в терминале.
-4. **Цифры сходятся** — Сводка / Сроки / Авторы / Категории / Динамика.

@@ -4,74 +4,103 @@
 
 ### Последняя работа
 
-**Ветка:** `release/1.4-plan`
-**Последний коммит:** 0a53529 (после патча 17)
+**Ветка:** `release/1.5-plan`
+**Последний коммит:** `a06483f` — патч 22.4 v4 (полоса даты в выгрузке Excel)
 
-**Документация обновлена** после серии из 17 задач (см. ниже).
+**Документация обновлена** после серии патчей 21 → 22.4 (см. ниже).
 
-### Что сделано за последние заходы
+### Что сделано в релизе 1.5
 
-1. **Единый источник листов** — `vitro/sheets.py` → `unique_vitro_sheets(rows)`, 11 312 уникальных листов.
-2. **Вкладка «План выдачи»** — 424 комплекта, ведомости Excel, бублики «всего/план», детальная таблица.
+1. **Патч 21 — «Статус комплекта»** во внешнем Excel: `vitro/sheets.py` → `get_kit_status()` / `get_kit_statuses()`. Правило: худший статус из A/B/C по уникальным листам комплекта; нет в Витро → «План (не загружен)».
+2. **Патч 22 — «Ревизия комплекта» и «Дата ревизии»**: `get_kit_revision_info()` в `vitro/sheets.py`, `_apply_kit_statuses(..., rev_info)` в `export.py`. Ревизия — максимальная с числовым сравнением (`_rev_key`: «2.0» < «10.0»), дата — крайняя выгрузка в ДД.ММ.ГГГГ (`_format_rev_date`).
+3. **Патч 22.2/22.3 — защита от «Ошибки в части содержимого»**: снятие Excel-таблиц (ListObject) с целевого листа; снятие и возврат merge-диапазонов при вставке строки.
+4. **Патч 22.4 — геометрия полосы**: строка «База актуальна на …» вставляется **прямо над шапкой таблицы**, а не в строку 1 листа. Титульные строки бланка не сдвигаются. Текст объединён ровно над шапками трёх kit-колонок.
+5. **Из 5d465a4 сохранено**: словарь `{строка: шифр}` — пустые строки внутри данных не сдвигают kit-значения вверх; `last_row = header_row_idx` — пустая таблица не даёт отрицательных диапазонов.
+
+### История релиза 1.4
+
+1. **Единый источник листов** — `vitro/sheets.py` → `unique_vitro_sheets(rows)`.
+2. **Вкладка «План выдачи»** — ведомости Excel, бублики «всего/план», детальная таблица.
 3. **Единые фильтры** — `vitro/ui/_filters.py` → `render_standard_filters()` во всех вкладках.
-4. **SLA в «Динамике»** — блок «Соблюдение сроков» (≤10 р.д., 10–30 р.д., >30 р.д.), топ-5 проблемных комплектов.
-5. **Патч 17**: сходимость "Выполнено" со Сводкой (исключены листы A и аннулированные), редизайн Динамики (7 плиток, удаление SLA и разрезов), новые метрики листов A/B, редизайн Плана выдачи (бублики как в Сводке, колонки Дисциплина/Раздел, перенос вводных вниз).
-6. **Второй ряд фильтров в Сводке** — «Статус замечания» (5 сырых) + «Статус листа» (8 групп). DISPLAY_LIMIT убран — все строки разреза видны.
-2. **Ссылки на Витро** — колонка «Витро» в трёх местах (Авторы drilldown, Сроки список, Поиск результаты). URL: `https://pdm-lakhta.ru/okhta/_layouts/15/Vitro/Viewer/PDF/web/Viewer.aspx?Id={guid}&version={v}&noteId={id}`.
-3. **Рефакторинг `_filters.py`** — вынос общих фильтров (статусы листов, статусы замечаний, марка комплекта).
-4. **`_urls.py`** — хелперы для URL Витро.
-5. **`_auth.py`** — авторизация по требованию (диалог только при сохранении).
-6. **Фильтр «Статус листа» в Поиске** — 8 групп.
-7. **Фильтр «Статус листа» в Авторах** — прокинут во все функции аналитики.
-8. **Фильтр «Статус замечания» в Авторах** — 4 статуса (без «Выполнено»).
-9. **Фильтр «Марка комплекта» (блок 2 шифра)** во всех 5 вкладках (Сводка, Сроки, Авторы, Категории, Поиск) — строгое совпадение.
-10. **Авторизация + версия** — диалог ввода имени только при сохранении, версия приложения в футере.
-11. **Часовой пояс МСК** — все timestamp из БД показываются в МСК (+3), `vitro/time_utils.py`.
+4. **Патч 17**: сходимость «Выполнено» со Сводкой, редизайн Динамики, метрики листов A/B.
+5. **Второй ряд фильтров** — «Статус замечания» + «Статус листа» (8 групп).
+6. **Ссылки на Витро** — колонка «Витро» в трёх местах (Авторы, Сроки, Поиск).
+7. **`_urls.py` / `_auth.py`** — URL Витро и авторизация по требованию.
+8. **Фильтр «Марка комплекта»** во всех вкладках — строгое совпадение 2-го блока шифра.
+9. **Версия приложения** в футере (`APP_VERSION` в `vitro/config.py`).
+10. **Часовой пояс МСК** — `vitro/time_utils.py`.
 
-### Последние коммиты (main)
+### Последние коммиты (release/1.5-plan)
 
 ```
-0a53529 feat(dynamics,plan): patch 17 — converge Выполнено with Summary, A/B sheet metrics, Summary-style donuts, layout cleanup
-27d3391 add patch17_dynamics_plan.patch for next application
-e18cbcf fix(dynamics,export): separate 'Выполнено' and 'Закрыто заказчиком', drop 'Наши ответы' (patch 16)
-dd2ef51 docs: update CONTEXT.md, HANDOFF.md, README.md after patches 1-15
-dfb2666 fix: apply patch15 — period sync, plan 424, summary arithmetic
-2ed75ab fix(time): show UTC timestamps in MSK (+3) across all tabs
-8079662 feat(auth): on-demand user dialog + version in footer
-140da6f feat(categories,search): add marka (block 2) filter — strict match
-e6b4f04 feat(deadlines,authors): add marka (block 2) filter — strict match
-7f8134f feat(summary): add marka (block 2) filter — strict match
-691d8d8 feat(search): add direct links to Vitro comments in results
-66969aa refactor(filters): move REMARK_STATUS_OPTIONS to _filters.py
-a1764e7 feat(urls): extract build_vitro_comment_url to _urls.py + add links to authors and deadlines
-3dbb23f feat(authors): add direct links to Vitro comments in drilldown
-fbcc92a feat(sync): add vitro_guid and vitro_version to documents
-7c8ff69 feat(authors): add sheet status filter to analytics tab
-be860af feat(search): add sheet status filter
-43f4105 refactor(ui): extract sheet-status filters to _filters.py
-8f74804 docs(readme): add filters section + terminology rows
-c14a6bd docs(agents): describe 2nd row filters in Summary
-20c4e28 docs(handoff): update after 97dc07b — 2nd row filters
-97dc07b fix(summary): filter Section 1 by sheet status + show all rows (no DISPLAY_LIMIT)
-765c70d docs: add HANDOFF.md for AI agent handoff
-ce612c1 fix(summary): fixed column widths and freeze header
-62e06d3 fix(summary): replace all len(display_df) with display_count
+a06483f feat(export): patch 22.4 v4 - date strip directly above table header, title rows unsifted
+62940f9 feat(export): patch 22.4 - date strip above header, text over kit columns
+1f3fe00 fix(export): restore date strip above header, drop ListObjects and re-anchor merges
+5d465a4 fix(export): move date strip below table, drop insert_rows in kit status export
+3129ed7 feat(export): patch 22 - revision and revision date columns in Excel export
+c7c0f73 Merge branch 'release/1.5-plan' into main (release 1.5 final)
+5af8de9 fix(export): format kit status column — width, center alignment, fix duplicate return
+4897107 fix(export): rewrite _xlsx_add_kit_status — simple style, no copy.copy
+8252e90 Merge branch 'release/1.5-plan' into main (release 1.5)
+62389c5 release: 1.5 — GIS sync, Excel status column, plan fixes, UI improvements
 ```
 
 ### Файлы, которые НЕ пушить
 
 - `.env` — секреты
 - `data/vitro.db` — база данных
-- `COMMIT_MSG.txt` — временный файл для `git commit -F`
+- `COMMIT_MSG.txt` / `.commit_msg.txt` — временные файлы сообщений коммитов
+- `.merge_msg.txt` — временный файл сообщения merge
 - `.gigacode/` — файлы планов
 
 ## Критические детали
 
-### `vitro/sheets.py` — единый источник листов
+### `vitro/sheets.py` — единый источник листов + статусы/ревизии комплектов
 
 - `unique_vitro_sheets(rows)` — дедуп ревизий: последняя по `(complex, leaf)`.
 - `dedup_document_rows(rows)` — обёртка для pandas/списка.
-- Используется в: `dynamics.py` (_load_unique_documents), `summary.py`, `export.py`, `plan.py`.
+- `normalize_kit_code(code)` — нормализация шифра: регистр, пробелы, латинские двойники → кириллица.
+- `is_valid_kit_code(code)` / `looks_like_rd_code(name)` — валидация шифров.
+- `sql_count_sheets(alias)` — SQL-выражение числа уникальных листов.
+- **Патч 21:** `get_kit_status(code)` / `get_kit_statuses(codes=None)` — статус комплекта `A`/`B`/`C`/«План (не загружен)». `codes=None` → все комплекты базы, один проход по БД.
+- **Патч 22:** `get_kit_revision_info(codes=None)` → `{шифр: {"revision": …, "date": …}}`. Внутренние хелперы: `_rev_key()` (числовое сравнение ревизий), `_format_rev_date()` (ISO → ДД.ММ.ГГГГ), `_kit_revision_from_rows()` (чистое ядро без БД). Листы — тот же `unique_vitro_sheets`, ревизия — максимум, дата — крайняя выгрузка. «И» / «АННУЛИРОВАНО» учитываются (информационные поля).
+- Используется в: `dynamics.py`, `summary.py`, `export.py`, `plan.py`.
+
+### `vitro/ui/export.py` — режим «Обновить статусы» (патчи 21/22)
+
+Константы: `KIT_STATUS_COL`, `KIT_REVISION_COL`, `KIT_REV_DATE_COL`.
+
+- `_xlsx_add_kit_status(source, sheet_name, kit_col, statuses, status_col_name, sync_ts)` — диспетчер по типу `source`: `pd.DataFrame` → `_styled_df_to_xlsx`, файл → `_styled_upload_to_xlsx`.
+- `_styled_df_to_xlsx(df, sheet_name, sync_ts)` — режим «с нуля» (тесты): строка 1 полоса, строка 2 шапка, данные с 3-й.
+- `_styled_upload_to_xlsx(...)` — правка **исходного** файла, форматирование сохраняется.
+- `_apply_kit_statuses(df, col, statuses, rev_info=None)` — дописывает kit-колонки в конец. Без `rev_info` работает по-старому (одна колонка, патч 21).
+- `_load_all_kit_statuses()` / `_load_all_kit_revision_info()` — `@versioned_cache(600)`, сбрасываются при синке.
+- `_kit_sync_caption(sync_ts)` — текст полосы; `sync_ts=None` → «База актуальна на —».
+- `_find_kit_code_sheet(uploaded)` / `_find_kit_code_column(df)` — поиск листа и колонки шифров.
+
+#### Геометрия полосы даты (финальная, патч 22.4 v4)
+
+- `strip_row = header_row_idx`, затем `ws.insert_rows(strip_row)` — полоса встаёт **прямо над шапкой**, титул бланка выше шапки не сдвигается.
+- Заливка `E8F0F8` + рамка `#808080` — на все ячейки полосы от колонки 1 до `col_date`; высота 22.
+- Текст — в `col_status` (первая kit-колонка), объединён `col_status..col_date` (ровно над шапками трёх kit-колонок), жирный, по центру. НЕ `A1:{last}1`.
+- Шапки kit-колонок — заливка `D9E1F2`, все ячейки таблицы — тонкие границы `#808080`, kit-колонки по центру.
+- Автофильтр — `A{header_row}:{last_letter}{last_row}`, то есть шапка + данные. Полоса в него не входит. Без данных → `auto_filter.ref = None`.
+
+#### Два источника «Ошибки в части содержимого» (обязательно оба фикса)
+
+1. **22.2 — ListObject.** `ws.insert_rows()` не сдвигает `table.ref`. Таблицы снимаются с целевого листа ДО правок: `for _t in list(ws.tables): del ws.tables[_t]`. Иначе Excel пишет «Удалено: автофильтр … /xl/tables/table1.xml». Таблицы других листов не трогаются.
+2. **22.3 — merge.** `openpyxl` не сдвигает merge при вставке строки. `src_merges` собираются и снимаются ДО `insert_rows`, возвращаются ПОСЛЕ через `range_boundaries`: `_r1 >= strip_row` → сдвиг обеих границ на +1; иначе если `_r2 >= strip_row` → расширение вниз (merge накрывал место вставки, как делает сам Excel); выше полосы — без изменений.
+
+⚠️ Оба фикса работают только вместе с `insert_rows`. Если убрать снятие таблиц — вернётся ошибка `table1.xml`; если убрать снятие merge — пересечение с полосой.
+
+⚠️ Не-анкерные ячейки merge (`J2`/`K2` при полосе `I2:K2`) в openpyxl остаются с `fill_type=None` — Excel рисует их заливкой анкера. Это ожидаемое поведение, не дефект.
+
+### Тесты патчей 21/22
+
+- `scripts/test_patch21.py` — статусы комплектов.
+- `scripts/test_patch22.py` — **73 проверки**, режим сборки из DataFrame.
+- `scripts/test_patch22_3.py` — **61 проверка**, режим правки загруженного файла: Excel-таблица, merge-заголовок, широкий баннер, пустая строка в данных, примечание под таблицей, пустая таблица, чужая таблица, титульные строки выше шапки.
+- Все тесты создают временную БД через `SQLITE_PATH` **до** импорта `vitro.sqlite_db` — реальная `data/vitro.db` не открывается.
 
 ### `vitro/ui/_filters.py` — общие фильтры
 
@@ -165,27 +194,36 @@ ce612c1 fix(summary): fixed column widths and freeze header
 
 ```
 Vitro_tracker/
-├── app.py                     # Главный Streamlit (8 вкладок)
+├── app.py                     # Главный Streamlit (9 вкладок, План выдачи — первая)
 ├── sync_runner.py             # Синхронизация по расписанию
 ├── requirements.txt
 ├── .env                       # НЕ в git
 ├── data/vitro.db              # НЕ в git
 ├── assets/logo.png
-├── scripts/check.py           # Диагностика
 ├── AGENTS.md                  # Инструкции для AI-агентов
 ├── CONTEXT.md                 # Для загрузки в AI-чаты
+├── HANDOFF.md                 # Этот файл
 ├── README.md
+├── patches/                   # Патчи по релизам (release_1.5/…)
+├── scripts/                   # Диагностика + регресс-тесты
+│   ├── check.py               # Диагностика
+│   ├── test_patch21.py        # Статусы комплектов
+│   ├── test_patch22.py        # Ревизии (режим DataFrame, 73 проверки)
+│   └── test_patch22_3.py      # Правка загруженного файла (61 проверка)
 └── vitro/
     ├── config.py              # .env + переменные (APP_VERSION)
     ├── disciplines.py         # Справочник дисциплин
     ├── sharepoint.py          # Загрузка из Витрокад
-    ├── sqlite_db.py           # Работа с БД
+    ├── sqlite_db.py           # Работа с БД (+ plan_kits, plan_drawings)
+    ├── plan_xlsx.py           # Шаблоны/парсеры/выгрузка ведомостей плана
     ├── sync.py                # Логика синхронизации
     ├── workdays.py            # Производственный календарь РФ
     ├── text_utils.py          # clean_leaf_key, normalize_homoglyphs
     ├── time_utils.py          # Время UTC → МСК
+    ├── _cache.py              # versioned_cache (TTL + PRAGMA data_version)
     ├── xlsx_builder.py        # Генерация XLSX
     ├── pdf_builder.py         # Генерация PDF
+    ├── sheets.py              # Листы + статусы/ревизии комплектов
     └── ui/
         ├── _auth.py           # Авторизация по требованию
         ├── _filters.py        # Общие фильтры (статусы, марка)
@@ -198,15 +236,14 @@ Vitro_tracker/
         ├── plan.py            # План выдачи комплектов
         ├── categories.py      # Категории (ручная разметка)
         ├── search.py          # Поиск по тексту
-        ├── export.py          # Экспорт
+        ├── export.py          # Экспорт (+ «Обновить статусы»)
         └── admin.py           # Управление + Логи
 ```
 
-## Патч 18 (в работе)
+## Патч 23 (планируется)
 
-- Светофор в KPI Динамики
-- Детализация бубликов замечаний по логике Сводки
-- Перенос вкладки План выдачи на 1-е место
+- Уточнение правил «Ревизия комплекта» по итогам обкатки на реальных перечнях.
+- Проверить открытие выгрузки в старых версиях Excel (2016 / LTSC).
 
 ## Команды
 
@@ -214,8 +251,24 @@ Vitro_tracker/
 streamlit run app.py
 .venv\Scripts\python.exe sync_runner.py
 .venv\Scripts\python.exe scripts\check.py
+.venv\Scripts\python.exe scripts\test_patch22.py
+.venv\Scripts\python.exe scripts\test_patch22_3.py
 git commit -F COMMIT_MSG.txt
 ```
+
+## Применение патчей (важно)
+
+Патчи лежат в `patches/release_1.5/`. Схема применения:
+
+```bash
+git checkout <base> -- vitro/sheets.py vitro/ui/export.py
+rm -f scripts/test_patch22.py scripts/test_patch22_3.py
+git apply patches/release_1.5/<patch>.patch
+```
+
+⚠️ Команда из шапки патча (`git checkout <base> -- … scripts/test_patch22.py`) падает целиком, потому что в базовых коммитах этого файла нет — патч создаёт его как `new file`. Разбивайте на два шага, как выше.
+
+⚠️ После `git checkout <base> -- <files>` индекс содержит базовые версии — перед коммитом нужен `git add -A`, иначе файлы уедут назад.
 
 ## Договорённости
 
