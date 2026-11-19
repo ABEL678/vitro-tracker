@@ -9,6 +9,12 @@
 комплектов (Excel) добавляется колонка «Статус комплекта» —
 логика в vitro/sheets.py (get_kit_status / get_kit_statuses).
 
+Патч 22: рядом со статусом добавляются «Ревизия комплекта» и
+«Дата ревизии» (get_kit_revision_info), а в строку 1 выгрузки —
+объединённая полоса «База актуальна на … (МСК)» с датой того же
+источника, что и полоса даты в шапке приложения
+(deadlines._load_last_sync_date).
+
 Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
 """
 
@@ -25,10 +31,12 @@ from vitro.sqlite_db import get_conn
 from vitro._cache import versioned_cache
 from vitro.sheets import (
     KIT_STATUS_NOT_LOADED,
+    get_kit_revision_info,
     get_kit_statuses,
     normalize_kit_code,
     unique_vitro_sheets,
 )
+from vitro.time_utils import fmt_msk
 from vitro.pdf_builder import build_pdf
 from vitro.ui._filters import render_standard_filters
 
@@ -918,9 +926,34 @@ def _render_analytics():
 
 
 # ---------------------------------------------------------------------------
-#  Секция 4: Обновить статусы комплектов (патч 21)
+#  Секция 4: Обновить статусы комплектов (патчи 21/22)
 # ---------------------------------------------------------------------------
 KIT_STATUS_COL = "Статус комплекта"
+KIT_REVISION_COL = "Ревизия комплекта"
+KIT_REV_DATE_COL = "Дата ревизии"
+
+# Стили патча 22 (согласованы): шапки трёх kit-колонок — светло-
+# голубая заливка D9E1F2; у всех ячеек таблицы тонкие границы
+# #808080; полоса «База актуальна на …» в строке 1 — заливка
+# #E8F0F8, как у полосы даты в шапке приложения
+# (app.py .date-bar).
+_KIT_HEADER_FILL = PatternFill("solid", fgColor="D9E1F2")
+_KIT_BORDER_SIDE = Side(style="thin", color="808080")
+_KIT_TABLE_BORDER = Border(left=_KIT_BORDER_SIDE,
+                           right=_KIT_BORDER_SIDE,
+                           top=_KIT_BORDER_SIDE,
+                           bottom=_KIT_BORDER_SIDE)
+_KIT_DATE_FILL = PatternFill("solid", fgColor="E8F0F8")
+
+
+def _kit_sync_caption(sync_ts) -> str:
+    """Текст полосы актуальности базы (патч 22).
+
+    Тот же источник даты, что и полоса в шапке приложения:
+    sync_ts — результат deadlines._load_last_sync_date(); без
+    синков fmt_msk вернёт «—» → «База актуальна на —».
+    """
+    return f"База актуальна на {fmt_msk(sync_ts, with_msk_label=True)}"
 
 # Заголовки колонки шифров в порядке приоритета (ТЗ патча 21);
 # сравнение — по канонической форме _norm_header
@@ -965,21 +998,49 @@ def _load_all_kit_statuses() -> dict:
     return get_kit_statuses()
 
 
-def _apply_kit_statuses(df: pd.DataFrame, col: str,
-                        statuses: dict) -> pd.DataFrame:
-    """Добавляет колонку «Статус комплекта» В КОНЕЦ таблицы (патч 21).
+@versioned_cache(600)
+def _load_all_kit_revision_info() -> dict:
+    """{шифр: {"revision": …, "date": …}} — один срез БД (патч 22).
+
+    sheets.get_kit_revision_info(None): тот же unique_vitro_sheets,
+    что и у статусов (последние ревизии листов, нормализация
+    шифров) — максимум ревизии по числовому сравнению и крайняя
+    дата выгрузки ДД.ММ.ГГГГ. versioned_cache — сброс при синке,
+    как у остальных загрузчиков вкладки.
+    """
+    return get_kit_revision_info()
+
+
+def _apply_kit_statuses(df: pd.DataFrame, col: str, statuses: dict,
+                        rev_info: dict | None = None) -> pd.DataFrame:
+    """Добавляет kit-колонки В КОНЕЦ таблицы (патчи 21/22).
 
     col — колонка шифров (результат _find_kit_code_column); шифры
     нормализуются перед сопоставлением со словарём статусов
     (латинские двойники, регистр, пробелы). Комплекта нет в Витро /
     пустой шифр → «План (не загружен)» (правило 2, согласовано).
     Исходный DataFrame не мутируется.
+
+    Патч 22: если передан rev_info (результат
+    _load_all_kit_revision_info), справа от статуса добавляются
+    «Ревизия комплекта» (максимум, как в Сводке) и «Дата ревизии»
+    (ДД.ММ.ГГГГ); комплекта нет в rev_info → пустые строки.
+    rev_info=None → только статус (обратная совместимость,
+    патч 21).
     """
     out = df.copy()
     out[KIT_STATUS_COL] = [
         statuses.get(normalize_kit_code(code), KIT_STATUS_NOT_LOADED)
         for code in out[col].tolist()
     ]
+    if rev_info is not None:
+        rev_rows = [
+            rev_info.get(normalize_kit_code(code), {})
+            for code in out[col].tolist()
+        ]
+        out[KIT_REVISION_COL] = [r.get("revision", "")
+                                 for r in rev_rows]
+        out[KIT_REV_DATE_COL] = [r.get("date", "") for r in rev_rows]
     return out
 
 
@@ -1073,18 +1134,21 @@ def _find_header_row_in_excel_for_sheet(uploaded_file, sheet_name: str) -> int:
 
 
 def _render_kit_status_update():
-    """Подвкладка «🔄 Обновить статусы» (патч 21).
+    """Подвкладка «🔄 Обновить статусы» (патчи 21/22).
 
     Пользователь загружает Excel с перечнем комплектов — для каждого
-    шифра подставляется статус комплекта по актуальным листам Витро;
-    предпросмотр — первые 10 строк, выгрузка — обновлённый Excel
-    (через openpyxl, сохраняя исходное форматирование).
+    шифра подставляются «Статус комплекта», «Ревизия комплекта» и
+    «Дата ревизии» по актуальным листам Витро; предпросмотр — первые
+    10 строк, выгрузка — обновлённый исходный Excel (через openpyxl,
+    сохраняя исходное форматирование) с полосой «База актуальна
+    на …» в строке 1.
     """
     st.markdown("### 🔄 Обновить статусы комплектов")
     st.caption(
         "Загрузите перечень комплектов (Excel) — для каждого шифра "
-        "подставится статус комплекта по листам Витро: «A» / «B» / "
-        "«C» / «План (не загружен)»."
+        "подставятся «Статус комплекта», «Ревизия комплекта» и "
+        "«Дата ревизии» по листам Витро: «A» / «B» / «C» / "
+        "«План (не загружен)»."
     )
 
     uploaded = st.file_uploader(
@@ -1128,11 +1192,13 @@ def _render_kit_status_update():
 
     # --- Предпросмотр через pandas ---
     statuses = _load_all_kit_statuses()
-    result = _apply_kit_statuses(df, col, statuses)
+    rev_info = _load_all_kit_revision_info()
+    result = _apply_kit_statuses(df, col, statuses, rev_info)
 
     n_found = int((result[KIT_STATUS_COL] != KIT_STATUS_NOT_LOADED).sum())
     st.success(
-        f"Колонка «{KIT_STATUS_COL}» добавлена (шифры — «{col}»). "
+        f"Колонки «{KIT_STATUS_COL}», «{KIT_REVISION_COL}», "
+        f"«{KIT_REV_DATE_COL}» добавлены (шифры — «{col}»). "
         f"Строк: {len(result)}, из них в Витро: {n_found}."
     )
 
@@ -1148,10 +1214,12 @@ def _render_kit_status_update():
 
     # --- Выгрузка через openpyxl (сохраняет форматирование) ---
     st.divider()
+    from vitro.ui.deadlines import _load_last_sync_date
     st.download_button(
         "📥 Скачать обновлённый Excel",
         data=_xlsx_add_kit_status(
-            uploaded, sheet_name, col, statuses, KIT_STATUS_COL
+            uploaded, sheet_name, col, statuses, KIT_STATUS_COL,
+            sync_ts=_load_last_sync_date(),
         ),
         file_name=f"{_extract_filename(uploaded)}_статусы_{datetime.now():%Y%m%d}.xlsx",
         mime=("application/vnd.openxmlformats-officedocument"
@@ -1170,17 +1238,141 @@ def _extract_filename(uploaded_file) -> str:
 
 
 def _xlsx_add_kit_status(
+    source,
+    sheet_name: str = "Комплекты",
+    kit_col: str | None = None,
+    statuses: dict | None = None,
+    status_col_name: str = KIT_STATUS_COL,
+    sync_ts=None,
+) -> bytes:
+    """Стилизованная выгрузка перечня комплектов (патчи 21/22).
+
+    Два режима по типу source:
+
+    1. Загруженный Excel (file_uploader) — ОСНОВНОЙ режим вызова
+       из UI (фиксы 21.x): ИСХОДНЫЙ файл открывается через openpyxl
+       и сохраняет своё форматирование; справа от таблицы
+       добавляются три kit-колонки («Статус комплекта», «Ревизия
+       комплекта», «Дата ревизии»), в строку 1 вставляется
+       объединённая полоса «База актуальна на …» — шапка и данные
+       сдвигаются на строку вниз. Шапки kit-колонок — заливка
+       D9E1F2 (согласовано), у всех ячеек таблицы тонкие границы
+       #808080, kit-колонки по центру, автофильтр по диапазону
+       таблицы.
+
+    2. pd.DataFrame (уже с kit-колонками от _apply_kit_statuses —
+       так зовут тесты scripts/test_patch22.py и fallback) —
+       сборка новой книги «с нуля»: строка 1 — полоса даты,
+       строка 2 — шапка, данные с 3-й, те же стили; sheet_name —
+       имя листа.
+
+    sync_ts — timestamp последнего синка
+    (deadlines._load_last_sync_date()); пусто → «База актуальна
+    на —», как в полосе даты приложения.
+    """
+    if isinstance(source, pd.DataFrame):
+        return _styled_df_to_xlsx(source, sheet_name=sheet_name,
+                                  sync_ts=sync_ts)
+    return _styled_upload_to_xlsx(
+        source, sheet_name, kit_col, statuses, status_col_name, sync_ts
+    )
+
+
+def _styled_df_to_xlsx(df: pd.DataFrame, sheet_name: str = "Комплекты",
+                       sync_ts=None) -> bytes:
+    """Режим 2 _xlsx_add_kit_status: сборка книги «с нуля» (патч 22).
+
+    Строка 1 — объединённая полоса «База актуальна на …» (заливка
+    #E8F0F8, как .date-bar в app.py; рамка по контуру полосы),
+    строка 2 — шапка (у трёх kit-колонок заливка D9E1F2, у всех
+    колонок жирный шрифт и тонкие границы #808080), данные с 3-й
+    строки (тонкие границы у всех ячеек, kit-колонки по центру),
+    автофильтр A2:…, ширины колонок по содержимому.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = (sheet_name or "Комплекты")[:31]
+
+    n_cols = len(df.columns)
+    last_letter = get_column_letter(max(n_cols, 1))
+    kit_idx = {i for i, name in enumerate(df.columns, start=1)
+               if name in (KIT_STATUS_COL, KIT_REVISION_COL,
+                           KIT_REV_DATE_COL)}
+
+    # --- Строка 1: полоса даты актуальности базы ---
+    for i in range(1, n_cols + 1):
+        ws.cell(row=1, column=i).border = Border(
+            left=_KIT_BORDER_SIDE if i == 1 else None,
+            right=_KIT_BORDER_SIDE if i == n_cols else None,
+            top=_KIT_BORDER_SIDE, bottom=_KIT_BORDER_SIDE,
+        )
+    strip = ws.cell(row=1, column=1, value=_kit_sync_caption(sync_ts))
+    strip.font = Font(bold=True)
+    strip.fill = _KIT_DATE_FILL
+    strip.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(f"A1:{last_letter}1")
+    ws.row_dimensions[1].height = 22
+
+    # --- Строка 2: шапка таблицы ---
+    for i, name in enumerate(df.columns, start=1):
+        c = ws.cell(row=2, column=i, value=str(name))
+        c.font = Font(bold=True)
+        c.border = _KIT_TABLE_BORDER
+        if i in kit_idx:
+            c.fill = _KIT_HEADER_FILL
+            c.alignment = Alignment(wrap_text=True, vertical="center")
+
+    # --- Данные с 3-й строки ---
+    for r_offset, (_, row) in enumerate(df.iterrows()):
+        r = 3 + r_offset
+        for i, name in enumerate(df.columns, start=1):
+            val = row[name]
+            if pd.isna(val):
+                val = ""
+            elif not isinstance(val, (str, int, float, bool)):
+                val = str(val)
+            c = ws.cell(row=r, column=i, value=val)
+            c.border = _KIT_TABLE_BORDER
+            if i in kit_idx:
+                c.alignment = Alignment(horizontal="center",
+                                        vertical="center")
+
+    # --- Автофильтр по всей таблице (шапка — строка 2) ---
+    ws.auto_filter.ref = f"A2:{last_letter}{2 + len(df)}"
+
+    # --- Ширины колонок по содержимому (шапка + до 200 строк) ---
+    for i, name in enumerate(df.columns, start=1):
+        lens = [len(str(name))]
+        lens += [len(str(v)) for v in df[name].tolist()[:200]
+                 if v is not None and not pd.isna(v)]
+        ws.column_dimensions[get_column_letter(i)].width = \
+            min(max(lens, default=8) + 2, 60)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _styled_upload_to_xlsx(
     uploaded_file,
     sheet_name: str,
-    kit_col: str,
-    statuses: dict,
+    kit_col: str | None,
+    statuses: dict | None,
     status_col_name: str,
+    sync_ts=None,
 ) -> bytes:
-    """Добавить колонку «Статус комплекта» в исходный Excel через openpyxl.
+    """Режим 1 _xlsx_add_kit_status: правка ИСХОДНОГО файла (21.x+22).
 
-    Максимально простая реализация: находит строку заголовка «Шифр РД»,
-    добавляет колонку справа с заголовком и статусами. Стиль заголовка
-    — простой синий (без копирования с соседних ячеек).
+    Простая реализация поверх фикс-цепочки 21.x: находит строку
+    заголовка «Шифр РД», добавляет справа ТРИ kit-колонки (статус,
+    ревизия, дата ревизии) и вставляет строку 1 с полосой «База
+    актуальна на …» — шапка и данные сдвигаются на строку вниз.
+    Форматирование исходного файла сохраняется: меняются только
+    границы ячеек таблицы и добавленные колонки. Шапки kit-колонок
+    — заливка D9E1F2 (согласовано), тонкие границы #808080 у всех
+    ячеек таблицы, kit-колонки по центру, автофильтр по диапазону
+    таблицы.
     """
     wb = openpyxl.load_workbook(uploaded_file, read_only=False,
                                 keep_vba=False)
@@ -1189,9 +1381,11 @@ def _xlsx_add_kit_status(
     # --- 1. Находим строку заголовка и колонку шифров ---
     header_row_idx = None
     kit_col_num = None
-    for cell_row in ws.iter_rows(min_row=1, max_row=50, max_col=ws.max_column):
+    for cell_row in ws.iter_rows(min_row=1, max_row=50,
+                                 max_col=ws.max_column):
         for cell in cell_row:
-            if cell.value is not None and str(cell.value).replace("\xa0", " ").strip():
+            if cell.value is not None and \
+                    str(cell.value).replace("\xa0", " ").strip():
                 norm = _norm_header(str(cell.value))
                 for want in _KIT_CODE_HEADERS:
                     if norm == want:
@@ -1206,16 +1400,18 @@ def _xlsx_add_kit_status(
             break
 
     if header_row_idx is None:
-        # Не нашли — fallback к pandas
-        return _df_to_xlsx(
+        # Не нашли — fallback к pandas + стилизованная сборка «с нуля»
+        df_fb = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        return _styled_df_to_xlsx(
             _apply_kit_statuses(
-                pd.read_excel(uploaded_file, sheet_name=sheet_name),
-                kit_col, statuses
+                df_fb, kit_col, statuses or {},
+                rev_info=get_kit_revision_info(),
             ),
-            sheet_name[:31],
+            sheet_name=(sheet_name or "Комплекты")[:31],
+            sync_ts=sync_ts,
         )
 
-    # --- 2. Определяем последнюю колонку и последнюю строку данных ---
+    # --- 2. Последняя колонка и последняя строка данных ---
     max_col = ws.max_column
     last_row = 0
     for r in range(header_row_idx + 1, ws.max_row + 1):
@@ -1223,24 +1419,43 @@ def _xlsx_add_kit_status(
         if val is not None and not pd.isna(val):
             last_row = r
 
-    # --- 3. Новая колонка для статуса ---
-    new_col = max_col + 1
+    # --- 3. Три новые kit-колонки справа от таблицы ---
+    col_status = max_col + 1
+    col_rev = max_col + 2
+    col_date = max_col + 3
+    last_letter = get_column_letter(col_date)
 
-    # --- 4. Заголовок с простым стилем (без копирования) ---
-    header_cell = ws.cell(row=header_row_idx, column=new_col,
-                          value=status_col_name)
-    header_cell.font = Font(bold=True, color="FFFFFF")
-    header_cell.fill = PatternFill("solid", fgColor="1F4E78")
-    header_cell.border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
-    )
-    header_cell.alignment = Alignment(wrap_text=True, vertical="center")
+    # --- 4. Полоса даты в строке 1 (шапка и данные уезжают вниз) ---
+    ws.insert_rows(1)
+    header_row_idx += 1
+    last_row += 1
 
-    # Ширина колонки — 16 символов (A/B/C/«План» помещаются)
-    ws.column_dimensions[get_column_letter(new_col)].width = 16
+    for i in range(1, col_date + 1):
+        ws.cell(row=1, column=i).border = Border(
+            left=_KIT_BORDER_SIDE if i == 1 else None,
+            right=_KIT_BORDER_SIDE if i == col_date else None,
+            top=_KIT_BORDER_SIDE, bottom=_KIT_BORDER_SIDE,
+        )
+    strip = ws.cell(row=1, column=1, value=_kit_sync_caption(sync_ts))
+    strip.font = Font(bold=True)
+    strip.fill = _KIT_DATE_FILL
+    strip.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(f"A1:{last_letter}1")
+    ws.row_dimensions[1].height = 22
 
-    # --- 5. Батч-вычисление статусов для всех шифров в таблице ---
+    # --- 5. Шапки трёх kit-колонок (D9E1F2, согласовано) ---
+    for col_num, name in ((col_status, status_col_name),
+                          (col_rev, KIT_REVISION_COL),
+                          (col_date, KIT_REV_DATE_COL)):
+        c = ws.cell(row=header_row_idx, column=col_num, value=name)
+        c.font = Font(bold=True)
+        c.fill = _KIT_HEADER_FILL
+        c.border = _KIT_TABLE_BORDER
+        c.alignment = Alignment(wrap_text=True, vertical="center")
+        # Ширина — 16 символов (статус/ревизия/дата помещаются)
+        ws.column_dimensions[get_column_letter(col_num)].width = 16
+
+    # --- 6. Батч-вычисление статусов и ревизий для всех шифров ---
     codes = []
     for r in range(header_row_idx + 1, last_row + 1):
         val = ws.cell(row=r, column=kit_col_num).value
@@ -1248,16 +1463,32 @@ def _xlsx_add_kit_status(
             codes.append(val)
 
     kit_statuses = get_kit_statuses(codes)
+    kit_revisions = get_kit_revision_info(codes)
 
-    # --- 6. Пишем статусы с выравниванием по центру ---
+    # --- 7. Значения трёх kit-колонок, выравнивание по центру ---
     for idx, code in enumerate(codes):
         r = header_row_idx + 1 + idx
-        cell = ws.cell(row=r, column=new_col,
-                       value=kit_statuses.get(normalize_kit_code(code),
-                                              KIT_STATUS_NOT_LOADED))
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        norm = normalize_kit_code(code)
+        rev = kit_revisions.get(norm) or {}
+        for col_num, value in (
+            (col_status, kit_statuses.get(norm, KIT_STATUS_NOT_LOADED)),
+            (col_rev, rev.get("revision", "")),
+            (col_date, rev.get("date", "")),
+        ):
+            c = ws.cell(row=r, column=col_num, value=value)
+            c.alignment = Alignment(horizontal="center",
+                                    vertical="center")
 
-    # --- 7. Сохраняем в буфер ---
+    # --- 8. Тонкие границы #808080 у всех ячеек таблицы ---
+    for r in range(header_row_idx, last_row + 1):
+        for i in range(1, col_date + 1):
+            ws.cell(row=r, column=i).border = _KIT_TABLE_BORDER
+
+    # --- 9. Автофильтр по всему диапазону таблицы ---
+    if last_row > header_row_idx:
+        ws.auto_filter.ref = f"A{header_row_idx}:{last_letter}{last_row}"
+
+    # --- 10. Сохраняем в буфер ---
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)

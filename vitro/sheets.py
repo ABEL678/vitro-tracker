@@ -62,6 +62,10 @@
   * get_kit_statuses(codes) — батчевый вариант get_kit_status: один
     проход по БД на весь список шифров, codes=None → все комплекты
     базы (патч 21).
+  * get_kit_revision_info(codes) — «Ревизия комплекта» и «Дата
+    ревизии» по тем же уникальным листам: максимальная ревизия
+    (числовое сравнение, как в Сводке) и крайняя дата выгрузки
+    ДД.ММ.ГГГГ (патч 22).
 
 Изменения структуры базы НЕ требуются: дедупликация выполняется на
 уровне SQL-выражений и pandas; таблицы/представления не создаются.
@@ -70,9 +74,15 @@
 функции get_kit_status / get_kit_statuses сводят статусы УНИКАЛЬНЫХ
 листов комплекта (тот же unique_vitro_sheets, что во вкладках) к
 одному значению: «A» / «B» / «C» / «План (не загружен)».
+
+ПАТЧ 22 — «Ревизия комплекта» и «Дата ревизии» для той же подвкладки:
+get_kit_revision_info берёт РЕВИЗИЮ (max по числовым значениям,
+«2.0» < «10.0») и КРАЙНЮЮ ДАТУ выгрузки (max status_date, ДД.ММ.ГГГГ)
+по уникальным листам комплекта; нет данных → пустые строки.
 """
 
 import re
+from datetime import date
 
 # ---------------------------------------------------------------------------
 #  Нормализация значений
@@ -472,9 +482,10 @@ def _load_vitro_sheets_raw() -> list:
     """Строки documents (dict) для расчёта статусов комплектов.
 
     Тот же срез, что в _vitro_sheet_counts «Плана выдачи» (plan.py):
-    id, complex, sheet_number, status, status_date по всем строкам
-    с непустым complex. Дедупликация — на стороне unique_vitro_sheets,
-    БД не изменяется.
+    id, complex, sheet_number, status, status_date, revision по всем
+    строкам с непустым complex. Дедупликация — на стороне
+    unique_vitro_sheets, БД не изменяется. Патч 22: в срез добавлено
+    revision (ревизия листа) — для get_kit_revision_info.
 
     get_conn импортируется ВНУТРИ функции: sqlite_db импортирует
     sheets на уровне модуля (vitro/sqlite_db.py), прямой импорт в
@@ -484,7 +495,8 @@ def _load_vitro_sheets_raw() -> list:
 
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, complex, sheet_number, status, status_date "
+            "SELECT id, complex, sheet_number, status, status_date, "
+            "revision "
             "FROM documents "
             "WHERE complex IS NOT NULL"
         ).fetchall()
@@ -549,4 +561,111 @@ def get_kit_statuses(codes=None) -> dict:
         if not key:
             continue  # пустой шифр — не комплект; UI подставит дефолт
         out[key] = result.get(key, KIT_STATUS_NOT_LOADED)
+    return out
+
+
+# ---------------------------------------------------------------------------
+#  Патч 22: «Ревизия комплекта» и «Дата ревизии»
+# ---------------------------------------------------------------------------
+# Правила (ТЗ патча 22, согласовано координатором):
+#   1. Считаются по ТЕМ ЖЕ данным, что и статусы патча 21:
+#      unique_vitro_sheets — последние ревизии листов комплекта.
+#   2. «Ревизия комплекта» — МАКСИМАЛЬНАЯ ревизия листов комплекта.
+#      Ревизия documents — числовая строка VitroBaseDocumentRevision
+#      («2.0», «10.0»), сравнение ЧИСЛОВОЕ («2.0» < «10.0») — тот же
+#      стандарт, что в колонке «Ревизия комплекта» Сводки (summary.py,
+#      _rev_key, патч 18). Пустые/нечисловые значения в максимум не
+#      попадают; нет ни одной числовой → пустая строка.
+#   3. «Дата ревизии» — КРАЙНЯЯ дата выгрузки (max status_date по
+#      листам комплекта — «дата выгрузки всех или части листов»),
+#      формат ДД.ММ.ГГГГ (стандарт plan_xlsx.py). Нет валидной даты →
+#      пустая строка.
+#   4. «И» и «АННУЛИРОВАНО» в ревизию/дату не исключаются — поля
+#      информационные (согласовано на плане патча 22).
+#   5. Комплекта нет в Витро → пары нет в результате; UI подставляет
+#      пустые строки (у статуса в этом случае «План (не загружен)»).
+
+
+def _rev_key(v) -> float:
+    """Ключ сравнения ревизий: числовые строки сравниваются как
+    числа («2.0» < «10.0») — стандарт Сводки (summary.py, _rev_key,
+    патч 18). Пустое/нечисловое значение → -1.0 (в максимум не
+    попадает)."""
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _format_rev_date(iso) -> str:
+    """ISO-дата documents.status_date → «ДД.ММ.ГГГГ» (стандарт
+    plan_xlsx.py). Пустое/неразбираемое → пустая строка."""
+    s = _s(iso)
+    if not s:
+        return ""
+    try:
+        return date.fromisoformat(s[:10]).strftime("%d.%m.%Y")
+    except ValueError:
+        return ""
+
+
+def _kit_revision_from_rows(rows) -> tuple:
+    """Чистое ядро правил патча 22 (без обращения к БД).
+
+    rows — листы комплекта (dict documents: revision, status_date).
+    Возвращает (ревизия, дата): максимальная ревизия по _rev_key
+    (исходная строка значения, например «10.0») и крайняя дата
+    status_date в формате ДД.ММ.ГГГГ. Даты сравниваются по ISO-
+    префиксу YYYY-MM-DD — строковое сравнение совпадает с
+    хронологическим; форматирование — в самом конце. Нет данных →
+    ("", "").
+    """
+    best_rev, best_key = "", -1.0
+    best_iso = ""
+    for r in rows or []:
+        k = _rev_key(r.get("revision"))
+        if k > best_key:
+            best_key, best_rev = k, _s(r.get("revision"))
+        iso = _s(r.get("status_date"))[:10]
+        if iso > best_iso:
+            best_iso = iso
+    return best_rev, _format_rev_date(best_iso)
+
+
+def get_kit_revision_info(codes=None) -> dict:
+    """«Ревизия комплекта» и «Дата ревизии» (патч 22) — батчевый API
+    в стиле get_kit_statuses: ОДИН проход по БД на весь список шифров.
+
+    codes=None → {шифр: {"revision": …, "date": …}} по всем комплектам
+    базы; строка трактуется как один шифр; список/кортеж — батч.
+    Шифры нормализуются (normalize_kit_code), отсутствующие в Витро
+    в результат не попадают (UI подставит пустые строки), пустые шифры
+    пропускаются. Листы комплекта — unique_vitro_sheets (последние
+    ревизии, «липкое» аннулирование, нормализация шифров, отсечение
+    мусорных); правила — _kit_revision_from_rows. Значения: revision —
+    строка («10.0») или "", date — «ДД.ММ.ГГГГ» или "".
+    """
+    rows_by_kit: dict = {}
+    for r in unique_vitro_sheets(_load_vitro_sheets_raw()):
+        cx = str(r.get("complex") or "")
+        if not cx:
+            continue
+        rows_by_kit.setdefault(cx, []).append(r)
+
+    result: dict = {}
+    for cx, rows in rows_by_kit.items():
+        rev, dt = _kit_revision_from_rows(rows)
+        result[cx] = {"revision": rev, "date": dt}
+
+    if codes is None:
+        return result
+
+    if isinstance(codes, str):
+        codes = [codes]
+    out: dict = {}
+    for c in codes or []:
+        key = normalize_kit_code(c)
+        if not key:
+            continue  # пустой шифр — не комплект; UI подставит пустые
+        out[key] = result.get(key, {"revision": "", "date": ""})
     return out

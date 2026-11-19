@@ -1,0 +1,854 @@
+diff --git a/scripts/test_patch22.py b/scripts/test_patch22.py
+new file mode 100644
+index 0000000..f0e3794
+--- /dev/null
++++ b/scripts/test_patch22.py
+@@ -0,0 +1,418 @@
++# scripts/test_patch22.py
++"""Тесты патча 22 «Ревизия комплекта и Дата ревизии во внешнем Excel».
++
++Блок 1: get_kit_revision_info (_rev_key / _format_rev_date /
++        _kit_revision_from_rows) — максимум ревизии (числовое
++        сравнение «2.0» < «10.0»), формат даты ДД.ММ.ГГГГ, ревизия
++        из ПОСЛЕДНЕЙ ревизии листа (дедуп), «И»/«АННУЛИРОВАНО»
++        учитываются, латинские двойники шифра, отсутствующий
++        комплект, одиночный и батчевый вызов, регрессия
++        get_kit_statuses (патч 21 не сломан).
++Блок 2: _apply_kit_statuses(..., rev_info) — три kit-колонки в
++        порядке Статус → Ревизия → Дата, исходный df не мутируется,
++        пустой шифр / отсутствующий комплект → «».
++Блок 3: _xlsx_add_kit_status — объединённая ячейка «База актуальна
++        на …(МСК)» в строке 1, шапка в строке 2, светло-голубая
++        заливка D9E1F2 у шапок трёх kit-колонок, тонкие границы у
++        всех ячеек шапки и данных, центрирование kit-колонок,
++        автофильтр A2:…, чтение синтетического Excel «Шифр РД».
++
++СТОП-ЛИСТ: реальная data/vitro.db не открывается — временная БД
++назначается через SQLITE_PATH ДО импорта vitro.sqlite_db (путь
++читается при импорте модуля).
++
++Запуск: python scripts/test_patch22.py
++"""
++import io
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++
++# --- Временная БД ДО импорта vitro.* (СТОП-ЛИСТ патчей 21/22) ---
++_TMPDIR = tempfile.mkdtemp(prefix="vitro_test_patch22_")
++os.environ["SQLITE_PATH"] = str(Path(_TMPDIR) / "test_vitro.db")
++
++import openpyxl  # noqa: E402
++import pandas as pd  # noqa: E402
++
++import vitro.sqlite_db as sqlite_db  # noqa: E402
++from vitro.sheets import (  # noqa: E402
++    KIT_STATUS_NOT_LOADED,
++    _format_rev_date,
++    _kit_revision_from_rows,
++    _rev_key,
++    get_kit_revision_info,
++    get_kit_status,
++    get_kit_statuses,
++)
++from vitro.ui.export import (  # noqa: E402
++    KIT_REV_DATE_COL,
++    KIT_REVISION_COL,
++    KIT_STATUS_COL,
++    _apply_kit_statuses,
++    _find_kit_code_column,
++    _xlsx_add_kit_status,
++)
++
++sqlite_db.init_db()
++
++FAILED: list[str] = []
++
++
++def check(name: str, cond: bool, detail: str = "") -> None:
++    status = "OK  " if cond else "FAIL"
++    msg = f"[{status}] {name}" + (f" — {detail}" if detail and not cond else "")
++    try:
++        print(msg)
++    except UnicodeEncodeError:
++        print(msg.encode("ascii", "replace").decode("ascii"))
++    if not cond:
++        FAILED.append(name)
++
++
++# ---------------------------------------------------------------------------
++#  Подготовка: временная БД documents
++# ---------------------------------------------------------------------------
++def seed_documents(rows) -> None:
++    """rows: (id, leaf, complex, status, sheet_number, status_date,
++    revision)."""
++    with sqlite_db.get_conn() as conn:
++        conn.execute("DELETE FROM documents")
++        conn.executemany(
++            "INSERT INTO documents (id, leaf, complex, status, "
++            "sheet_number, status_date, revision) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?)",
++            list(rows),
++        )
++
++
++KIT = "АТ-РД-КЖ1-1-00"
++KIT2 = "АТ-РД-ОВ2-С-00"        # латинские двойники
++KIT_ABSENT = "АТ-РД-ХХ9-9-99"  # заведомо отсутствует в БД
++
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.1 — _rev_key: числовое сравнение ревизий
++# ---------------------------------------------------------------------------
++check("_rev_key: «2.0» < «10.0» (числовое сравнение)",
++      _rev_key("2.0") < _rev_key("10.0"),
++      f"{_rev_key('2.0')} vs {_rev_key('10.0')}")
++check("_rev_key: «10.0» == 10.0", _rev_key("10.0") == 10.0)
++check("_rev_key: пробелы игнорируются", _rev_key(" 3.0 ") == 3.0)
++check("_rev_key: пустое → -1.0", _rev_key("") == -1.0)
++check("_rev_key: None → -1.0", _rev_key(None) == -1.0)
++check("_rev_key: «И» (нечисловое) → -1.0", _rev_key("И") == -1.0)
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.2 — _format_rev_date: ISO → ДД.ММ.ГГГГ
++# ---------------------------------------------------------------------------
++check("дата: ISO с временем → 19.11.2026",
++      _format_rev_date("2026-11-19T11:46:00") == "19.11.2026")
++check("дата: ISO без времени → 01.06.2025",
++      _format_rev_date("2025-06-01") == "01.06.2025")
++check("дата: пустая → ''", _format_rev_date("") == "")
++check("дата: None → ''", _format_rev_date(None) == "")
++check("дата: мусор → ''", _format_rev_date("не дата") == "")
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.3 — _kit_revision_from_rows: чистое ядро
++# ---------------------------------------------------------------------------
++rev, dt = _kit_revision_from_rows([
++    {"revision": "2.0", "status_date": "2025-03-01T10:00:00"},
++    {"revision": "10.0", "status_date": "2026-01-15T09:00:00"},
++    {"revision": "1.0", "status_date": "2024-12-31"},
++])
++check("ядро: max ревизия «10.0», не «2.0» (числовое сравнение)",
++      rev == "10.0", f"получено «{rev}»")
++check("ядро: max дата 15.01.2026", dt == "15.01.2026", f"получено «{dt}»")
++
++rev, dt = _kit_revision_from_rows([
++    {"revision": "", "status_date": None},
++    {"revision": "И", "status_date": "мусор"},
++])
++check("ядро: нет числовой ревизии → ''", rev == "")
++check("ядро: нет валидной даты → ''", dt == "")
++
++rev, dt = _kit_revision_from_rows([])
++check("ядро: пустой список → ('', '')", (rev, dt) == ("", ""))
++
++rev, dt = _kit_revision_from_rows([
++    {"revision": "5.0", "status_date": "2025-05-05"},
++])
++check("ядро: одна строка → («5.0», «05.05.2025»)",
++      (rev, dt) == ("5.0", "05.05.2025"))
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.4 — get_kit_revision_info: расчёт по БД (unique_vitro_sheets)
++# ---------------------------------------------------------------------------
++# KIT: три листа; у листа «1» две ревизии (старая 1.0, свежая 10.0) —
++# дедуп оставляет последнюю по (status_date, id), значит «10.0».
++# Крайняя дата — у листа «3» (статус «И»), 03.03.2026.
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "A", "1", "2025-01-10", "1.0"),
++    (2, f"{KIT}-1.PDF", KIT, "A", "1", "2026-01-20", "10.0"),
++    (3, f"{KIT}-2.PDF", KIT, "B", "2", "2025-06-15", "2.0"),
++    (4, f"{KIT}-3.PDF", KIT, "И", "3", "2026-03-03", ""),
++])
++info = get_kit_revision_info(KIT)[KIT]
++check("БД: max ревизия комплекта 10.0",
++      info["revision"] == "10.0", f"получено «{info['revision']}»")
++check("БД: крайняя дата 03.03.2026 (лист «И» учитывается)",
++      info["date"] == "03.03.2026", f"получено «{info['date']}»")
++check("БД: одиночный вызов возвращает dict с двумя ключами",
++      set(info.keys()) == {"revision", "date"})
++
++# ревизия листа — из ПОСЛЕДНЕЙ ревизии, а не максимум по всем строкам:
++# у листа «1» старая строка имеет ревизию 99.0, свежая — 2.0
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "B", "1", "2025-01-10", "99.0"),
++    (2, f"{KIT}-1.PDF", KIT, "B", "1", "2026-01-10", "2.0"),
++])
++info = get_kit_revision_info(KIT)[KIT]
++check("БД: ревизия из ПОСЛЕДНЕЙ ревизии листа (2.0, не 99.0)",
++      info["revision"] == "2.0", f"получено «{info['revision']}»")
++check("БД: дата — по последней выгрузке листа (10.01.2026)",
++      info["date"] == "10.01.2026", f"получено «{info['date']}»")
++
++# «И»/«АННУЛИРОВАНО» учитываются в rev/date (информационные поля,
++# согласовано на плане патча 22)
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "АННУЛИРОВАНО", "1", "2026-05-01", "7.0"),
++])
++info = get_kit_revision_info(KIT)[KIT]
++check("БД: АННУЛИРОВАНО учитывается в ревизии (7.0)",
++      info["revision"] == "7.0")
++check("БД: АННУЛИРОВАНО учитывается в дате (01.05.2026)",
++      info["date"] == "01.05.2026")
++
++# пустая ревизия у всех листов → '', дата при этом считается
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "A", "1", "2025-06-01", ""),
++])
++info = get_kit_revision_info(KIT)[KIT]
++check("БД: нет числовых ревизий → ''", info["revision"] == "")
++check("БД: дата при пустой ревизии считается (01.06.2025)",
++      info["date"] == "01.06.2025")
++
++# латинские двойники шифра
++seed_documents([
++    (1, f"{KIT2}-1.PDF", KIT2, "A", "1", "2025-06-01", "3.0"),
++])
++latin_mix = "AT-PД-OB2-C-00"  # латиница: A, T, P, O, B, C; кириллица: Д
++info = get_kit_revision_info(latin_mix)[KIT2]
++check("БД: латинская запись шифра → та же ревизия",
++      info["revision"] == "3.0")
++
++# отсутствующий комплект → пустые строки
++info = get_kit_revision_info(KIT_ABSENT)[KIT_ABSENT]
++check("БД: отсутствующий комплект → пустые строки",
++      info == {"revision": "", "date": ""})
++
++# пустые шифры пропускаются, батч работает
++info = get_kit_revision_info(["", None, KIT2])
++check("БД: пустые шифры пропускаются",
++      info == {KIT2: {"revision": "3.0", "date": "01.06.2025"}})
++
++# codes=None → все комплекты базы; батч == codes=None
++seed_documents([
++    (1, f"{KIT}-1.PDF", KIT, "A", "1", "2025-06-01", "4.0"),
++    (2, f"{KIT2}-1.PDF", KIT2, "B", "1", "2025-07-01", "5.0"),
++])
++all_info = get_kit_revision_info()
++check("БД: codes=None → все комплекты",
++      set(all_info.keys()) == {KIT, KIT2})
++check("БД: батч == codes=None по общим ключам",
++      get_kit_revision_info([KIT, KIT2]) == all_info)
++
++# ---------------------------------------------------------------------------
++#  БЛОК 1.5 — регрессия патча 21: get_kit_statuses не сломан
++# ---------------------------------------------------------------------------
++sts = get_kit_statuses()
++check("регрессия 21: get_kit_statuses()[KIT] == «A»", sts[KIT] == "A")
++check("регрессия 21: get_kit_statuses()[KIT2] == «B»", sts[KIT2] == "B")
++check("регрессия 21: get_kit_status(KIT) == get_kit_statuses()[KIT]",
++      get_kit_status(KIT) == sts[KIT])
++check("регрессия 21: отсутствующий комплект → «План (не загружен)»",
++      get_kit_statuses(KIT_ABSENT)
++      == {KIT_ABSENT: KIT_STATUS_NOT_LOADED})
++
++# ---------------------------------------------------------------------------
++#  БЛОК 2 — _apply_kit_statuses(..., rev_info): три kit-колонки
++# ---------------------------------------------------------------------------
++df_src = pd.DataFrame({
++    "Шифр РД": [KIT, KIT_ABSENT, "", None],
++    "Название": ["Комплект КЖ1", "Нет в Витро", "", ""],
++})
++statuses = get_kit_statuses([KIT, KIT_ABSENT])
++rev_info = get_kit_revision_info([KIT, KIT_ABSENT])
++out = _apply_kit_statuses(df_src, "Шифр РД", statuses, rev_info)
++
++check("колонки: исходные две первые",
++      list(out.columns)[:2] == ["Шифр РД", "Название"])
++check("порядок колонок: Статус → Ревизия → Дата",
++      list(out.columns)[2:] == [KIT_STATUS_COL, KIT_REVISION_COL,
++                                KIT_REV_DATE_COL])
++check("статус найденного комплекта", out[KIT_STATUS_COL].iloc[0] == "A")
++check("ревизия найденного комплекта",
++      out[KIT_REVISION_COL].iloc[0] == "4.0")
++check("дата найденного комплекта (ДД.ММ.ГГГГ)",
++      out[KIT_REV_DATE_COL].iloc[0] == "01.06.2025")
++check("отсутствующий комплект: статус «План (не загружен)»",
++      out[KIT_STATUS_COL].iloc[1] == KIT_STATUS_NOT_LOADED)
++check("отсутствующий комплект: ревизия ''",
++      out[KIT_REVISION_COL].iloc[1] == "")
++check("отсутствующий комплект: дата ''",
++      out[KIT_REV_DATE_COL].iloc[1] == "")
++check("пустой шифр: статус дефолт",
++      out[KIT_STATUS_COL].iloc[2] == KIT_STATUS_NOT_LOADED)
++check("пустой шифр: ревизия ''", out[KIT_REVISION_COL].iloc[2] == "")
++check("None-шифр: дата ''", out[KIT_REV_DATE_COL].iloc[3] == "")
++check("исходный df не мутировался (без kit-колонок)",
++      list(df_src.columns) == ["Шифр РД", "Название"])
++
++# обратная совместимость: без rev_info — только статус (патч 21)
++out21 = _apply_kit_statuses(df_src, "Шифр РД", statuses)
++check("обратная совместимость: без rev_info одна kit-колонка",
++      list(out21.columns)[2:] == [KIT_STATUS_COL])
++
++# ---------------------------------------------------------------------------
++#  БЛОК 3 — _xlsx_add_kit_status: стилизованная выгрузка
++# ---------------------------------------------------------------------------
++# Синтетический «внешний перечень» → колонки → стилизованный Excel
++buf = io.BytesIO()
++wb = openpyxl.Workbook()
++ws_src = wb.active
++ws_src.append(["Наименование", "Шифр РД"])
++ws_src.append(["Комплект КЖ1", KIT])
++ws_src.append(["Комплект ОВ2", KIT2])
++ws_src.append(["Нет в Витро", KIT_ABSENT])
++wb.save(buf)
++buf.seek(0)
++df_up = pd.read_excel(buf)
++
++col = _find_kit_code_column(df_up)
++check("синтетический Excel: колонка шифров найдена", col == "Шифр РД")
++statuses = get_kit_statuses([KIT, KIT2, KIT_ABSENT])
++rev_info = get_kit_revision_info([KIT, KIT2, KIT_ABSENT])
++result = _apply_kit_statuses(df_up, col, statuses, rev_info)
++
++xlsx_bytes = _xlsx_add_kit_status(
++    result, sync_ts="2026-11-19T11:46:00", sheet_name="Комплекты")
++check("выгрузка: bytes непустые",
++      isinstance(xlsx_bytes, bytes) and len(xlsx_bytes) > 0)
++
++wb2 = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
++ws = wb2.active
++n_cols = len(result.columns)
++n_rows = len(result)
++last_letter = openpyxl.utils.get_column_letter(n_cols)
++kit_idx = sorted(result.columns.get_loc(c) + 1
++                 for c in (KIT_STATUS_COL, KIT_REVISION_COL,
++                           KIT_REV_DATE_COL))
++other_idx = [i for i in range(1, n_cols + 1) if i not in kit_idx]
++
++
++def has_thin_border(c) -> bool:
++    b = c.border
++    return all(getattr(b, s).style == "thin"
++               for s in ("left", "right", "top", "bottom"))
++
++
++# строка 1 — объединённая ячейка с датой актуальности базы
++merged = [str(r) for r in ws.merged_cells.ranges]
++check(f"строка 1: объединена во всю ширину (A1:{last_letter}1)",
++      f"A1:{last_letter}1" in merged, f"merged={merged}")
++check("строка 1: текст «База актуальна на 19.11.2026, 11:46 (МСК)»",
++      ws["A1"].value == "База актуальна на 19.11.2026, 11:46 (МСК)",
++      f"получено «{ws['A1'].value}»")
++check("строка 1: жирный шрифт", ws["A1"].font.bold is True)
++check("строка 1: выравнивание по центру",
++      ws["A1"].alignment.horizontal == "center")
++check("строка 1: заливка как полоса даты (E8F0F8)",
++      str(ws["A1"].fill.start_color.rgb)[-6:] == "E8F0F8",
++      f"получено {ws['A1'].fill.start_color.rgb}")
++# Рамка объединённой ячейки: openpyxl сохраняет для не-анкерных
++# ячеек диапазона только контурные стороны (top/bottom) — их и
++# проверяем, плюс левый край у A1 и правый у последней колонки.
++check("строка 1: рамка по всей объединённой полосе",
++      all(ws.cell(row=1, column=i).border.top.style == "thin"
++          and ws.cell(row=1, column=i).border.bottom.style == "thin"
++          for i in range(1, n_cols + 1))
++      and ws.cell(row=1, column=1).border.left.style == "thin"
++      and ws.cell(row=1, column=n_cols).border.right.style == "thin")
++
++# строка 2 — шапка таблицы
++check("шапка в строке 2",
++      ws.cell(row=2, column=1).value == result.columns[0])
++check("шапка: жирный шрифт у всех колонок",
++      all(ws.cell(row=2, column=i).font.bold
++          for i in range(1, n_cols + 1)))
++check("шапка: границы у всех колонок",
++      all(has_thin_border(ws.cell(row=2, column=i))
++          for i in range(1, n_cols + 1)))
++check("шапка: светло-голубая заливка D9E1F2 у трёх kit-колонок",
++      all(str(ws.cell(row=2, column=i).fill.start_color.rgb)[-6:]
++          == "D9E1F2" for i in kit_idx),
++      f"kit_idx={kit_idx}")
++check("шапка: прочие колонки без заливки kit-цвета",
++      all(str(ws.cell(row=2, column=i).fill.start_color.rgb)[-6:]
++          != "D9E1F2" for i in other_idx))
++
++# данные — границы у всех, kit-колонки по центру
++check("данные: тонкие границы у всех ячеек",
++      all(has_thin_border(ws.cell(row=r, column=i))
++          for r in range(3, 3 + n_rows) for i in range(1, n_cols + 1)))
++check("данные: kit-колонки по центру",
++      all(ws.cell(row=r, column=i).alignment.horizontal == "center"
++          for r in range(3, 3 + n_rows) for i in kit_idx))
++check("данные: прочие колонки — без центрирования",
++      all(ws.cell(row=3, column=i).alignment.horizontal != "center"
++          for i in other_idx))
++
++# автофильтр по всей таблице (шапка — строка 2)
++check(f"автофильтр A2:{last_letter}{n_rows + 2}",
++      ws.auto_filter.ref == f"A2:{last_letter}{n_rows + 2}",
++      f"получено {ws.auto_filter.ref}")
++
++# значения данных на месте (строки 3–5: KIT, KIT2, KIT_ABSENT)
++c_stat = result.columns.get_loc(KIT_STATUS_COL) + 1
++c_rev = result.columns.get_loc(KIT_REVISION_COL) + 1
++c_date = result.columns.get_loc(KIT_REV_DATE_COL) + 1
++check("данные: статус KIT == «A»",
++      ws.cell(row=3, column=c_stat).value == "A")
++check("данные: ревизия KIT == «4.0»",
++      ws.cell(row=3, column=c_rev).value == "4.0")
++check("данные: дата KIT == «01.06.2025»",
++      ws.cell(row=3, column=c_date).value == "01.06.2025")
++check("данные: дата KIT2 == «01.07.2025»",
++      ws.cell(row=4, column=c_date).value == "01.07.2025")
++check("данные: отсутствующий комплект → статус «План (не загружен)»",
++      ws.cell(row=5, column=c_stat).value == KIT_STATUS_NOT_LOADED)
++check("данные: отсутствующий комплект → пустая ревизия",
++      ws.cell(row=5, column=c_rev).value in ("", None))
++
++# ширины колонок заданы
++check("ширины колонок заданы",
++      all((ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width
++           or 0) > 0 for i in range(1, n_cols + 1)))
++
++# нет синков → «База актуальна на —»
++xlsx_empty = _xlsx_add_kit_status(result, sync_ts=None)
++wb3 = openpyxl.load_workbook(io.BytesIO(xlsx_empty))
++check("sync_ts=None → «База актуальна на —»",
++      wb3.active["A1"].value == "База актуальна на —",
++      f"получено «{wb3.active['A1'].value}»")
++
++# ---------------------------------------------------------------------------
++#  Итог
++# ---------------------------------------------------------------------------
++if FAILED:
++    print(f"\nПРОВАЛЕНО: {len(FAILED)} проверок:")
++    for name in FAILED:
++        print(f"  - {name}")
++    sys.exit(1)
++print("\nВсе проверки патча 22 пройдены.")
+diff --git a/vitro/sheets.py b/vitro/sheets.py
+index 86335c4..c1bd566 100644
+--- a/vitro/sheets.py
++++ b/vitro/sheets.py
+@@ -62,6 +62,10 @@
+   * get_kit_statuses(codes) — батчевый вариант get_kit_status: один
+     проход по БД на весь список шифров, codes=None → все комплекты
+     базы (патч 21).
++  * get_kit_revision_info(codes) — «Ревизия комплекта» и «Дата
++    ревизии» по тем же уникальным листам: максимальная ревизия
++    (числовое сравнение, как в Сводке) и крайняя дата выгрузки
++    ДД.ММ.ГГГГ (патч 22).
+ 
+ Изменения структуры базы НЕ требуются: дедупликация выполняется на
+ уровне SQL-выражений и pandas; таблицы/представления не создаются.
+@@ -70,9 +74,15 @@
+ функции get_kit_status / get_kit_statuses сводят статусы УНИКАЛЬНЫХ
+ листов комплекта (тот же unique_vitro_sheets, что во вкладках) к
+ одному значению: «A» / «B» / «C» / «План (не загружен)».
++
++ПАТЧ 22 — «Ревизия комплекта» и «Дата ревизии» для той же подвкладки:
++get_kit_revision_info берёт РЕВИЗИЮ (max по числовым значениям,
++«2.0» < «10.0») и КРАЙНЮЮ ДАТУ выгрузки (max status_date, ДД.ММ.ГГГГ)
++по уникальным листам комплекта; нет данных → пустые строки.
+ """
+ 
+ import re
++from datetime import date
+ 
+ # ---------------------------------------------------------------------------
+ #  Нормализация значений
+@@ -472,9 +482,10 @@ def _load_vitro_sheets_raw() -> list:
+     """Строки documents (dict) для расчёта статусов комплектов.
+ 
+     Тот же срез, что в _vitro_sheet_counts «Плана выдачи» (plan.py):
+-    id, complex, sheet_number, status, status_date по всем строкам
+-    с непустым complex. Дедупликация — на стороне unique_vitro_sheets,
+-    БД не изменяется.
++    id, complex, sheet_number, status, status_date, revision по всем
++    строкам с непустым complex. Дедупликация — на стороне
++    unique_vitro_sheets, БД не изменяется. Патч 22: в срез добавлено
++    revision (ревизия листа) — для get_kit_revision_info.
+ 
+     get_conn импортируется ВНУТРИ функции: sqlite_db импортирует
+     sheets на уровне модуля (vitro/sqlite_db.py), прямой импорт в
+@@ -484,7 +495,8 @@ def _load_vitro_sheets_raw() -> list:
+ 
+     with get_conn() as conn:
+         rows = conn.execute(
+-            "SELECT id, complex, sheet_number, status, status_date "
++            "SELECT id, complex, sheet_number, status, status_date, "
++            "revision "
+             "FROM documents "
+             "WHERE complex IS NOT NULL"
+         ).fetchall()
+@@ -550,3 +562,110 @@ def get_kit_statuses(codes=None) -> dict:
+             continue  # пустой шифр — не комплект; UI подставит дефолт
+         out[key] = result.get(key, KIT_STATUS_NOT_LOADED)
+     return out
++
++
++# ---------------------------------------------------------------------------
++#  Патч 22: «Ревизия комплекта» и «Дата ревизии»
++# ---------------------------------------------------------------------------
++# Правила (ТЗ патча 22, согласовано координатором):
++#   1. Считаются по ТЕМ ЖЕ данным, что и статусы патча 21:
++#      unique_vitro_sheets — последние ревизии листов комплекта.
++#   2. «Ревизия комплекта» — МАКСИМАЛЬНАЯ ревизия листов комплекта.
++#      Ревизия documents — числовая строка VitroBaseDocumentRevision
++#      («2.0», «10.0»), сравнение ЧИСЛОВОЕ («2.0» < «10.0») — тот же
++#      стандарт, что в колонке «Ревизия комплекта» Сводки (summary.py,
++#      _rev_key, патч 18). Пустые/нечисловые значения в максимум не
++#      попадают; нет ни одной числовой → пустая строка.
++#   3. «Дата ревизии» — КРАЙНЯЯ дата выгрузки (max status_date по
++#      листам комплекта — «дата выгрузки всех или части листов»),
++#      формат ДД.ММ.ГГГГ (стандарт plan_xlsx.py). Нет валидной даты →
++#      пустая строка.
++#   4. «И» и «АННУЛИРОВАНО» в ревизию/дату не исключаются — поля
++#      информационные (согласовано на плане патча 22).
++#   5. Комплекта нет в Витро → пары нет в результате; UI подставляет
++#      пустые строки (у статуса в этом случае «План (не загружен)»).
++
++
++def _rev_key(v) -> float:
++    """Ключ сравнения ревизий: числовые строки сравниваются как
++    числа («2.0» < «10.0») — стандарт Сводки (summary.py, _rev_key,
++    патч 18). Пустое/нечисловое значение → -1.0 (в максимум не
++    попадает)."""
++    try:
++        return float(str(v).strip())
++    except (TypeError, ValueError):
++        return -1.0
++
++
++def _format_rev_date(iso) -> str:
++    """ISO-дата documents.status_date → «ДД.ММ.ГГГГ» (стандарт
++    plan_xlsx.py). Пустое/неразбираемое → пустая строка."""
++    s = _s(iso)
++    if not s:
++        return ""
++    try:
++        return date.fromisoformat(s[:10]).strftime("%d.%m.%Y")
++    except ValueError:
++        return ""
++
++
++def _kit_revision_from_rows(rows) -> tuple:
++    """Чистое ядро правил патча 22 (без обращения к БД).
++
++    rows — листы комплекта (dict documents: revision, status_date).
++    Возвращает (ревизия, дата): максимальная ревизия по _rev_key
++    (исходная строка значения, например «10.0») и крайняя дата
++    status_date в формате ДД.ММ.ГГГГ. Даты сравниваются по ISO-
++    префиксу YYYY-MM-DD — строковое сравнение совпадает с
++    хронологическим; форматирование — в самом конце. Нет данных →
++    ("", "").
++    """
++    best_rev, best_key = "", -1.0
++    best_iso = ""
++    for r in rows or []:
++        k = _rev_key(r.get("revision"))
++        if k > best_key:
++            best_key, best_rev = k, _s(r.get("revision"))
++        iso = _s(r.get("status_date"))[:10]
++        if iso > best_iso:
++            best_iso = iso
++    return best_rev, _format_rev_date(best_iso)
++
++
++def get_kit_revision_info(codes=None) -> dict:
++    """«Ревизия комплекта» и «Дата ревизии» (патч 22) — батчевый API
++    в стиле get_kit_statuses: ОДИН проход по БД на весь список шифров.
++
++    codes=None → {шифр: {"revision": …, "date": …}} по всем комплектам
++    базы; строка трактуется как один шифр; список/кортеж — батч.
++    Шифры нормализуются (normalize_kit_code), отсутствующие в Витро
++    в результат не попадают (UI подставит пустые строки), пустые шифры
++    пропускаются. Листы комплекта — unique_vitro_sheets (последние
++    ревизии, «липкое» аннулирование, нормализация шифров, отсечение
++    мусорных); правила — _kit_revision_from_rows. Значения: revision —
++    строка («10.0») или "", date — «ДД.ММ.ГГГГ» или "".
++    """
++    rows_by_kit: dict = {}
++    for r in unique_vitro_sheets(_load_vitro_sheets_raw()):
++        cx = str(r.get("complex") or "")
++        if not cx:
++            continue
++        rows_by_kit.setdefault(cx, []).append(r)
++
++    result: dict = {}
++    for cx, rows in rows_by_kit.items():
++        rev, dt = _kit_revision_from_rows(rows)
++        result[cx] = {"revision": rev, "date": dt}
++
++    if codes is None:
++        return result
++
++    if isinstance(codes, str):
++        codes = [codes]
++    out: dict = {}
++    for c in codes or []:
++        key = normalize_kit_code(c)
++        if not key:
++            continue  # пустой шифр — не комплект; UI подставит пустые
++        out[key] = result.get(key, {"revision": "", "date": ""})
++    return out
+diff --git a/vitro/ui/export.py b/vitro/ui/export.py
+index 13da867..8f6e664 100644
+--- a/vitro/ui/export.py
++++ b/vitro/ui/export.py
+@@ -5,9 +5,12 @@
+ Вся аналитика синхронизирована с дашбордом через `_load_all_categorized`.
+ Колонки по ответственным: 🔴 АТП ТЛП / 🔵 Ждут заказчика / 🔴 Хроника / 🟢 Учтено A/B.
+ 
+-Подвкладка «🔄 Обновить статусы» (патч 21): во внешний перечень
+-комплектов (Excel) добавляется колонка «Статус комплекта» —
+-логика в vitro/sheets.py (get_kit_status / get_kit_statuses).
++Подвкладка «🔄 Обновить статусы» (патчи 21–22): во внешний перечень
++комплектов (Excel) добавляются колонки «Статус комплекта», «Ревизия
++комплекта» и «Дата ревизии» — логика в vitro/sheets.py
++(get_kit_statuses / get_kit_revision_info). Выгрузка — стилизованная
++_xlsx_add_kit_status: строка «База актуальна на …» (та же дата, что
++в шапке приложения), шапка, границы, автофильтр.
+ 
+ Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
+ """
+@@ -17,11 +20,14 @@ from datetime import datetime
+ 
+ import pandas as pd
+ import streamlit as st
++from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
++from openpyxl.utils import get_column_letter
+ 
+ from vitro.sqlite_db import get_conn
+ from vitro._cache import versioned_cache
+ from vitro.sheets import (
+     KIT_STATUS_NOT_LOADED,
++    get_kit_revision_info,
+     get_kit_statuses,
+     normalize_kit_code,
+     unique_vitro_sheets,
+@@ -693,6 +699,105 @@ def _df_to_xlsx(df: pd.DataFrame, sheet_name: str = "Данные") -> bytes:
+     return buf.getvalue()
+ 
+ 
++# Оформление стилизованной выгрузки подвкладки «Обновить статусы»
++# (патч 22, согласовано): заливка объединённой ячейки — как полоса
++# даты приложения (#E8F0F8, app.py), заливка шапок kit-колонок —
++# светло-голубая (#D9E1F2, светлее синей основной шапки 0070C0 в
++# xlsx_builder.py); тонкие границы — как THIN_BORDER в xlsx_builder.
++_KIT_XLSX_TITLE_FILL = PatternFill("solid", fgColor="E8F0F8")
++_KIT_XLSX_TITLE_FONT = Font(bold=True, size=12, color="1F4E78")
++_KIT_XLSX_HEADER_FILL = PatternFill("solid", fgColor="D9E1F2")
++_KIT_XLSX_BORDER = Border(
++    left=Side(style="thin", color="808080"),
++    right=Side(style="thin", color="808080"),
++    top=Side(style="thin", color="808080"),
++    bottom=Side(style="thin", color="808080"),
++)
++_KIT_XLSX_CENTER = Alignment(horizontal="center", vertical="center",
++                             wrap_text=True)
++
++
++def _xlsx_add_kit_status(df: pd.DataFrame, sync_ts: str | None = None,
++                         sheet_name: str = "Комплекты") -> bytes:
++    """Стилизованная выгрузка подвкладки «Обновить статусы» (патч 22).
++
++    Отличия от _df_to_xlsx (остальные выгрузки продолжают ею
++    пользоваться без изменений):
++      * строка 1 — объединённая ячейка во всю ширину таблицы «База
++        актуальна на ДД.ММ.ГГГГ, ЧЧ:ММ (МСК)»: sync_ts — тот же
++        timestamp, что в шапке приложения (_load_last_sync_date →
++        fmt_msk); синков не было → «База актуальна на —»;
++      * шапка в строке 2: жирный шрифт, центр, тонкие границы;
++        светло-голубая заливка #D9E1F2 у шапок трёх kit-колонок;
++      * тонкие границы (#808080) у ВСЕХ ячеек шапки и данных;
++        данные kit-колонок выровнены по центру;
++      * автофильтр по всей таблице (шапка — строка 2).
++    """
++    from vitro.time_utils import fmt_msk  # утилита времени, лениво
++
++    n_cols = len(df.columns)
++    last_letter = get_column_letter(n_cols)
++    n_rows = len(df)
++    kit_cols = {KIT_STATUS_COL, KIT_REVISION_COL, KIT_REV_DATE_COL}
++
++    buf = io.BytesIO()
++    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
++        # startrow=1: строка 1 резервируется под объединённую ячейку
++        # «База актуальна на …», шапка попадает в строку 2, данные —
++        # с строки 3
++        df.to_excel(writer, index=False, sheet_name=sheet_name[:31],
++                    startrow=1)
++        ws = writer.sheets[sheet_name[:31]]
++
++        # Строка 1 — объединённая ячейка с датой актуальности базы:
++        # тот же источник, что в шапке приложения (ТЗ патча 22)
++        ws.merge_cells(f"A1:{last_letter}1")
++        title = ws.cell(row=1, column=1)
++        title.value = ("База актуальна на "
++                       f"{fmt_msk(sync_ts, with_msk_label=True)}")
++        title.font = _KIT_XLSX_TITLE_FONT
++        title.alignment = _KIT_XLSX_CENTER
++        ws.row_dimensions[1].height = 22
++        for col_idx in range(1, n_cols + 1):
++            c = ws.cell(row=1, column=col_idx)
++            c.fill = _KIT_XLSX_TITLE_FILL
++            c.border = _KIT_XLSX_BORDER
++
++        # Строка 2 — шапка таблицы: жирный шрифт, центр, границы;
++        # светло-голубая заливка у kit-колонок (согласовано)
++        for col_idx, col_name in enumerate(df.columns, start=1):
++            c = ws.cell(row=2, column=col_idx)
++            c.font = Font(bold=True)
++            c.alignment = _KIT_XLSX_CENTER
++            c.border = _KIT_XLSX_BORDER
++            if col_name in kit_cols:
++                c.fill = _KIT_XLSX_HEADER_FILL
++
++        # Данные — тонкие границы у ВСЕХ ячеек; kit-колонки по центру
++        for row in ws.iter_rows(min_row=3, max_row=n_rows + 2,
++                                max_col=n_cols):
++            for c in row:
++                c.border = _KIT_XLSX_BORDER
++                if df.columns[c.column - 1] in kit_cols:
++                    c.alignment = _KIT_XLSX_CENTER
++
++        # Ширины колонок — та же логика, что в _df_to_xlsx
++        for col_idx, col_name in enumerate(df.columns, start=1):
++            letter = get_column_letter(col_idx)
++            max_len = max(
++                len(str(col_name)),
++                int(df[col_name].astype(str).str.len().max())
++                if n_rows else 0,
++            )
++            ws.column_dimensions[letter].width = min(max_len + 2, 60)
++
++        # Автофильтр по всей таблице (шапка — строка 2)
++        ws.auto_filter.ref = f"A2:{last_letter}{n_rows + 2}"
++
++    buf.seek(0)
++    return buf.getvalue()
++
++
+ def _make_download(df: pd.DataFrame, filename_base: str, key_suffix: str,
+                     formats=("xlsx", "pdf"), subtitle: str = "",
+                     pdf_max_rows: int = 1000):
+@@ -915,9 +1020,11 @@ def _render_analytics():
+ 
+ 
+ # ---------------------------------------------------------------------------
+-#  Секция 4: Обновить статусы комплектов (патч 21)
++#  Секция 4: Обновить статусы комплектов (патчи 21–22)
+ # ---------------------------------------------------------------------------
+ KIT_STATUS_COL = "Статус комплекта"
++KIT_REVISION_COL = "Ревизия комплекта"   # патч 22
++KIT_REV_DATE_COL = "Дата ревизии"        # патч 22
+ 
+ # Заголовки колонки шифров в порядке приоритета (ТЗ патча 21);
+ # сравнение — по канонической форме _norm_header
+@@ -962,14 +1069,33 @@ def _load_all_kit_statuses() -> dict:
+     return get_kit_statuses()
+ 
+ 
++@versioned_cache(600)
++def _load_all_kit_revision_info() -> dict:
++    """{шифр: {"revision": …, "date": …}} — один срез БД (патч 22).
++
++    sheets.get_kit_revision_info(None): тот же срез
++    unique_vitro_sheets, что и у статусов. versioned_cache — сброс
++    при синке, как у статусного загрузчика.
++    """
++    return get_kit_revision_info()
++
++
+ def _apply_kit_statuses(df: pd.DataFrame, col: str,
+-                        statuses: dict) -> pd.DataFrame:
+-    """Добавляет колонку «Статус комплекта» В КОНЕЦ таблицы (патч 21).
++                        statuses: dict,
++                        rev_info: dict | None = None) -> pd.DataFrame:
++    """Добавляет kit-колонки В КОНЕЦ таблицы (патчи 21, 22).
+ 
+     col — колонка шифров (результат _find_kit_code_column); шифры
+-    нормализуются перед сопоставлением со словарём статусов
+-    (латинские двойники, регистр, пробелы). Комплекта нет в Витро /
+-    пустой шифр → «План (не загружен)» (правило 2, согласовано).
++    нормализуются перед сопоставлением со словарями (латинские
++    двойники, регистр, пробелы).
++
++    Патч 21: «Статус комплекта» — «A»/«B»/«C»/«План (не загружен)»;
++    комплекта нет в Витро / пустой шифр → «План (не загружен)»
++    (правило 2, согласовано).
++    Патч 22 (rev_info передан): справа от статуса — «Ревизия
++    комплекта» и «Дата ревизии» (значения {"revision", "date"} из
++    get_kit_revision_info); комплекта нет / пустой шифр / нет данных
++    → пустая строка (правило ТЗ патча 22).
+     Исходный DataFrame не мутируется.
+     """
+     out = df.copy()
+@@ -977,21 +1103,31 @@ def _apply_kit_statuses(df: pd.DataFrame, col: str,
+         statuses.get(normalize_kit_code(code), KIT_STATUS_NOT_LOADED)
+         for code in out[col].tolist()
+     ]
++    if rev_info is not None:
++        rows = [
++            rev_info.get(normalize_kit_code(code),
++                         {"revision": "", "date": ""})
++            for code in out[col].tolist()
++        ]
++        out[KIT_REVISION_COL] = [r["revision"] for r in rows]
++        out[KIT_REV_DATE_COL] = [r["date"] for r in rows]
+     return out
+ 
+ 
+ def _render_kit_status_update():
+-    """Подвкладка «🔄 Обновить статусы» (патч 21).
++    """Подвкладка «🔄 Обновить статусы» (патчи 21–22).
+ 
+     Пользователь загружает Excel с перечнем комплектов — для каждого
+-    шифра подставляется статус комплекта по актуальным листам Витро;
+-    предпросмотр — первые 10 строк, выгрузка — обновлённый Excel.
++    шифра подставляются статус, ревизия комплекта и дата ревизии по
++    актуальным листам Витро; предпросмотр — первые 10 строк,
++    выгрузка — стилизованный Excel (_xlsx_add_kit_status).
+     """
+     st.markdown("### 🔄 Обновить статусы комплектов")
+     st.caption(
+         "Загрузите перечень комплектов (Excel) — для каждого шифра "
+-        "подставится статус комплекта по листам Витро: «A» / «B» / "
+-        "«C» / «План (не загружен)»."
++        "подставятся статус комплекта («A» / «B» / «C» / «План "
++        "(не загружен)»), ревизия комплекта и дата ревизии по листам "
++        "Витро."
+     )
+ 
+     uploaded = st.file_uploader(
+@@ -1029,11 +1165,13 @@ def _render_kit_status_update():
+         return
+ 
+     statuses = _load_all_kit_statuses()
+-    result = _apply_kit_statuses(df, col, statuses)
++    rev_info = _load_all_kit_revision_info()
++    result = _apply_kit_statuses(df, col, statuses, rev_info)
+ 
+     n_found = int((result[KIT_STATUS_COL] != KIT_STATUS_NOT_LOADED).sum())
+     st.success(
+-        f"Колонка «{KIT_STATUS_COL}» добавлена (шифры — «{col}»). "
++        f"Колонки «{KIT_STATUS_COL}», «{KIT_REVISION_COL}», "
++        f"«{KIT_REV_DATE_COL}» добавлены (шифры — «{col}»). "
+         f"Строк: {len(result)}, из них в Витро: {n_found}."
+     )
+ 
+@@ -1047,9 +1185,16 @@ def _render_kit_status_update():
+         st.caption("Показаны первые 10 строк. В выгрузку попадут все.")
+ 
+     st.divider()
++    # Дата актуальности базы — тот же источник, что в шапке приложения
++    # (app.py: _load_sync_date ↔ deadlines._load_last_sync_date, ТЗ
++    # патча 22). Ленивый импорт — по паттерну _load_active_df.
++    from vitro.ui.deadlines import _load_last_sync_date
++
+     st.download_button(
+         "📥 Скачать обновлённый Excel",
+-        data=_df_to_xlsx(result, "Комплекты"),
++        data=_xlsx_add_kit_status(
++            result, sync_ts=_load_last_sync_date(),
++            sheet_name="Комплекты"),
+         file_name=f"Комплекты_со_статусами_{datetime.now():%Y%m%d}.xlsx",
+         mime=("application/vnd.openxmlformats-officedocument"
+               ".spreadsheetml.sheet"),
