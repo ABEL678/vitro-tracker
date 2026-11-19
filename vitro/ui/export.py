@@ -1250,15 +1250,16 @@ def _xlsx_add_kit_status(
     Два режима по типу source:
 
     1. Загруженный Excel (file_uploader) — ОСНОВНОЙ режим вызова
-       из UI (фиксы 21.x): ИСХОДНЫЙ файл открывается через openpyxl
-       и сохраняет своё форматирование; справа от таблицы
-       добавляются три kit-колонки («Статус комплекта», «Ревизия
-       комплекта», «Дата ревизии»), в строку 1 вставляется
-       объединённая полоса «База актуальна на …» — шапка и данные
-       сдвигаются на строку вниз. Шапки kit-колонок — заливка
-       D9E1F2 (согласовано), у всех ячеек таблицы тонкие границы
-       #808080, kit-колонки по центру, автофильтр по диапазону
-       таблицы.
+       из UI: ИСХОДНЫЙ файл открывается через openpyxl и сохраняет
+       своё форматирование; справа от таблицы добавляются три
+       kit-колонки («Статус комплекта», «Ревизия комплекта», «Дата
+       ревизии»). Полоса «База актуальна на …» пишется ПОД таблицей
+       (строка last_row + 2) и не сдвигает шапку и данные: вставка
+       строки ломала файлы с объединёнными ячейками в шапке
+       (пересекающиеся merge → Excel «Ошибка в части содержимого»).
+       Шапки kit-колонок — заливка D9E1F2 (согласовано), у всех
+       ячеек таблицы тонкие границы #808080, kit-колонки по центру,
+       автофильтр только по шапке и данным.
 
     2. pd.DataFrame (уже с kit-колонками от _apply_kit_statuses —
        так зовут тесты scripts/test_patch22.py и fallback) —
@@ -1366,13 +1367,18 @@ def _styled_upload_to_xlsx(
 
     Простая реализация поверх фикс-цепочки 21.x: находит строку
     заголовка «Шифр РД», добавляет справа ТРИ kit-колонки (статус,
-    ревизия, дата ревизии) и вставляет строку 1 с полосой «База
-    актуальна на …» — шапка и данные сдвигаются на строку вниз.
+    ревизия, дата ревизии). Полоса «База актуальна на …» пишется ПОД
+    таблицей — в строке last_row + 2, объединённой во всю ширину.
+    Шапка и данные НЕ сдвигаются: insert_rows(1) ломал файлы с
+    объединёнными ячейками в шапке (openpyxl не сдвигает merge при
+    вставке строки → два пересекающихся диапазона → Excel
+    «Ошибка в части содержимого»).
+
     Форматирование исходного файла сохраняется: меняются только
     границы ячеек таблицы и добавленные колонки. Шапки kit-колонок
     — заливка D9E1F2 (согласовано), тонкие границы #808080 у всех
-    ячеек таблицы, kit-колонки по центру, автофильтр по диапазону
-    таблицы.
+    ячеек таблицы, kit-колонки по центру, автофильтр только по
+    шапке и данным (полоса под таблицей в него не попадает).
     """
     wb = openpyxl.load_workbook(uploaded_file, read_only=False,
                                 keep_vba=False)
@@ -1413,7 +1419,7 @@ def _styled_upload_to_xlsx(
 
     # --- 2. Последняя колонка и последняя строка данных ---
     max_col = ws.max_column
-    last_row = 0
+    last_row = header_row_idx
     for r in range(header_row_idx + 1, ws.max_row + 1):
         val = ws.cell(row=r, column=kit_col_num).value
         if val is not None and not pd.isna(val):
@@ -1425,25 +1431,10 @@ def _styled_upload_to_xlsx(
     col_date = max_col + 3
     last_letter = get_column_letter(col_date)
 
-    # --- 4. Полоса даты в строке 1 (шапка и данные уезжают вниз) ---
-    ws.insert_rows(1)
-    header_row_idx += 1
-    last_row += 1
+    # Шапка и данные НЕ сдвигаются (insert_rows(1) ломал файлы с
+    # объединёнными ячейками в шапке); полоса даты — под таблицей.
 
-    for i in range(1, col_date + 1):
-        ws.cell(row=1, column=i).border = Border(
-            left=_KIT_BORDER_SIDE if i == 1 else None,
-            right=_KIT_BORDER_SIDE if i == col_date else None,
-            top=_KIT_BORDER_SIDE, bottom=_KIT_BORDER_SIDE,
-        )
-    strip = ws.cell(row=1, column=1, value=_kit_sync_caption(sync_ts))
-    strip.font = Font(bold=True)
-    strip.fill = _KIT_DATE_FILL
-    strip.alignment = Alignment(horizontal="center", vertical="center")
-    ws.merge_cells(f"A1:{last_letter}1")
-    ws.row_dimensions[1].height = 22
-
-    # --- 5. Шапки трёх kit-колонок (D9E1F2, согласовано) ---
+    # --- 4. Шапки трёх kit-колонок (D9E1F2, согласовано) ---
     for col_num, name in ((col_status, status_col_name),
                           (col_rev, KIT_REVISION_COL),
                           (col_date, KIT_REV_DATE_COL)):
@@ -1456,18 +1447,21 @@ def _styled_upload_to_xlsx(
         ws.column_dimensions[get_column_letter(col_num)].width = 16
 
     # --- 6. Батч-вычисление статусов и ревизий для всех шифров ---
-    codes = []
+    # code_by_row — чтобы значения попали в ФАКТИЧЕСКУЮ строку
+    # шифра: при пустых строках внутри таблицы сплошной список
+    # сдвигал бы kit-значения вверх.
+    code_by_row = {}
     for r in range(header_row_idx + 1, last_row + 1):
         val = ws.cell(row=r, column=kit_col_num).value
         if val is not None and not pd.isna(val):
-            codes.append(val)
+            code_by_row[r] = val
 
+    codes = list(code_by_row.values())
     kit_statuses = get_kit_statuses(codes)
     kit_revisions = get_kit_revision_info(codes)
 
     # --- 7. Значения трёх kit-колонок, выравнивание по центру ---
-    for idx, code in enumerate(codes):
-        r = header_row_idx + 1 + idx
+    for r, code in code_by_row.items():
         norm = normalize_kit_code(code)
         rev = kit_revisions.get(norm) or {}
         for col_num, value in (
@@ -1484,11 +1478,42 @@ def _styled_upload_to_xlsx(
         for i in range(1, col_date + 1):
             ws.cell(row=r, column=i).border = _KIT_TABLE_BORDER
 
-    # --- 9. Автофильтр по всему диапазону таблицы ---
+    # --- 9. Автофильтр ТОЛЬКО по шапке и данным (без полосы даты) ---
     if last_row > header_row_idx:
         ws.auto_filter.ref = f"A{header_row_idx}:{last_letter}{last_row}"
+    else:
+        ws.auto_filter.ref = None
 
-    # --- 10. Сохраняем в буфер ---
+    # --- 10. Полоса «База актуальна на …» ПОД таблицей ---
+    # Строка strip_row = last_row + 2 (одна пустая строка-отступ от
+    # таблицы). Вставка строки сверху (insert_rows(1)) убрана: она
+    # не сдвигала существующие объединённые ячейки, из-за чего в
+    # файле оказывались пересекающиеся merge-диапазоны и Excel
+    # выдавал «Ошибка в части содержимого».
+    strip_row = last_row + 2
+
+    # Защита от наложения: если в исходном файле есть объединённые
+    # ячейки в полосе strip_row, удаляем их — иначе новый merge
+    # пересечётся с ними и файл снова станет невалидным.
+    for rng in list(ws.merged_cells.ranges):
+        if rng.min_row <= strip_row <= rng.max_row:
+            ws.unmerge_cells(str(rng))
+
+    for i in range(1, col_date + 1):
+        ws.cell(row=strip_row, column=i).border = Border(
+            left=_KIT_BORDER_SIDE if i == 1 else None,
+            right=_KIT_BORDER_SIDE if i == col_date else None,
+            top=_KIT_BORDER_SIDE, bottom=_KIT_BORDER_SIDE,
+        )
+    strip = ws.cell(row=strip_row, column=1,
+                    value=_kit_sync_caption(sync_ts))
+    strip.font = Font(bold=True)
+    strip.fill = _KIT_DATE_FILL
+    strip.alignment = Alignment(horizontal="center", vertical="center")
+    ws.merge_cells(f"A{strip_row}:{last_letter}{strip_row}")
+    ws.row_dimensions[strip_row].height = 22
+
+    # --- 11. Сохраняем в буфер ---
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
