@@ -1250,16 +1250,15 @@ def _xlsx_add_kit_status(
     Два режима по типу source:
 
     1. Загруженный Excel (file_uploader) — ОСНОВНОЙ режим вызова
-       из UI: ИСХОДНЫЙ файл открывается через openpyxl и сохраняет
-       своё форматирование; справа от таблицы добавляются три
-       kit-колонки («Статус комплекта», «Ревизия комплекта», «Дата
-       ревизии»). Полоса «База актуальна на …» пишется ПОД таблицей
-       (строка last_row + 2) и не сдвигает шапку и данные: вставка
-       строки ломала файлы с объединёнными ячейками в шапке
-       (пересекающиеся merge → Excel «Ошибка в части содержимого»).
-       Шапки kit-колонок — заливка D9E1F2 (согласовано), у всех
-       ячеек таблицы тонкие границы #808080, kit-колонки по центру,
-       автофильтр только по шапке и данным.
+       из UI (фиксы 21.x): ИСХОДНЫЙ файл открывается через openpyxl
+       и сохраняет своё форматирование; справа от таблицы
+       добавляются три kit-колонки («Статус комплекта», «Ревизия
+       комплекта», «Дата ревизии»), в строку 1 вставляется
+       объединённая полоса «База актуальна на …» — шапка и данные
+       сдвигаются на строку вниз. Шапки kit-колонок — заливка
+       D9E1F2 (согласовано), у всех ячеек таблицы тонкие границы
+       #808080, kit-колонки по центру, автофильтр по диапазону
+       таблицы.
 
     2. pd.DataFrame (уже с kit-колонками от _apply_kit_statuses —
        так зовут тесты scripts/test_patch22.py и fallback) —
@@ -1283,8 +1282,10 @@ def _styled_df_to_xlsx(df: pd.DataFrame, sheet_name: str = "Комплекты",
                        sync_ts=None) -> bytes:
     """Режим 2 _xlsx_add_kit_status: сборка книги «с нуля» (патч 22).
 
-    Строка 1 — объединённая полоса «База актуальна на …» (заливка
-    #E8F0F8, как .date-bar в app.py; рамка по контуру полосы),
+    Строка 1 — полоса «База актуальна на …» во всю ширину таблицы
+    (заливка #E8F0F8, как .date-bar в app.py; рамка по контуру),
+    ТЕКСТ полосы объединён над шапками kit-колонок (уточнение
+    от 19.11.2026: дата стоит прямо над «Статус/Ревизия/Дата»),
     строка 2 — шапка (у трёх kit-колонок заливка D9E1F2, у всех
     колонок жирный шрифт и тонкие границы #808080), данные с 3-й
     строки (тонкие границы у всех ячеек, kit-колонки по центру),
@@ -1301,17 +1302,25 @@ def _styled_df_to_xlsx(df: pd.DataFrame, sheet_name: str = "Комплекты",
                            KIT_REV_DATE_COL)}
 
     # --- Строка 1: полоса даты актуальности базы ---
+    # Полоса (заливка E8F0F8, рамка по контуру) идёт во всю ширину
+    # таблицы, а ТЕКСТ объединён над шапками kit-колонок — дата видна
+    # прямо над «Статус/Ревизия/Дата ревизии», а не по центру всей
+    # ширины (уточнение 19.11.2026). Без kit-колонок — во всю ширину.
     for i in range(1, n_cols + 1):
-        ws.cell(row=1, column=i).border = Border(
+        _c = ws.cell(row=1, column=i)
+        _c.border = Border(
             left=_KIT_BORDER_SIDE if i == 1 else None,
             right=_KIT_BORDER_SIDE if i == n_cols else None,
             top=_KIT_BORDER_SIDE, bottom=_KIT_BORDER_SIDE,
         )
-    strip = ws.cell(row=1, column=1, value=_kit_sync_caption(sync_ts))
+        _c.fill = _KIT_DATE_FILL
+    _ks = min(kit_idx) if kit_idx else 1
+    _ke = max(kit_idx) if kit_idx else n_cols
+    strip = ws.cell(row=1, column=_ks, value=_kit_sync_caption(sync_ts))
     strip.font = Font(bold=True)
-    strip.fill = _KIT_DATE_FILL
     strip.alignment = Alignment(horizontal="center", vertical="center")
-    ws.merge_cells(f"A1:{last_letter}1")
+    ws.merge_cells(start_row=1, start_column=_ks,
+                   end_row=1, end_column=_ke)
     ws.row_dimensions[1].height = 22
 
     # --- Строка 2: шапка таблицы ---
@@ -1368,7 +1377,9 @@ def _styled_upload_to_xlsx(
     Находит строку заголовка «Шифр РД», добавляет справа ТРИ
     kit-колонки (статус, ревизия, дата ревизии) и вставляет строку 1
     с полосой «База актуальна на …» — шапка и данные сдвигаются на
-    строку вниз (одобренный дизайн: полоса НАД шапкой). Форматирование
+    строку вниз (одобренный дизайн: полоса НАД шапкой, ТЕКСТ полосы
+    объединён над шапками kit-колонок — уточнение 19.11.2026).
+    Форматирование
     исходного файла сохраняется: меняются только границы ячеек таблицы
     и добавленные колонки. Шапки kit-колонок — заливка D9E1F2
     (согласовано), тонкие границы #808080 у всех ячеек таблицы,
@@ -1383,7 +1394,7 @@ def _styled_upload_to_xlsx(
        /xl/tables/table1.xml». Таблицы на других листах не трогаются.
     2. Merge-диапазоны исходника снимаются перед insert_rows() и
        возвращаются со сдвигом на строку вниз: openpyxl НЕ сдвигает
-       merges, старые пересеклись бы с полосой A1:…1. (Любой merge
+       merges, старые пересеклись бы с полосой строки 1. (Любой merge
        исходника ограничен max_column, а kit-колонки — правее, так
        что в зону kit-колонок merges попасть не могут.)
     3. kit-значения пишутся в ФАКТИЧЕСКИЕ строки (словарь
@@ -1465,21 +1476,28 @@ def _styled_upload_to_xlsx(
     last_letter = get_column_letter(col_date)
 
     # --- 5. Полоса даты в строке 1 (шапка и данные уезжают вниз) ---
+    # Полоса — заливка/рамка во всю ширину таблицы, а ТЕКСТ объединён
+    # над шапками трёх kit-колонок: дата стоит прямо над «Статус/
+    # Ревизия/Дата ревизии» (уточнение 19.11.2026), а не по центру
+    # всей ширины бланка.
     ws.insert_rows(1)
     header_row_idx += 1
     last_row += 1
 
     for i in range(1, col_date + 1):
-        ws.cell(row=1, column=i).border = Border(
+        _c = ws.cell(row=1, column=i)
+        _c.border = Border(
             left=_KIT_BORDER_SIDE if i == 1 else None,
             right=_KIT_BORDER_SIDE if i == col_date else None,
             top=_KIT_BORDER_SIDE, bottom=_KIT_BORDER_SIDE,
         )
-    strip = ws.cell(row=1, column=1, value=_kit_sync_caption(sync_ts))
+        _c.fill = _KIT_DATE_FILL
+    strip = ws.cell(row=1, column=col_status,
+                    value=_kit_sync_caption(sync_ts))
     strip.font = Font(bold=True)
-    strip.fill = _KIT_DATE_FILL
     strip.alignment = Alignment(horizontal="center", vertical="center")
-    ws.merge_cells(f"A1:{last_letter}1")
+    ws.merge_cells(start_row=1, start_column=col_status,
+                   end_row=1, end_column=col_date)
     ws.row_dimensions[1].height = 22
 
     # --- 5.1. Возвращаем merges исходника со сдвигом +1 ---

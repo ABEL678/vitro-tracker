@@ -174,12 +174,14 @@ def merges_overlap(ranges) -> bool:
     return False
 
 
-def no_overlap_with_strip(ws, strip_row: int = 1) -> bool:
+def no_overlap_with_strip(ws, strip_ref: str = "D1:F1") -> bool:
     """Ни один merge не пересекает строку полосы (кроме самой полосы)."""
+    from openpyxl.utils import range_boundaries
+    _, s_row, _, _e = range_boundaries(strip_ref)
     for rng in ws.merged_cells.ranges:
-        if str(rng) == f"A{strip_row}:F{strip_row}":
+        if str(rng) == strip_ref:
             continue
-        if rng.min_row <= strip_row <= rng.max_row:
+        if rng.min_row <= s_row <= rng.max_row:
             return False
     return True
 
@@ -197,11 +199,14 @@ check("1: в выгрузке нет xl/tables/*.xml (диалог «table1.xml�
 wb_out = openpyxl.load_workbook(io.BytesIO(out))
 ws_out = wb_out["Комплекты"]
 check("1: после перезагрузки у листа нет таблиц", len(ws_out.tables) == 0)
-check("1: merge-полоса даты A1:F1",
-      "A1:F1" in [str(r) for r in ws_out.merged_cells.ranges])
-check("1: A1 — «База актуальна на —» (sync_ts=None)",
-      ws_out["A1"].value == "База актуальна на —",
-      f"получено «{ws_out['A1'].value}»")
+check("1: текст полосы объединён над kit-колонками (D1:F1)",
+      "D1:F1" in [str(r) for r in ws_out.merged_cells.ranges])
+check("1: D1 — «База актуальна на —» (sync_ts=None), над kit-шапкой",
+      ws_out["D1"].value == "База актуальна на —",
+      f"получено «{ws_out['D1'].value}»")
+check("1: заливка полосы E8F0F8 во всю ширину строки 1 (A1..D1)",
+      all(str(ws_out.cell(row=1, column=i).fill.start_color.rgb)[-6:]
+          == "E8F0F8" for i in range(1, 5)))
 check("1: шапка в строке 2: A2 = «Шифр РД»",
       ws_out["A2"].value == "Шифр РД")
 check("1: шапка в строке 2: D2/E2/F2 — три kit-колонки",
@@ -234,8 +239,8 @@ out_m = export(build_source(merged_title=True))
 wb_m = openpyxl.load_workbook(io.BytesIO(out_m))
 ws_m = wb_m["Комплекты"]
 mr = [str(r) for r in ws_m.merged_cells.ranges]
-check("2: полоса A1:F1 и сдвинутый заголовок A2:C2",
-      "A1:F1" in mr and "A2:C2" in mr, f"merges: {mr}")
+check("2: полоса D1:F1 и сдвинутый заголовок A2:C2",
+      "D1:F1" in mr and "A2:C2" in mr, f"merges: {mr}")
 check("2: заголовок не пересекается с полосой",
       not merges_overlap(list(ws_m.merged_cells.ranges)),
       f"merges: {mr}")
@@ -294,8 +299,8 @@ ws_n = wb_n["Комплекты"]
 check("5: примечание под таблицей сохранено (A7)",
       ws_n["A7"].value == "Перевыпускаем 18.11. Выяснить что делаем с колодцами",
       f"получено «{ws_n['A7'].value}»")
-check("5: полоса на месте (A1)",
-      ws_n["A1"].value == "База актуальна на —")
+check("5: полоса на месте (D1, над kit-колонками)",
+      ws_n["D1"].value == "База актуальна на —")
 
 # ---------------------------------------------------------------------------
 #  6. Пустая таблица (только шапка, без данных)
@@ -304,7 +309,7 @@ seed_db()
 out_empty = export(build_source(empty_data=True))
 wb_e = openpyxl.load_workbook(io.BytesIO(out_empty))
 ws_e = wb_e["Комплекты"]
-check("6: полоса в строке 1", ws_e["A1"].value == "База актуальна на —")
+check("6: полоса в строке 1 (D1)", ws_e["D1"].value == "База актуальна на —")
 check("6: шапка в строке 2", ws_e["A2"].value == "Шифр РД")
 check("6: автофильтр не ставится",
       ws_e.auto_filter.ref in (None, ""),
@@ -324,8 +329,11 @@ ws_w = wb_w["Комплекты"]
 mr_w = [str(r) for r in ws_w.merged_cells.ranges]
 check("7: нет пересекающихся merges",
       not merges_overlap(list(ws_w.merged_cells.ranges)), f"merges: {mr_w}")
-check("7: баннер возвращён со сдвигом (A2:H2), полоса A1:K1",
-      "A2:H2" in mr_w and "A1:K1" in mr_w, f"merges: {mr_w}")
+check("7: баннер возвращён со сдвигом (A2:H2), полоса над kit-колонками I1:K1",
+      "A2:H2" in mr_w and "I1:K1" in mr_w, f"merges: {mr_w}")
+check("7: текст полосы в I1 — над шапкой kit-колонок",
+      ws_w["I1"].value == "База актуальна на —",
+      f"получено «{ws_w['I1'].value}»")
 check("7: шапка в строке 3", ws_w["A3"].value == "Шифр РД",
       f"получено «{ws_w['A3'].value}»")
 # баннер раздувает max_column до 8 → kit-колонки уходят на I/J/K

@@ -322,23 +322,36 @@ def has_thin_border(c) -> bool:
                for s in ("left", "right", "top", "bottom"))
 
 
-# строка 1 — объединённая ячейка с датой актуальности базы
+# строка 1 — полоса даты: заливка/рамка во всю ширину, а ТЕКСТ
+# объединён над шапками kit-колонок (уточнение 19.11.2026)
+kit_first = openpyxl.utils.get_column_letter(min(kit_idx))
+kit_last = openpyxl.utils.get_column_letter(max(kit_idx))
+strip_ref = f"{kit_first}1:{kit_last}1"
 merged = [str(r) for r in ws.merged_cells.ranges]
-check(f"строка 1: объединена во всю ширину (A1:{last_letter}1)",
-      f"A1:{last_letter}1" in merged, f"merged={merged}")
-check("строка 1: текст «База актуальна на 19.11.2026, 11:46 (МСК)»",
-      ws["A1"].value == "База актуальна на 19.11.2026, 11:46 (МСК)",
-      f"получено «{ws['A1'].value}»")
-check("строка 1: жирный шрифт", ws["A1"].font.bold is True)
+check(f"строка 1: текст полосы объединён над kit-колонками ({strip_ref})",
+      strip_ref in merged, f"merged={merged}")
+check("строка 1: текст «База актуальна на 19.11.2026, 11:46 (МСК)» "
+      "стоит над первой kit-колонкой",
+      ws.cell(row=1, column=min(kit_idx)).value
+      == "База актуальна на 19.11.2026, 11:46 (МСК)",
+      f"получено «{ws.cell(row=1, column=min(kit_idx)).value}»")
+check("строка 1: жирный шрифт",
+      ws.cell(row=1, column=min(kit_idx)).font.bold is True)
 check("строка 1: выравнивание по центру",
-      ws["A1"].alignment.horizontal == "center")
-check("строка 1: заливка как полоса даты (E8F0F8)",
-      str(ws["A1"].fill.start_color.rgb)[-6:] == "E8F0F8",
-      f"получено {ws['A1'].fill.start_color.rgb}")
-# Рамка объединённой ячейки: openpyxl сохраняет для не-анкерных
-# ячеек диапазона только контурные стороны (top/bottom) — их и
-# проверяем, плюс левый край у A1 и правый у последней колонки.
-check("строка 1: рамка по всей объединённой полосе",
+      ws.cell(row=1, column=min(kit_idx)).alignment.horizontal == "center")
+# Заливка E8F0F8 — во всей строке 1. У не-анкерных ячеек merge
+# (kit-колонки правее первой) openpyxl стиль заливки не сохраняет —
+# Excel рисует объединённую область заливкой анкера, поэтому для них
+# заливка не проверяется.
+check("строка 1: заливка полосы (E8F0F8) во всю ширину строки 1",
+      all(str(ws.cell(row=1, column=i).fill.start_color.rgb)[-6:]
+          == "E8F0F8" for i in range(1, n_cols + 1)
+          if i not in set(kit_idx[1:])),
+      f"заливки: {[ws.cell(row=1, column=i).fill.start_color.rgb for i in range(1, n_cols + 1)]}")
+# Рамка полосы: контур по всей ширине строки 1 — top/bottom у всех
+# ячеек (включая не-анкерные ячейки merge), левый край у A1, правый
+# у последней колонки.
+check("строка 1: рамка по всей полосе",
       all(ws.cell(row=1, column=i).border.top.style == "thin"
           and ws.cell(row=1, column=i).border.bottom.style == "thin"
           for i in range(1, n_cols + 1))
@@ -404,8 +417,9 @@ check("ширины колонок заданы",
 xlsx_empty = _xlsx_add_kit_status(result, sync_ts=None)
 wb3 = openpyxl.load_workbook(io.BytesIO(xlsx_empty))
 check("sync_ts=None → «База актуальна на —»",
-      wb3.active["A1"].value == "База актуальна на —",
-      f"получено «{wb3.active['A1'].value}»")
+      wb3.active.cell(row=1, column=min(kit_idx)).value
+      == "База актуальна на —",
+      f"получено «{wb3.active.cell(row=1, column=min(kit_idx)).value}»")
 
 # ---------------------------------------------------------------------------
 #  Итог
