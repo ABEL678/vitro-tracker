@@ -58,7 +58,8 @@ Vitro_tracker/
 │   ├── check.py
 │   ├── test_patch21.py
 │   ├── test_patch22.py
-│   └── test_patch22_3.py
+│   ├── test_patch22_3.py
+│   └── test_patch22_5.py
 └── vitro/
     ├── config.py              # .env + переменные (APP_VERSION)
     ├── disciplines.py         # Справочник дисциплин
@@ -209,7 +210,7 @@ Vitro_tracker/
 1. **ListObject:** таблицы снимаются с целевого листа до правок (`del ws.tables[name]`), иначе `table.ref` остаётся старым → Excel удаляет `table1.xml`.
 2. **Merge:** диапазоны снимаются ДО `insert_rows` и возвращаются ПОСЛЕ через `range_boundaries`: ниже полосы — сдвиг +1, выше — без сдвига, накрывающий место вставки — расширение вниз.
 
-Тесты: `scripts/test_patch22.py` (73, режим DataFrame) и `scripts/test_patch22_3.py` (61, правка файла).
+Тесты: `scripts/test_patch22.py` (73, режим DataFrame), `scripts/test_patch22_3.py` (61, правка файла), `scripts/test_patch22_5.py` (39, журнал загрузок плана + детальная таблица без планового количества). 
 
 ⚠️ Применение патчей: `git checkout <base> -- vitro/sheets.py vitro/ui/export.py`, затем удалить тестовые файлы, затем `git apply`. Команда «в лоб» с `scripts/test_patch22.py` падает — в базовых коммитах его нет.
 
@@ -258,7 +259,7 @@ Vitro_tracker/
 4. **Цифры сходятся** — Сводка / Сроки / Авторы / Категории / Динамика.
 5. **«План выдачи»** — загрузка ведомостей, правка срока, выгрузка Excel.
 6. **«Экспорт» → «Обновить статусы»** — выгрузка открывается в Excel без диалога восстановления.
-7. **Регресс-тесты** — `scripts/test_patch22.py` и `scripts/test_patch22_3.py`, оба `EXIT=0`.
+7. **Регресс-тесты** — `scripts/test_patch22.py`, `test_patch22_3.py`, `test_patch22_5.py` — все `EXIT=0`.
 
 ## Безопасность
 

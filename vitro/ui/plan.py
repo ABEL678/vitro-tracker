@@ -1756,6 +1756,42 @@ def _render_last_warnings() -> None:
             st.write(f"- {x}")
 
 
+def _build_import_log_rows(rows) -> pd.DataFrame:
+    """Строки журнала загрузок из выборки log (патч 22.5).
+
+    Вынесено из _render_import_log, чтобы покрыть тестом баг
+    pyarrow: пустое «Строк» подставлялось как "", а колонка рендерится
+    NumberColumn → ArrowInvalid «Could not convert '' … to int64».
+    Теперь пустое значение — None (пропуск), и колонка приводится к
+    nullable-целому Int64, чтобы Excel-выгрузка и st.dataframe видели
+    целые числа, а не 42.0. Нечисловой/дробный log.rows тоже становится
+    пропуском: журнал диагностический, одна кривая запись не должна
+    валить вкладку.
+    """
+    data = [{
+        "Дата (МСК)": r["timestamp"] or "",
+        "Событие": ("Очистка плана" if r["event"] == "plan_clear"
+                    else "Загрузка ведомости"),
+        "Строк": r["rows"] if r["rows"] else None,
+        "Статус": r["status"] or "OK",
+        "Сообщение": str(r["message"] or "").replace("\n", " · "),
+    } for r in rows]
+    if data:
+        df = pd.DataFrame(data)
+        # NULL в log.rows и события без числа строк (plan_clear) —
+        # пропуски, а не ноль: 0 значил бы «распознано 0 строк».
+        # SQLite не проверяет типы INTEGER-колонок, поэтому в log.rows
+        # может лежать текст или дробь: нечисловое → пропуск (журнал
+        # диагностический — из-за одной кривой записи вкладка падать
+        # не должна), дробное → тоже пропуск (число строк целое).
+        vals = pd.to_numeric(df["Строк"], errors="coerce")
+        vals = vals.where(vals.isna() | (vals % 1 == 0))
+        df["Строк"] = vals.astype("Int64")
+        return df
+    return pd.DataFrame(columns=["Дата (МСК)", "Событие", "Строк",
+                                 "Статус", "Сообщение"])
+
+
 def _render_import_log() -> None:
     """Блок «📜 Журнал загрузок» (патч 13): последние события
     plan_import / plan_clear из таблицы log.
@@ -1776,24 +1812,17 @@ def _render_import_log() -> None:
             """).fetchall()
     except Exception:
         return  # таблицы log ещё нет (старая БД без init_db) — молча
-    data = [{
-        "Дата (МСК)": r["timestamp"] or "",
-        "Событие": ("Очистка плана" if r["event"] == "plan_clear"
-                    else "Загрузка ведомости"),
-        "Строк": r["rows"] if r["rows"] else "",
-        "Статус": r["status"] or "OK",
-        "Сообщение": str(r["message"] or "").replace("\n", " · "),
-    } for r in rows]
+    df_log = _build_import_log_rows(rows)
     with st.expander(
-            f"📜 Журнал загрузок (последние {len(data) or 0} записей)",
+            f"📜 Журнал загрузок (последние {len(df_log) or 0} записей)",
             expanded=False):
-        if not data:
+        if df_log.empty:
             st.caption("Записей ещё нет — загрузите ведомости.")
             return
         st.dataframe(
-            pd.DataFrame(data),
+            df_log,
             width='stretch', hide_index=True,
-            height=min(max(len(data) * 36 + 40, 200), 420),
+            height=min(max(len(df_log) * 36 + 40, 200), 420),
             column_config={
                 "Дата (МСК)": st.column_config.TextColumn(width="medium"),
                 "Событие": st.column_config.TextColumn(width="small"),
