@@ -213,6 +213,18 @@ Vitro_tracker/
 - **`.env`** — секреты
 - **`data/vitro.db`** — база данных
 - **`COMMIT_MSG.txt`** — временный файл для сообщений коммитов. Можно и нужно создавать для `git commit -F COMMIT_MSG.txt`, но **НИКОГДА не коммитить и не пушить**.
+- **`.commit_msg.txt`**, **`.merge_msg.txt`** — тоже временные файлы сообщений. В `.gitignore`, из индекса убраны (`git rm --cached`), на диске остаются локально.
+
+## Сообщения коммитов и merge (важно)
+
+На этой машине сообщения коммитов и merge писать **только через Python (UTF-8 без BOM)**, например:
+
+```bash
+.venv\Scripts\python.exe -c "open('COMMIT_MSG.txt','w',encoding='utf-8',newline='\n').write('текст сообщения')"
+git commit -F COMMIT_MSG.txt
+```
+
+**Нельзя** писать сообщения через `Set-Content -Encoding UTF8` в PowerShell 5.1: он добавляет BOM, и BOM попадает в заголовок коммита (кракозябры в `git log`).
 
 ## Известные проблемы
 
