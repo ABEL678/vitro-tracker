@@ -349,7 +349,25 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     vitro_counts = _vitro_sheet_counts()
     plan_qty = {}
     if not drawings.empty:
-        plan_qty = drawings.groupby("kit_code")["qty"].sum().to_dict()
+        # Патч 22.6: SQLite не проверяет типы INTEGER-колонок, поэтому в
+        # plan_drawings.qty может оказаться ТЕКСТ. Тогда весь столбец после
+        # read_sql — object, и groupby(...).sum() склеивает строки
+        # (TypeError: can only concatenate str (not "int") to str /
+        # ValueError: invalid literal for int()). Приводим к числам:
+        # нечисловой текст → NaN, как и NULL → плановых листов 0.
+        # Число текстом («3») остаётся числом 3 (errors="coerce" его парсит).
+        qty_num = pd.to_numeric(drawings["qty"], errors="coerce")
+        # Бесконечность тоже недостижима в плане, но int(inf) роняет
+        # сводку (OverflowError) — трактуем как отсутствие количества.
+        qty_num = qty_num.mask(
+            qty_num.isin([float("inf"), float("-inf")]))
+        plan_qty = (
+            drawings.assign(qty=qty_num)
+            .groupby("kit_code")["qty"]
+            .sum()
+            .fillna(0)
+            .to_dict()
+        )
 
     rows = []
     if not plan.empty:
