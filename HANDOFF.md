@@ -100,6 +100,25 @@ c7c0f73 Merge branch 'release/1.5-plan' into main (release 1.5 final)
 - `scripts/test_patch21.py` — статусы комплектов.
 - `scripts/test_patch22.py` — **73 проверки**, режим сборки из DataFrame.
 - `scripts/test_patch22_3.py` — **61 проверка**, режим правки загруженного файла: Excel-таблица, merge-заголовок, широкий баннер, пустая строка в данных, примечание под таблицей, пустая таблица, чужая таблица, титульные строки выше шапки.
+- `scripts/test_patch22_5.py` — **39 проверок**, журнал загрузок «Плана выдачи» (Arrow/NumberColumn) и детальная таблица с позицией без планового количества.
+
+### Патч 22.5 — pyarrow ArrowInvalid в «Плане выдачи»
+
+**Симптом на сервере:** вкладка «План выдачи» падала с
+`pyarrow.lib.ArrowInvalid: Could not convert '' with type str: tried to convert to int64 — Conversion failed for column Строк with type object`.
+
+**Причина:** журнал загрузок (`_render_import_log`) подставлял `""` вместо пустого числа строк, а колонка «Строк» рендерится `st.column_config.NumberColumn` → Arrow приводил object-колонку к `int64` и падал. Пустое значение возникает законно: `log_event("plan_clear", …)` вызывается **без** `rows` (по умолчанию `0`), и `if r["rows"]` для `0` ложно — как и для `NULL`.
+
+**Фикс:** сборка строк вынесена в `_build_import_log_rows(rows)`:
+- пустое → `None`, а не `""`;
+- колонка приводится к nullable `Int64` — в таблице видно `421`, а не `421.0`, и Arrow получает `int64`;
+- пустая выборка → DataFrame с теми же колонками (без падения).
+
+⚠️ `0` в `log.rows` означает «событие без числа строк», а не «распознано 0 строк» — поэтому это пропуск, а не нуль.
+
+**Детальная таблица** (`_build_sheet_plan_table`) позицию с `qty = NULL` обрабатывает корректно: строка не теряется, а в сводке `_build_overview` такая позиция даёт `0` плановых листов (проверено тестом).
+
+⚠️ **Отдельная находка (не входила в патч, НЕ исправлена):** если в `plan_drawings.qty` попадёт текст (SQLite не проверяет типы `INTEGER`), `_build_overview` падает с `TypeError: can only concatenate str (not "int") to str` — `groupby("kit_code")["qty"].sum()` складывает строки. На сервере не воспроизводилось (парсер ведомостей пишет `NULL`/число). Если появится — приводить `qty` через `pd.to_numeric(..., errors="coerce")` перед `groupby`.
 - Все тесты создают временную БД через `SQLITE_PATH` **до** импорта `vitro.sqlite_db` — реальная `data/vitro.db` не открывается.
 
 ### `vitro/ui/_filters.py` — общие фильтры
@@ -209,7 +228,8 @@ Vitro_tracker/
 │   ├── check.py               # Диагностика
 │   ├── test_patch21.py        # Статусы комплектов
 │   ├── test_patch22.py        # Ревизии (режим DataFrame, 73 проверки)
-│   └── test_patch22_3.py      # Правка загруженного файла (61 проверка)
+│   ├── test_patch22_3.py      # Правка загруженного файла (61 проверка)
+│   └── test_patch22_5.py      # Журнал загрузок + детальная таблица (39)
 └── vitro/
     ├── config.py              # .env + переменные (APP_VERSION)
     ├── disciplines.py         # Справочник дисциплин
@@ -253,6 +273,7 @@ streamlit run app.py
 .venv\Scripts\python.exe scripts\check.py
 .venv\Scripts\python.exe scripts\test_patch22.py
 .venv\Scripts\python.exe scripts\test_patch22_3.py
+.venv\Scripts\python.exe scripts\test_patch22_5.py
 git commit -F COMMIT_MSG.txt
 ```
 
