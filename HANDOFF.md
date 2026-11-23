@@ -5,13 +5,17 @@
 ### Последняя работа
 
 **Ветка:** `release/1.5-plan`
-**Последний коммит:** патч 22.8 — `log_event("refresh")` в `sync_runner.py` (полоса «База актуальна на …» обновляется при синхронизации из cron/Планировщика)
+**Последний коммит:** патч 22.9 — `PRAGMA wal_checkpoint(TRUNCATE)` при синхронизации (WAL-файл сбрасывается в основной, полоса «База актуальна на …» показывает актуальную дату после переноса базы на сервер)
 
-### Что сделано в патче 22.8
+### Что сделано в патче 22.9
 
-1. **Проблема:** полоса «База актуальна на …» не обновлялась при синхронизации через `sync_runner.py` (cron/Планировщик задач Windows). `deadlines._load_last_sync_date()` читает `MAX(timestamp)` из `log WHERE event IN ('sync_from_ui', 'refresh') AND status = 'OK'` — запись не создавалась.
-2. **Исправление:** `sync_runner.py` — после успешного `refresh_data()` вызывается `log_event("refresh", f"Загружено {N} замечаний", rows=n)`. (В `refresh_data()` (vitro/sync.py:99) вызов уже был — добавлен дублирующий вызов как гарантия.)
-3. **Тест:** `scripts/test_patch22_8.py` — 24 проверки: `log_event` записывает строку, `_load_last_sync_date()` читает `MAX(timestamp)`, `refresh_data()` с моками оставляет запись, `sync_runner.main()` возвращает 0 и пишет в log, регресс `rows=0`. Все PASS.
+1. **Проблема:** база работает в WAL-режиме (`PRAGMA journal_mode = WAL`). Свежие записи (включая последнюю запись в `log`) остаются в `vitro.db-wal` и не попадают в основной `vitro.db`. При переносе базы на сервер копированием только `vitro.db` — данные новые, но запись в журнале старая. Полоса «База актуальна на …» показывает устаревшую дату.
+2. **Исправление:** `sync_runner.py` — после `log_event("refresh")` вызывается `_checkpoint_db()` (`PRAGMA wal_checkpoint(TRUNCATE)`). `vitro/sync.py` — в конце `refresh_data()` тот же checkpoint. Теперь при копировании `vitro.db` на сервер все данные (включая log) включены.
+3. **Тест:** `scripts/test_patch22_9.py` — 18 проверок: WAL-режим включён, запись попадает в -wal до checkpoint, после checkpoint запись читается из основного файла, `refresh_data()` и `sync_runner.main()` с моками выполняют checkpoint, регресс повторного checkpoint. Все PASS.
+
+### Применение патчей 22.8/22.9
+
+Checkpoint входит в цикл синхронизации. При переносе базы на сервер дополнительных действий не нужно — `vitro.db` уже содержит все данные из WAL.
 
 **Документация обновлена** после серии патчей 21 → 22.6 (см. ниже).
 
@@ -111,6 +115,7 @@ c7c0f73 Merge branch 'release/1.5-plan' into main (release 1.5 final)
 - `scripts/test_patch22_5.py` — **39 проверок**, журнал загрузок «Плана выдачи» (Arrow/NumberColumn) и детальная таблица с позицией без планового количества.
 - `scripts/test_patch22_6.py` — **23 проверки**, защита `_build_overview` от текста/`inf` в `qty` + `APP_VERSION`.
 - `scripts/test_patch22_8.py` — **24 проверки**, `log_event("refresh")` в `sync_runner.py` и `sync.py`: запись в log, чтение `_load_last_sync_date()`, интеграция с моками, регресс `rows=0`.
+- `scripts/test_patch22_9.py` — **18 проверок**, `PRAGMA wal_checkpoint(TRUNCATE)` при синхронизации: WAL-файл сбрасывается в основной, запись в log читается из копии основного файла без -wal.
 
 ### Патч 22.5 — pyarrow ArrowInvalid в «Плане выдачи»
 
