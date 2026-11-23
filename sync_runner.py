@@ -31,6 +31,8 @@ def main() -> int:
     print(f"=== Запуск синхронизации: {datetime.now():%Y-%m-%d %H:%M:%S} ===")
     try:
         result = refresh_data(verbose=True)
+        n = result.get("comments", 0)
+        log_event("refresh", f"Загружено {n} замечаний", rows=n)
         print(f"\nИтог: {result}")
         return 0
     except Exception as exc:
