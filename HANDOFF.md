@@ -5,7 +5,7 @@
 ### Последняя работа
 
 **Ветка:** `release/1.5-plan`
-**Последний коммит:** патч 22.9 — `PRAGMA wal_checkpoint(TRUNCATE)` при синхронизации (WAL-файл сбрасывается в основной, полоса «База актуальна на …» показывает актуальную дату после переноса базы на сервер)
+**Последний коммит:** патч 22.10 — комплект «АТ-РД-СП-0-00» (Ведомость комплектов) больше не исключается из выгрузки
 
 ### Что сделано в патче 22.9
 
@@ -13,7 +13,18 @@
 2. **Исправление:** `sync_runner.py` — после `log_event("refresh")` вызывается `_checkpoint_db()` (`PRAGMA wal_checkpoint(TRUNCATE)`). `vitro/sync.py` — в конце `refresh_data()` тот же checkpoint. Теперь при копировании `vitro.db` на сервер все данные (включая log) включены.
 3. **Тест:** `scripts/test_patch22_9.py` — 18 проверок: WAL-режим включён, запись попадает в -wal до checkpoint, после checkpoint запись читается из основного файла, `refresh_data()` и `sync_runner.main()` с моками выполняют checkpoint, регресс повторного checkpoint. Все PASS.
 
-### Применение патчей 22.8/22.9
+### Что сделано в патче 22.10
+
+1. **Проблема:** файлы из папки `АТ-РД-СП-0-00` («Ведомость комплектов») отбрасывались списком `_EXCLUDED_LEAFS` в `sharepoint.py` ещё до `parse_path`, поэтому в таблице `documents` строк по этому комплекту не было. Путь в SharePoint: `/01_В процессе/01_РД/Комплекты/01_РД/Основной вид/АТ-РД-СП-0-00/` — `parse_path` вернул бы discipline="01_РД", но файл не доходил до парсера.
+2. **Исправление:**
+   - `sharepoint.py` → `_EXCLUDED_LEAFS`: убрано `"АТ-РД-СП-0-00.PDF"` и `"АТ-РД-СП-0-00.DWG"`.
+   - `fetch_atp_documents()`: для `complex == "АТ-РД-СП-0-00"` discipline переопределяется на `"АТ-РД-СП-0-00"`, section очищается.
+   - `fetch_complex_names()`: тот же override discipline.
+   - `disciplines.py` → `DISCIPLINE_NAMES`: добавлена запись `"АТ-РД-СП-0-00": "Ведомость комплектов"`.
+3. **Тест:** `scripts/test_patch22_10.py` — 26 проверок (7 блоков): `_EXCLUDED_LEAFS` не содержит файлы, `_is_excluded` проходит, `parse_path` возвращает исходные значения, `fetch_atp_documents` срабатывает override, `fetch_complex_names` включает комплект, `DISCIPLINE_NAMES` содержит запись, `discipline_name()` возвращает название, регресс обычных комплектов. Все PASS.
+4. **KPI:** файлы до сих пор не попадали в базу → замечаний к ним нет → цифры не изменятся.
+
+### Применение патчей 22.8/22.9/22.10
 
 Checkpoint входит в цикл синхронизации. При переносе базы на сервер дополнительных действий не нужно — `vitro.db` уже содержит все данные из WAL.
 
@@ -45,6 +56,9 @@ Checkpoint входит в цикл синхронизации. При пере�
 ### Последние коммиты (release/1.5-plan)
 
 ```
+0eac750 fix(sharepoint): комплект АТ-РД-СП-0-00 (Ведомость комплектов) больше не исключается
+4b7aed9 Merge branch 'release/1.5-plan' into main
+0cabf75 fix(sharepoint): комплект АТ-РД-СП-0-00 (Ведомость комплектов) больше не исключается
 a06483f feat(export): patch 22.4 v4 - date strip directly above table header, title rows unsifted
 62940f9 feat(export): patch 22.4 - date strip above header, text over kit columns
 1f3fe00 fix(export): restore date strip above header, drop ListObjects and re-anchor merges
@@ -116,6 +130,7 @@ c7c0f73 Merge branch 'release/1.5-plan' into main (release 1.5 final)
 - `scripts/test_patch22_6.py` — **23 проверки**, защита `_build_overview` от текста/`inf` в `qty` + `APP_VERSION`.
 - `scripts/test_patch22_8.py` — **24 проверки**, `log_event("refresh")` в `sync_runner.py` и `sync.py`: запись в log, чтение `_load_last_sync_date()`, интеграция с моками, регресс `rows=0`.
 - `scripts/test_patch22_9.py` — **18 проверок**, `PRAGMA wal_checkpoint(TRUNCATE)` при синхронизации: WAL-файл сбрасывается в основной, запись в log читается из копии основного файла без -wal.
+- `scripts/test_patch22_10.py` — **26 проверок**, комплект «АТ-РД-СП-0-00» (Ведомость комплектов): `_EXCLUDED_LEAFS` не содержит файлы, `_is_excluded` проходит, `parse_path` возвращает исходные значения, `fetch_atp_documents` и `fetch_complex_names` срабатывают override discipline, `DISCIPLINE_NAMES` содержит запись, регресс обычных комплектов.
 
 ### Патч 22.5 — pyarrow ArrowInvalid в «Плане выдачи»
 
@@ -262,7 +277,9 @@ Vitro_tracker/
 │   ├── test_patch21.py        # Статусы комплектов
 │   ├── test_patch22.py        # Ревизии (режим DataFrame, 73 проверки)
 │   ├── test_patch22_3.py      # Правка загруженного файла (61 проверка)
-│   └── test_patch22_5.py      # Журнал загрузок + детальная таблица (39)
+│   ├── test_patch22_5.py      # Журнал загрузок + детальная таблица (39)
+│   ├── test_patch22_9.py      # WAL-checkpoint (18)
+│   └── test_patch22_10.py     # АТ-РД-СП-0-00 (26)
 └── vitro/
     ├── config.py              # .env + переменные (APP_VERSION)
     ├── disciplines.py         # Справочник дисциплин
@@ -307,6 +324,8 @@ streamlit run app.py
 .venv\Scripts\python.exe scripts\test_patch22.py
 .venv\Scripts\python.exe scripts\test_patch22_3.py
 .venv\Scripts\python.exe scripts\test_patch22_5.py
+.venv\Scripts\python.exe scripts\test_patch22_9.py
+.venv\Scripts\python.exe scripts\test_patch22_10.py
 git commit -F COMMIT_MSG.txt
 ```
 

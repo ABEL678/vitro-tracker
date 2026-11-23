@@ -47,8 +47,8 @@ _EXCLUDED_MARKERS = (
 )
 
 _EXCLUDED_LEAFS = {
-    "АТ-РД-СП-0-00.PDF",
-    "АТ-РД-СП-0-00.DWG",
+    # Убрано: АТ-РД-СП-0-00.PDF / .DWG — патч 22.10, ранее исключались
+    # вручную, теперь проходят обычную проверку looks_like_rd_code
 }
 
 # ---------------------------------------------------------------------------
@@ -287,6 +287,11 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             "vitro_guid": it.get("UniqueId"),
             "vitro_version": vitro_version,
         }
+        # Патч 22.10: для «Ведомости комплектов» discipline = код комплекта,
+        # а не первый элемент пути (parse_path вернул бы "01_РД")
+        if record["complex"] == "АТ-РД-СП-0-00":
+            record["discipline"] = "АТ-РД-СП-0-00"
+            record["section"] = ""
         # Дедуп по UniqueId: оставляем последнюю ревизию
         guid = record["vitro_guid"]
         if guid:
@@ -514,6 +519,9 @@ def fetch_complex_names() -> list[dict]:
         if not comp:
             continue
         code = normalize_complex(comp)
+        # Патч 22.10: «Ведомость комплектов» — discipline = код комплекта
+        if code == "АТ-РД-СП-0-00":
+            disc = "АТ-РД-СП-0-00"
         complex_codes.setdefault(code, disc)
 
     # 4. Для каждого кода ищем название папки
