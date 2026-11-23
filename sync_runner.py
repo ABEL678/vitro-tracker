@@ -24,7 +24,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vitro.sync import refresh_data
-from vitro.sqlite_db import log_event
+from vitro.sqlite_db import log_event, get_conn
+
+
+def _checkpoint_db() -> None:
+    """WAL-checkpoint: сбрасывает все страницы из -wal в основной файл."""
+    try:
+        with get_conn() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass  # не критично, если база уже в режиме DELETE/NOMODE
 
 
 def main() -> int:
@@ -33,6 +42,7 @@ def main() -> int:
         result = refresh_data(verbose=True)
         n = result.get("comments", 0)
         log_event("refresh", f"Загружено {n} замечаний", rows=n)
+        _checkpoint_db()
         print(f"\nИтог: {result}")
         return 0
     except Exception as exc:

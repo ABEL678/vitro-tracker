@@ -28,6 +28,7 @@ from vitro.sqlite_db import (
     save_history_summary,
     save_history_status,
     log_event,
+    get_conn,
 )
 
 
@@ -98,6 +99,14 @@ def refresh_data(verbose: bool = True) -> dict:
     elapsed = round(time.time() - t0, 1)
     log_event("refresh", f"Загружено {len(comments)} замечаний", rows=len(comments))
     log(f"\n✅ Готово за {elapsed} сек")
+
+    # WAL-checkpoint: сбросить -wal в основной файл, чтобы данные
+    # при копировании vitro.db на сервер включали все записи.
+    try:
+        with get_conn() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass  # не критично, если база уже в режиме DELETE/NOMODE
 
     # PATCH-06: сброс кэшей Streamlit, если синк вызван из приложения
     # (кнопка в «Управлении») — данные на вкладках обновятся мгновенно.
