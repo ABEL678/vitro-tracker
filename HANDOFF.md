@@ -5,7 +5,13 @@
 ### Последняя работа
 
 **Ветка:** `release/1.5-plan`
-**Последний коммит:** патч 22.6 — защита сводки «Плана выдачи» от текста в `qty`, `APP_VERSION` → «1.5 от 19.11.2026»
+**Последний коммит:** патч 22.8 — `log_event("refresh")` в `sync_runner.py` (полоса «База актуальна на …» обновляется при синхронизации из cron/Планировщика)
+
+### Что сделано в патче 22.8
+
+1. **Проблема:** полоса «База актуальна на …» не обновлялась при синхронизации через `sync_runner.py` (cron/Планировщик задач Windows). `deadlines._load_last_sync_date()` читает `MAX(timestamp)` из `log WHERE event IN ('sync_from_ui', 'refresh') AND status = 'OK'` — запись не создавалась.
+2. **Исправление:** `sync_runner.py` — после успешного `refresh_data()` вызывается `log_event("refresh", f"Загружено {N} замечаний", rows=n)`. (В `refresh_data()` (vitro/sync.py:99) вызов уже был — добавлен дублирующий вызов как гарантия.)
+3. **Тест:** `scripts/test_patch22_8.py` — 24 проверки: `log_event` записывает строку, `_load_last_sync_date()` читает `MAX(timestamp)`, `refresh_data()` с моками оставляет запись, `sync_runner.main()` возвращает 0 и пишет в log, регресс `rows=0`. Все PASS.
 
 **Документация обновлена** после серии патчей 21 → 22.6 (см. ниже).
 
@@ -104,6 +110,7 @@ c7c0f73 Merge branch 'release/1.5-plan' into main (release 1.5 final)
 - `scripts/test_patch22_3.py` — **61 проверка**, режим правки загруженного файла: Excel-таблица, merge-заголовок, широкий баннер, пустая строка в данных, примечание под таблицей, пустая таблица, чужая таблица, титульные строки выше шапки.
 - `scripts/test_patch22_5.py` — **39 проверок**, журнал загрузок «Плана выдачи» (Arrow/NumberColumn) и детальная таблица с позицией без планового количества.
 - `scripts/test_patch22_6.py` — **23 проверки**, защита `_build_overview` от текста/`inf` в `qty` + `APP_VERSION`.
+- `scripts/test_patch22_8.py` — **24 проверки**, `log_event("refresh")` в `sync_runner.py` и `sync.py`: запись в log, чтение `_load_last_sync_date()`, интеграция с моками, регресс `rows=0`.
 
 ### Патч 22.5 — pyarrow ArrowInvalid в «Плане выдачи»
 
