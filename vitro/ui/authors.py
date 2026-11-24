@@ -19,7 +19,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from vitro.sqlite_db import update_category_safe
+from vitro.sqlite_db import get_conn, update_category_safe
 from vitro._cache import versioned_cache
 from vitro.disciplines import discipline_name
 from vitro.ui._auth import ensure_user
@@ -856,6 +856,163 @@ def _render_waiting_review():
 
 
 # ---------------------------------------------------------------------------
+#  Готовы к переводу в А
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_ready_for_a(
+    disciplines: tuple = (),
+    sections: tuple = (),
+    kits: tuple = (),
+    block_codes: tuple = (),
+    marka: str = "",
+) -> pd.DataFrame:
+    """
+    Листы-кандидаты на перевод в А:
+    - Статус листа ∈ {B, C}
+    - Есть хотя бы одно замечание
+    - ВСЕ замечания на листе ∈ {Закрыто, Аннулировано}
+    """
+    with get_conn() as conn:
+        sql = """
+            WITH kit_comments AS (
+                SELECT
+                    d.complex, d.discipline,
+                    UPPER(d.status) AS doc_status,
+                    c.id AS comment_id,
+                    c.status AS comment_status,
+                    c.created
+                FROM documents d
+                JOIN comments c ON c.doc_id = d.id
+                WHERE UPPER(d.status) IN ('B', 'C')
+            ),
+            kit_summary AS (
+                SELECT
+                    complex, discipline, doc_status,
+                    COUNT(*) AS n_total,
+                    SUM(CASE WHEN comment_status IN ('Закрыто', 'Аннулировано') THEN 1 ELSE 0 END) AS n_closed,
+                    MAX(created) AS last_status_change
+                FROM kit_comments
+                GROUP BY complex, discipline, doc_status
+            )
+            SELECT complex, discipline, doc_status, n_total, n_closed, last_status_change
+            FROM kit_summary
+            WHERE n_total = n_closed AND n_total > 0
+            ORDER BY discipline, complex
+        """
+        df = pd.read_sql(sql, conn)
+
+    if df.empty:
+        return df
+
+    # Применяем фильтры
+    if disciplines:
+        df = df[df["discipline"].isin(disciplines)]
+    if kits:
+        df = df[df["complex"].isin(kits)]
+    if block_codes:
+        df = _filter_by_blocks(df, block_codes)
+    if marka:
+        df = _filter_by_marka(df, marka)
+    if sections:
+        with get_conn() as conn2:
+            ph = ",".join("?" * len(sections))
+            in_section = conn2.execute(
+                f"SELECT DISTINCT complex FROM documents WHERE section IN ({ph})",
+                tuple(sections)
+            ).fetchall()
+            section_kits = {r["complex"] for r in in_section}
+            df = df[df["complex"].isin(section_kits)]
+
+    return df
+
+
+def _render_ready_for_a():
+    st.markdown("### ✅ Готовы к переводу в А")
+    st.caption(
+        "Листы со статусом B или C, по которым все замечания закрыты "
+        "(\"Закрыто\" или \"Аннулировано\"), но лист ещё не переведён в А. "
+        "Кандидаты на формальный перевод: замечания фактически не актуальны, "
+        "осталось утверждение листа заказчиком."
+    )
+
+    # Единый стандарт фильтров
+    flt = render_standard_filters(
+        key_prefix="ready_a_",
+        expander_label="🎛 Фильтры",
+        expanded=False,
+        show_remark_status=False,
+        show_sheet_status=False,
+    )
+
+    df = _load_ready_for_a(
+        disciplines=flt["disc"] or None,
+        kits=flt["kits"] or None,
+        sections=flt["section"] or None,
+        block_codes=flt["block_codes"] or None,
+        marka=flt["marka"],
+    )
+
+    if df.empty:
+        st.success("🎉 Нет кандидатов на перевод в А с учётом фильтров.")
+        return
+
+    # Карточки объёма
+    n_sheets = len(df)
+    n_comments = int(df["n_total"].sum())
+    n_closed = int(df["n_closed"].sum())
+    n_b = int(df[df["doc_status"] == "B"]["n_total"].sum())
+    n_c = int(df[df["doc_status"] == "C"]["n_total"].sum())
+
+    st.markdown("##### 📊 Объём")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Листов-кандидатов", f"{n_sheets:,}".replace(",", " "))
+    c2.metric("Замечаний всего", f"{n_comments:,}".replace(",", " "))
+    c3.metric("Из них B / из них C", f"{n_b} / {n_c}")
+
+    st.divider()
+
+    # Таблица
+    st.markdown(f"##### 📋 Список ({n_sheets:,})")
+
+    display = df.copy()
+    display["doc_status_group"] = display["doc_status"].apply(_doc_status_group)
+    display = display.rename(columns={
+        "complex": "Шифр листа",
+        "discipline": "Дисциплина",
+        "doc_status": "Статус листа",
+        "n_total": "Всего замечаний",
+        "n_closed": "Закрыто/аннулировано",
+        "last_status_change": "Последнее изменение",
+    })
+
+    st.dataframe(
+        display,
+        width='stretch', hide_index=True, height=600,
+        column_config={
+            "Шифр листа": st.column_config.TextColumn(width="medium"),
+            "Дисциплина": st.column_config.TextColumn(width="small"),
+            "Статус листа": st.column_config.TextColumn(width="small"),
+            "Всего замечаний": st.column_config.NumberColumn(width="small"),
+            "Закрыто/аннулировано": st.column_config.NumberColumn(width="small"),
+            "Последнее изменение": st.column_config.TextColumn(width="small"),
+        },
+    )
+
+    # Выгрузка в Excel
+    st.download_button(
+        "📥 Выгрузить в Excel",
+        data=_export_rows_to_excel(display),
+        file_name=(
+            f"Готовы_к_переводу_в_А_{datetime.now():%Y%m%d_%H%M}.xlsx"
+        ),
+        mime="application/vnd.openxmlformats-officedocument."
+             "spreadsheetml.sheet",
+        width='stretch',
+        key="ready_a_export",
+    )
+
+
+# ---------------------------------------------------------------------------
 #  К листам A и аннулированным
 # ---------------------------------------------------------------------------
 @versioned_cache(3600)
@@ -1193,10 +1350,11 @@ def render():
         "как быстро рассматривают наши ответы."
     )
 
-    tab_analytics, tab_waiting, tab_a_annulled = st.tabs([
+    tab_analytics, tab_waiting, tab_a_annulled, tab_ready_a = st.tabs([
         "📊 Аналитика авторов",
         "🔵 Ждут заказчика",
         "📄 К листам A и аннулированным",
+        "✅ Готовы к переводу в А",
     ])
 
     with tab_analytics:
@@ -1205,3 +1363,5 @@ def render():
         _render_waiting_review()
     with tab_a_annulled:
         _render_customer_a_annulled()
+    with tab_ready_a:
+        _render_ready_for_a()
