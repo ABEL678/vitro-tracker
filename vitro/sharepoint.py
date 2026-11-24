@@ -1,5 +1,6 @@
 # vitro/sharepoint.py
 
+import re
 import urllib3
 from typing import Any
 from collections import defaultdict
@@ -199,6 +200,95 @@ def _is_excluded(file_dir_ref: str, file_leaf_ref: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Патч 22.16 — одиночный реестровый PDF вида «Р-NNN.pdf» в папке комплекта
+# ---------------------------------------------------------------------------
+# Строгий паттерн имени: «Р-» + цифры, строго верхняя кириллическая «Р»
+# (регистр — как в данных), расширение «.pdf» в конце (регистр расширения
+# не важен — SharePoint хранит FileLeafRef и как «.pdf», и как «.PDF»).
+# «Р-3.5.pdf», «РА-12.pdf», «р-381.pdf» (строчная «р») НЕ проходят.
+_SINGLE_REGISTRY_PDF_STEM_PATTERN = re.compile(r"^Р-\d+$")
+
+# Служебные деревья для правила 22.16 в дополнение к _EXCLUDED_MARKERS:
+# «на удаление/» там нет, а ТЕСТ/TECT/TEST, АННУЛИРОВАН, АРХИВ, ~$ и др.
+# уже отсекаются _is_excluded. Корень вне комплектов отсекается
+# условием «имя папки — шифр РД-комплекта».
+_REGISTRY_SERVICE_DIR_MARKERS = ("НА УДАЛЕНИЕ",)
+
+
+def is_single_registry_pdf(leaf: str) -> bool:
+    """Патч 22.16: имя файла — одиночный реестровый PDF «Р-NNN.pdf».
+
+    Строго: кириллическая «Р» верхнего регистра, дефис, только цифры;
+    расширение «.pdf» в конце (регистр расширения не важен).
+    «Р-3.5.pdf», «РА-12.pdf», «р-381.pdf» (строчная «р») НЕ проходят.
+    """
+    s = (leaf or "").strip()
+    stem, dot, ext = s.rpartition(".")
+    if not dot or ext.lower() != "pdf":
+        return False
+    return bool(_SINGLE_REGISTRY_PDF_STEM_PATTERN.match(stem))
+
+
+def _registry_dir_is_service(dir_ref: str) -> bool:
+    """Патч 22.16: папка в служебном дереве («на удаление/» и др.).
+    ТЕСТ/TECT/TEST и прочие маркеры уже отсекает _is_excluded."""
+    upper = (dir_ref or "").upper()
+    return any(m in upper for m in _REGISTRY_SERVICE_DIR_MARKERS)
+
+
+def _collect_single_registry_pdfs(raw: list[dict]) -> list[dict]:
+    """
+    Патч 22.16: отбор «одиночных реестровых PDF» из сырой выдачи SharePoint.
+
+    Возвращает список элементов SharePoint (dict) — кандидатов в документы.
+    Все условия обязательны; правило не срабатывает, если хоть одно
+    нарушено:
+      1. имя файла матчится по строгому паттерну «Р-\\d+.pdf»
+         (is_single_registry_pdf);
+      2. файл лежит непосредственно в папке комплекта — имя папки
+         распознаётся как шифр РД-комплекта (looks_like_rd_code);
+      3. в этой папке (без подпапок) нет других PDF с именами,
+         проходящими looks_like_rd_code (другие PDF с «нердовыми»
+         именами, включая прочие «Р-NNN.pdf», не мешают);
+      4. файл не в служебных деревьях — ТЕСТ/, «на удаление/», корень
+         вне комплектов (_is_excluded + маркеры + условие 2).
+    """
+    # 1. Группируем PDF по папке (без подпапок — ключ точный FileDirRef)
+    by_dir: dict[str, list[dict]] = {}
+    for it in raw:
+        leaf = (it.get("FileLeafRef") or "").strip()
+        dir_ref = (it.get("FileDirRef") or "").strip()
+        if not leaf.lower().endswith(".pdf"):
+            continue
+        if _is_excluded(dir_ref, leaf):
+            continue
+        by_dir.setdefault(dir_ref, []).append(it)
+
+    result: list[dict] = []
+    for dir_ref, items in by_dir.items():
+        # Условие 2: файл лежит непосредственно в папке комплекта —
+        # последний сегмент пути распознаётся как шифр РД-комплекта
+        folder_name = dir_ref.rstrip("/").rsplit("/", 1)[-1]
+        if not looks_like_rd_code(folder_name):
+            continue
+        # Условие 4: не в служебных деревьях («на удаление/» и др.)
+        if _registry_dir_is_service(dir_ref):
+            continue
+        # Условие 3: в папке нет других PDF с именами-шифрами РД
+        has_rd_sibling = any(
+            looks_like_rd_code((x.get("FileLeafRef") or "").strip())
+            for x in items
+        )
+        if has_rd_sibling:
+            continue
+        # Условие 1: имя файла — строго «Р-NNN.pdf»
+        for x in items:
+            if is_single_registry_pdf((x.get("FileLeafRef") or "").strip()):
+                result.append(x)
+    return result
+
+
+# ---------------------------------------------------------------------------
 #  Справочники
 # ---------------------------------------------------------------------------
 def fetch_doc_statuses() -> dict[int, str]:
@@ -230,6 +320,14 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
 
     Патч 20: запрашивает из двух папок — АТП и ГИС, объединяет с
     дедупликацией по UniqueId (последняя ревизия побеждает).
+
+    Патч 22.16: одиночный реестровый PDF вида «Р-NNN.pdf» в папке
+    комплекта (имя папки — шифр РД-комплекта, других PDF с РД-именами
+    в папке нет, вне служебных деревьев) принимается как документ
+    комплекта: complex — нормализованный шифр из имени папки,
+    leaf — имя файла без расширения («Р-381»). Идемпотентность —
+    как у обычных документов: дедуп по UniqueId здесь, повторный
+    синк не создаёт дубликаты (save_all перезаписывает documents).
     """
     work_paths = (ATP_WORK, GIS_WORK)  # патч 20
 
@@ -249,6 +347,12 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             )
         )
 
+    # Патч 22.16: одиночные реестровые PDF «Р-NNN.pdf» по папкам.
+    # Отбираются из той же сырой выдачи ДО обычного фильтра
+    # looks_like_rd_code (который такие имена отсекает).
+    registry_pdfs = _collect_single_registry_pdfs(raw)
+    registry_ids = {id(it) for it in registry_pdfs}
+
     doc_statuses = fetch_doc_statuses()
     docs: list[dict] = []
     # Дедупликация по UniqueId (патч 20): последняя ревизия побеждает
@@ -257,6 +361,11 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
         leaf = (it.get("FileLeafRef") or "").strip()
         dir_ref = it.get("FileDirRef") or ""
 
+        # Патч 22.16: одиночный реестровый PDF принимается отдельным
+        # правилом ниже; в обычном потоке его пропускаем, чтобы не
+        # отсекать по looks_like_rd_code и не задвоить запись.
+        if id(it) in registry_ids:
+            continue
         if not looks_like_rd_code(leaf):
             continue
         if _is_excluded(dir_ref, leaf):
@@ -293,6 +402,46 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             record["discipline"] = "АТ-РД-СП-0-00"
             record["section"] = ""
         # Дедуп по UniqueId: оставляем последнюю ревизию
+        guid = record["vitro_guid"]
+        if guid:
+            existing = seen.get(guid)
+            if existing is None or vitro_version >= existing.get("vitro_version", 0):
+                seen[guid] = record
+
+    # Патч 22.16: одиночные реестровые PDF «Р-NNN.pdf» в папках
+    # комплектов — записываем как документы комплекта.
+    # complex — нормализованный шифр комплекта из имени папки,
+    # leaf — имя файла без расширения («Р-381»), расширение/тип —
+    # по факту (.pdf). Идемпотентность: тот же дедуп по UniqueId,
+    # что и для обычных документов; повторный синк перезаписывает
+    # documents целиком (save_all), дубликаты не создаются.
+    for it in registry_pdfs:
+        leaf = (it.get("FileLeafRef") or "").strip()
+        dir_ref = (it.get("FileDirRef") or "").strip()
+        folder_name = dir_ref.rstrip("/").rsplit("/", 1)[-1]
+        disc, sec, comp = parse_path(dir_ref)
+
+        ui_version_raw = it.get("OData__UIVersionString") or ""
+        try:
+            vitro_version = int(float(str(ui_version_raw)))
+        except (ValueError, TypeError):
+            vitro_version = 1
+
+        record = {
+            "id": it.get("Id"),
+            "leaf": leaf[: -len(".pdf")],  # «Р-381» — без расширения
+            "discipline": disc,
+            "section": sec,
+            "complex": normalize_complex(folder_name),
+            "dir_ref": dir_ref,
+            "status": doc_statuses.get(it.get("VitroBaseStatus"), ""),
+            "revision": it.get("VitroBaseDocumentRevision"),
+            "name": it.get("VitroBaseFullName"),
+            "status_date": it.get("VitroBaseStatusDate"),
+            "sheet_number": it.get("VitroBaseDocSheetNumber"),
+            "vitro_guid": it.get("UniqueId"),
+            "vitro_version": vitro_version,
+        }
         guid = record["vitro_guid"]
         if guid:
             existing = seen.get(guid)
