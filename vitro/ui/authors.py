@@ -873,30 +873,31 @@ def _load_ready_for_a(
     - ВСЕ замечания на листе ∈ {Закрыто, Аннулировано}
     """
     with get_conn() as conn:
+        # Проверка закрытости — по КАЖДОМУ листу (документу), а не по группе:
+        # группа (шифр+дисциплина+статус) попадает в выборку, только если
+        # все замечания каждого её листа закрыты/аннулированы.
         sql = """
-            WITH kit_comments AS (
+            WITH doc_stats AS (
                 SELECT
+                    d.id AS doc_id,
                     d.complex, d.discipline,
                     UPPER(d.status) AS doc_status,
-                    c.id AS comment_id,
-                    c.status AS comment_status,
-                    c.created
+                    COUNT(c.id) AS n_total,
+                    SUM(CASE WHEN c.status IN ('Закрыто', 'Аннулировано') THEN 1 ELSE 0 END) AS n_closed,
+                    MAX(c.created) AS last_status_change
                 FROM documents d
                 JOIN comments c ON c.doc_id = d.id
                 WHERE UPPER(d.status) IN ('B', 'C')
-            ),
-            kit_summary AS (
-                SELECT
-                    complex, discipline, doc_status,
-                    COUNT(*) AS n_total,
-                    SUM(CASE WHEN comment_status IN ('Закрыто', 'Аннулировано') THEN 1 ELSE 0 END) AS n_closed,
-                    MAX(created) AS last_status_change
-                FROM kit_comments
-                GROUP BY complex, discipline, doc_status
+                GROUP BY d.id, d.complex, d.discipline, UPPER(d.status)
             )
-            SELECT complex, discipline, doc_status, n_total, n_closed, last_status_change
-            FROM kit_summary
+            SELECT
+                complex, discipline, doc_status,
+                SUM(n_total) AS n_total,
+                SUM(n_closed) AS n_closed,
+                MAX(last_status_change) AS last_status_change
+            FROM doc_stats
             WHERE n_total = n_closed AND n_total > 0
+            GROUP BY complex, discipline, doc_status
             ORDER BY discipline, complex
         """
         df = pd.read_sql(sql, conn)
