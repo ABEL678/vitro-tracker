@@ -858,6 +858,38 @@ def _render_waiting_review():
 # ---------------------------------------------------------------------------
 #  Готовы к переводу в А
 # ---------------------------------------------------------------------------
+def _sheet_code(leaf) -> str:
+    """Шифр листа: имя файла документа без расширения (documents.leaf)."""
+    if leaf is None or (isinstance(leaf, float) and pd.isna(leaf)):
+        return ""
+    s = str(leaf).strip()
+    for ext in (".pdf", ".PDF", ".dwg", ".DWG"):
+        if s.endswith(ext):
+            return s[: -len(ext)]
+    return s
+
+
+def _fmt_dt(value) -> str:
+    """ISO 8601 из базы (UTC, суффикс Z отсекается) → «ДД.ММ.ГГГГ ЧЧ:ММ».
+
+    Таймзону не конвертируем: показываем значение как в базе.
+    Пустое значение → пустая строка.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    s = s.rstrip("Zz")
+    try:
+        return datetime.fromisoformat(s).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return s
+
+
+# ---------------------------------------------------------------------------
+#  Готовы к переводу в А
+# ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_ready_for_a(
     disciplines: tuple = (),
@@ -878,6 +910,7 @@ def _load_ready_for_a(
             SELECT
                 d.id AS doc_id,
                 d.complex,
+                d.leaf,
                 d.discipline,
                 d.name AS sheet_name,
                 UPPER(d.status) AS doc_status,
@@ -888,7 +921,7 @@ def _load_ready_for_a(
             FROM documents d
             JOIN comments c ON c.doc_id = d.id
             WHERE UPPER(d.status) IN ('B', 'C')
-            GROUP BY d.id, d.complex, d.discipline, d.name, UPPER(d.status)
+            GROUP BY d.id, d.complex, d.leaf, d.discipline, d.name, UPPER(d.status)
             HAVING COUNT(c.id) = SUM(CASE WHEN TRIM(c.status) IN ('Закрыто', 'Аннулировано')
                                           THEN 1 ELSE 0 END)
                AND COUNT(c.id) > 0
@@ -974,8 +1007,11 @@ def _render_ready_for_a():
     display["discipline"] = display["discipline"].apply(
         lambda c: f"{c} — {discipline_name(c)}" if c else ""
     )
+    display["leaf"] = display["leaf"].apply(_sheet_code)
+    display["last_status_change"] = display["last_status_change"].apply(_fmt_dt)
     display = display.rename(columns={
-        "complex": "Шифр листа",
+        "complex": "Шифр комплекта",
+        "leaf": "Шифр листа",
         "sheet_name": "Название",
         "discipline": "Дисциплина",
         "doc_status": "Статус листа",
@@ -984,7 +1020,7 @@ def _render_ready_for_a():
         "last_status_change": "Последнее изменение",
     })
     display = display[[
-        "Шифр листа", "Название", "Дисциплина", "Статус листа",
+        "Шифр комплекта", "Шифр листа", "Название", "Дисциплина", "Статус листа",
         "Всего замечаний", "Закрыто/аннулировано", "Последнее изменение",
     ]]
 
@@ -992,6 +1028,7 @@ def _render_ready_for_a():
         display,
         width='stretch', hide_index=True, height=600,
         column_config={
+            "Шифр комплекта": st.column_config.TextColumn(width="medium"),
             "Шифр листа": st.column_config.TextColumn(width="medium"),
             "Название": st.column_config.TextColumn(width="large"),
             "Дисциплина": st.column_config.TextColumn(width="small"),
@@ -1355,6 +1392,7 @@ def _load_closed_comments_for_doc(doc_id: int) -> pd.DataFrame:
             """
             SELECT
                 d.complex AS complex,
+                d.leaf AS leaf,
                 d.name AS sheet_name,
                 TRIM(c.status) AS comment_status,
                 c.comment AS comment_text,
@@ -1404,18 +1442,27 @@ def _render_closed_comments_registry(df_sheets: pd.DataFrame):
 
     st.markdown(f"##### 📋 Замечания ({len(reg):,})")
 
+    reg = reg.copy()
+    reg["leaf"] = reg["leaf"].apply(_sheet_code)
+    reg["changed_at"] = reg["changed_at"].apply(_fmt_dt)
     display = reg.rename(columns={
-        "complex": "Шифр листа",
+        "complex": "Шифр комплекта",
+        "leaf": "Шифр листа",
         "sheet_name": "Название",
         "comment_status": "Статус замечания",
         "comment_text": "Текст замечания",
         "changed_at": "Дата изменения",
     })
+    display = display[[
+        "Шифр комплекта", "Шифр листа", "Название", "Статус замечания",
+        "Текст замечания", "Дата изменения",
+    ]]
 
     st.dataframe(
         display,
         width='stretch', hide_index=True, height=500,
         column_config={
+            "Шифр комплекта": st.column_config.TextColumn(width="medium"),
             "Шифр листа": st.column_config.TextColumn(width="medium"),
             "Название": st.column_config.TextColumn(width="medium"),
             "Статус замечания": st.column_config.TextColumn(width="small"),
