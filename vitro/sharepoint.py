@@ -486,15 +486,21 @@ def fetch_complex_names() -> list[dict]:
     любые — «АТ-РД-…», «ГИС-РД-…» и др., фильтр looks_like_rd_code):
       [{"code": "АТ-РД-КЖ0-С-П2.1", "name": "...", "discipline": "02_КР"}]
     Комплекты берутся из путей PDF-файлов; названия — из VitroBaseFullName папок.
+
+    Патч 22.11: помимо АТП («01_В процессе») обходится и папка ГИС
+    (GIS_WORK), поэтому комплекты ГИС-РД-* попадают в complexes и
+    каскадный kit-фильтр работает для них.
     """
-    # 1. Все объекты в 01_В процессе (и папки, и файлы) — без фильтра по имени
-    flt = f"startswith(FileDirRef, '{ATP_WORK}/')"
-    raw = _fetch_all(
-        VITRO_OKHTA_URL, LIST_DOCS,
-        ["Id", "FileLeafRef", "FileDirRef", "VitroBaseFullName"],
-        flt=flt,
-        max_items=0,
-    )
+    # 1. Все объекты в 01_В процессе АТП и ГИС (и папки, и файлы)
+    raw: list[dict] = []
+    for wp in (ATP_WORK, GIS_WORK):  # патч 22.11
+        flt = f"startswith(FileDirRef, '{wp}/')"
+        raw.extend(_fetch_all(
+            VITRO_OKHTA_URL, LIST_DOCS,
+            ["Id", "FileLeafRef", "FileDirRef", "VitroBaseFullName"],
+            flt=flt,
+            max_items=0,
+        ))
 
     # 2. Разделяем на файлы и папки
     pdf_files = []

@@ -132,13 +132,21 @@ from vitro.plan_xlsx import (
 # ---------------------------------------------------------------------------
 KIT_STATUS_OPTIONS = [
     "Загружен в Витро",
+    "Передан (вне Витро)",
     "Загружается (частично)",
     "План (не загружен)",
     "Только в Витро",
 ]
 
+# Патч 22.11: статус ГИС-комплекта «передан вне Витро». Засчитывается
+# как выполненный (наравне с «Загружено в Витро»), в «План к загрузке»
+# не попадает. Других статусов не добавлять.
+KIT_STATUS_PASSED = "Передан (вне Витро)"
+GIS_KIT_PREFIX = "ГИС-РД-"
+
 KIT_STATUS_COLORS = {
     "Загружен в Витро":        "#2ca02c",
+    "Передан (вне Витро)":     "#17becf",
     "Загружается (частично)":  "#ffdd57",
     "План (не загружен)":      "#9467bd",
     "Только в Витро":          "#1f77b4",
@@ -346,6 +354,12 @@ def _iso_to_date(v) -> date | None:
 # ---------------------------------------------------------------------------
 #  Общая (сводная) таблица
 # ---------------------------------------------------------------------------
+def _is_gis_kit(code) -> bool:
+    """Патч 22.11: комплект ГИС по префиксу «ГИС-РД-» — после нормализации
+    шифра (регистр, пробелы, латинские двойники)."""
+    return _norm_complex_code(code).startswith(GIS_KIT_PREFIX)
+
+
 def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     """
     Одна строка = один комплект: план (ведомости) + Витро.
@@ -393,7 +407,11 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
             in_vitro = code in vitro_counts
             sheets_vitro = vitro_counts.get(code, 0)
             sheets_plan = int(plan_qty.get(code, 0))
-            if in_vitro and sheets_plan > 0 and sheets_vitro < sheets_plan:
+            if _is_gis_kit(code):
+                # Патч 22.11: ГИС-комплект передан вне Витро — статус
+                # безусловно «Передан», даже при листах в Витро.
+                status = KIT_STATUS_PASSED
+            elif in_vitro and sheets_plan > 0 and sheets_vitro < sheets_plan:
                 status = "Загружается (частично)"
             elif in_vitro:
                 status = "Загружен в Витро"
@@ -409,7 +427,8 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
                 "sheets_vitro": sheets_vitro,
                 "sheets_plan": sheets_plan,
                 "status": status,
-                "in_vitro": in_vitro,
+                # «Передан» засчитывается выполненным (как «в Витро»)
+                "in_vitro": in_vitro or status == KIT_STATUS_PASSED,
                 "updated_at": r["updated_at"] or "",
                 "updated_by": r["updated_by"] or "",
             })
@@ -910,11 +929,14 @@ def _plan_totals(overview_filtered: pd.DataFrame) -> dict:
                     совпадает с «в Витро»)."""
     if overview_filtered.empty:
         return {k: 0 for k in (
-            "kits_total", "kits_loaded", "kits_plan", "sheets_total",
-            "sheets_vitro", "sheets_plan", "sheets_excess",
+            "kits_total", "kits_loaded", "kits_passed", "kits_plan",
+            "sheets_total", "sheets_vitro", "sheets_plan", "sheets_excess",
             "sheets_remaining", "sheets_done")}
     n_total = len(overview_filtered)
-    n_loaded = int(overview_filtered["in_vitro"].astype(bool).sum())
+    # Патч 22.11: три категории комплектов — «Загружено в Витро»
+    # (статус), «Передан (вне Витро)» (ГИС), «План к загрузке» (остаток).
+    n_passed = int((overview_filtered["status"] == KIT_STATUS_PASSED).sum())
+    n_loaded = int(overview_filtered["in_vitro"].astype(bool).sum()) - n_passed
     sheets_vitro = int(overview_filtered["sheets_vitro"].astype(int).sum())
     sheets_plan = int(overview_filtered["sheets_plan"].astype(int).sum())
     sheets_total = max(sheets_vitro, sheets_plan)
@@ -923,7 +945,8 @@ def _plan_totals(overview_filtered: pd.DataFrame) -> dict:
     return {
         "kits_total": n_total,
         "kits_loaded": n_loaded,
-        "kits_plan": n_total - n_loaded,
+        "kits_passed": n_passed,
+        "kits_plan": n_total - n_loaded - n_passed,
         "sheets_total": sheets_total,
         "sheets_vitro": sheets_vitro,
         "sheets_plan": sheets_plan,
@@ -1011,10 +1034,12 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
     # ---- КОМПЛЕКТЫ: все отфильтрованные, включая «Только в Витро» ----
     n_total = totals["kits_total"]
     n_loaded = totals["kits_loaded"]
+    n_passed = totals["kits_passed"]
     n_plan = totals["kits_plan"]
 
     kits_data = pd.DataFrame([
         {"Группа": "Загружено в Витро", "Количество": n_loaded},
+        {"Группа": KIT_STATUS_PASSED, "Количество": n_passed},
         {"Группа": "План к загрузке", "Количество": n_plan},
     ])
     kits_data = kits_data[kits_data["Количество"] > 0]
@@ -1024,7 +1049,12 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
     with k_left:
         st.caption(f"Комплектов всего: **{n_total}**")
         _donut(kits_data, "Группа", "Количество", "plan_pie_kits",
-               center_total=f"{n_total}")
+               center_total=f"{n_total}",
+               color_map={
+                   "Загружено в Витро": KIT_STATUS_COLORS["Загружен в Витро"],
+                   KIT_STATUS_PASSED: KIT_STATUS_COLORS[KIT_STATUS_PASSED],
+                   "План к загрузке": KIT_STATUS_COLORS["План (не загружен)"],
+               })
     with k_right:
         st.metric(
             "🟢 Загружено в Витро", _fmt_num(n_loaded),
@@ -1033,12 +1063,18 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
                  "ведомостях).",
         )
         st.metric(
+            "🔵 Передан (вне Витро)", _fmt_num(n_passed),
+            help="ГИС-комплекты (префикс ГИС-РД-): переданы вне Витро, "
+                 "засчитываются выполненными.",
+        )
+        st.metric(
             "🟣 План к загрузке", _fmt_num(n_plan),
-            help="Комплекты из ведомостей, которых ещё нет в Витро.",
+            help="Комплекты из ведомостей, которых ещё нет в Витро "
+                 "и которые не переданы.",
         )
         st.caption(
-            f"Арифметика: {_fmt_num(n_loaded)} + {_fmt_num(n_plan)} = "
-            f"**{_fmt_num(n_total)}**."
+            f"Арифметика: {_fmt_num(n_loaded)} + {_fmt_num(n_passed)} + "
+            f"{_fmt_num(n_plan)} = **{_fmt_num(n_total)}**."
         )
 
     # ---- ЛИСТЫ: разбивка загруженных по статусам A/B/C/Другие ----
