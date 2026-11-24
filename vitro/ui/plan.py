@@ -75,15 +75,38 @@ sheet_number — отдельные листы (пример СМИК: 44, а н
 Патч 17 (компоновка и бублики как в Сводке):
   1. «📥 Вводные данные», «⚠️ Замечания последней загрузки» и
      «📜 Журнал загрузок» перенесены в самый низ вкладки.
-  2. Бублики «Комплектов и листов»: слева бублик, справа список
-     с маркерами и числами (как в Сводке). Загруженные листы
-     разбиты по статусам A/B/C/Другие — новый загрузчик
-     _vitro_sheet_status_counts на том же дедупе
-     sheets.unique_vitro_sheets, что и «Листов в Витро»:
-     A + B + C + Другие = «Листов в Витро» по отбору.
+   2. Бублики «Комплектов и листов»: слева бублик, справа список
+      с маркерами и числами (как в Сводке). Загруженные листы
+      разбиты по статусам A/B/C/Другие — загрузчик
+      _vitro_sheet_status_counts на том же дедупе документов, что
+      и «Листов в Витро» (с патча 22.15 — дедуп БЕЗ отсечения
+      невалидных написаний, зачёт через _vitro_claim_index):
+      A + B + C + Другие = «Листов в Витро» по отбору.
   3. В «Сводный план готовности» добавлены колонки «Дисциплина»
      и «Раздел» — значения видны в каждой строке; группировка
      «Дисциплина → Раздел» строками-заголовками сохранена.
+
+Патч 22.15 (сопоставление шифров комплекта — следствие диагностики
+22.11, раунд 2):
+  Сверка plan_kits.code ↔ documents.complex раньше шла только на
+  равенство после _norm_complex_code, поэтому не зачитывались:
+    (1) documents.complex с текстовым хвостом — «АТ-РД-КСТ2-А-00
+        КОНТАКТНАЯ СЕТЬ ТРОЛЛЕЙБУСА И ТРАМВАЯ ПО ВРЕМЕННОЙ СХЕМЕ»;
+    (2) ГИС-план-коды с дробной частью — «ГИС-РД-СБ-АСЗП-0-00/
+        10511.25.01-АСЗП» при комплексе в базе «ГИС-РД-СБ-АСЗП-0-00».
+  Единый хелпер _kit_matches_complex (рядом с _is_gis_kit) + индекс
+  зачёта _vitro_claim_index: точное/нормализованное совпадение, затем
+  (а) «шифр плана + пробел(ы) + не-шифровый хвост», (б) ГИС — базовая
+  часть до «/», дробь ровно с одной стороны, (в) близнецы (оба
+  написания невалидны, различие только в точках). Каждый комплекс
+  Витро зачитывается НЕ БОЛЕЕ чем одному комплекту плана — двойного
+  счёта листов нет (у пары «базовый ГИС-код + дробный вариант» листы
+  уходят базовому — точное совпадение сильнее).
+  _vitro_sheet_counts/_vitro_sheet_status_counts теперь дедуплицируют
+  строки БЕЗ отсечения невалидных написаний (иначе хвостовые
+  комплексы не доходили до сопоставления); мусор отсекается где и
+  раньше: is_valid_kit_code в «Только в Витро» и валидация план-кодов
+  (патч 13).
 
 Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
 """
@@ -108,7 +131,7 @@ from vitro.sqlite_db import (
     clear_plan,
     log_event,
 )
-from vitro.sheets import dedup_document_rows, unique_vitro_sheets
+from vitro.sheets import dedup_document_rows, looks_like_rd_code
 from vitro._cache import versioned_cache
 from vitro.ui._auth import ensure_user
 from vitro.ui._filters import (
@@ -202,7 +225,7 @@ MAX_DETAIL_ROWS = 2000  # строки детальных таблиц свер�
 def _vitro_sheet_counts() -> dict[str, int]:
     """{шифр комплекта: количество УНИКАЛЬНЫХ листов в Витро}.
 
-    Патч 14: считается через sheets.unique_vitro_sheets — единый
+    Патч 14: дедупликация sheets.dedup_document_rows — единый
     стандарт всех вкладок (Сводка, Динамика, Экспорт, Управление):
       * ревизии/повторы листа с номером считаются ОДИН раз
         (ключ complex + sheet_number, последняя ревизия);
@@ -215,6 +238,15 @@ def _vitro_sheet_counts() -> dict[str, int]:
         фантомный дубль в «Только в Витро» раздувал бублик);
       * мусорные шифры (is_valid_kit_code) исключаются — как и раньше
         в _build_overview, теперь отсечение живёт в sheets.py.
+
+    Патч 22.15: отсечение невалидных шифров из подсчёта УБРАНО —
+    дедуп (без валидации) возвращает ВСЕ написания, в том числе с
+    текстовым хвостом («АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ …»): иначе
+    такие строки отбрасывались ДО сопоставления с планом и комплект
+    КСТ2 навсегда оставался «Планом (не загружен)». Мусор в таблицу
+    и бублик по-прежнему не попадает: «Только в Витро» фильтрует
+    is_valid_kit_code (патч 13), а листы зачитываются плану только
+    через _vitro_claim_index — по правилам _kit_matches_complex.
     """
     with get_conn() as conn:
         rows = conn.execute("""
@@ -223,9 +255,10 @@ def _vitro_sheet_counts() -> dict[str, int]:
             WHERE complex IS NOT NULL
         """).fetchall()
     counts: dict[str, int] = {}
-    for r in unique_vitro_sheets([dict(x) for x in rows]):
-        code = str(r.get("complex") or "")
-        counts[code] = counts.get(code, 0) + 1
+    for r in dedup_document_rows([dict(x) for x in rows]):
+        code = str(r.get("complex") or "").strip()
+        if code:
+            counts[code] = counts.get(code, 0) + 1
     return counts
 
 
@@ -234,9 +267,10 @@ def _vitro_sheet_status_counts() -> dict[str, dict[str, int]]:
     """{шифр комплекта: {"A": n, "B": n, "C": n, "other": n}} —
     разбивка УНИКАЛЬНЫХ листов в Витро по статусам (патч 17).
 
-    Тот же дедуп sheets.unique_vitro_sheets, что и в
-    _vitro_sheet_counts, поэтому A + B + C + other по комплектам
-    отбора сходится с колонкой «Листов в Витро». Статус
+    Патч 22.15: тот же дедуп БЕЗ отсечения невалидных шифров, что и
+    в _vitro_sheet_counts (см. комментарий там): хвостовые комплексы
+    («АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ …») доходят до сопоставления
+    с планом и попадают в бублик A/B/C через индекс зачёта. Статус
     нормализуется .strip().upper() — как в Сводке; «other» — все
     не-A/B/C (И, на согласовании, готовится к загрузке,
     аннулированные, прочие).
@@ -248,8 +282,10 @@ def _vitro_sheet_status_counts() -> dict[str, dict[str, int]]:
             WHERE complex IS NOT NULL
         """).fetchall()
     counts: dict[str, dict[str, int]] = {}
-    for r in unique_vitro_sheets([dict(x) for x in rows]):
-        code = str(r.get("complex") or "")
+    for r in dedup_document_rows([dict(x) for x in rows]):
+        code = str(r.get("complex") or "").strip()
+        if not code:
+            continue
         status_raw = str(r.get("status") or "").strip().upper()
         bucket = status_raw if status_raw in ("A", "B", "C") else "other"
         per = counts.setdefault(code, {"A": 0, "B": 0, "C": 0, "other": 0})
@@ -360,6 +396,117 @@ def _is_gis_kit(code) -> bool:
     return _norm_complex_code(code).startswith(GIS_KIT_PREFIX)
 
 
+def _kit_matches_complex(kit_code, complex_code) -> bool:
+    """Патч 22.15: сопоставление plan_kits.code ↔ documents.complex.
+
+    Единое место сверки (рядом с _is_gis_kit). Раньше сравнение шло
+    только на равенство после _norm_complex_code, из-за чего не
+    зачитывались: (1) documents.complex с текстовым хвостом —
+    «АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ ТРОЛЛЕЙБУСА И ТРАМВАЯ ПО
+    ВРЕМЕННОЙ СХЕМЕ»; (2) ГИС-план-коды с дробной частью —
+    «ГИС-РД-СБ-АСЗП-0-00/10511.25.01-АСЗП» при комплексе в базе без
+    неё. Правила — по убыванию строгости, первое сработавшее
+    зачитывает:
+
+      1. Точное совпадение после _norm_complex_code (как раньше):
+         регистр, пробелы по краям, латинские двойники.
+      2. (а) Комплекс = шифр плана + ПРОБЕЛ(Ы) + не-шифровый хвост.
+         Условия все обязательны: шифр плана валиден
+         (is_valid_kit_code); комплекс начинается с него; следующий
+         символ — пробел; хвост после пробелов непуст и сам НЕ похож
+         на РД-шифр (looks_like_rd_code) — иначе это другой комплект
+         (или «две папки в одной»), а не наименование при шифре.
+         Сравнение «шифр + пробел» вместо подстроки исключает ложные
+         зачёты вида АТ-Р-КИ.ВК-2-00 ↔ АТ-РД-КИ.ВК-С-00.
+      3. (б) Оба с префиксом «ГИС-РД-»: базовые части до «/» равны,
+         дробная часть ровно с ОДНОЙ стороны, и та сторона — валидный
+         дробный шифр комплекта (is_valid_kit_code), а не шифр листа
+         («…/1.1» не проходит). Дроби с обеих сторон (даже равные
+         попадают в правило 1) или разные — не зачитываются.
+      4. (в) «Близнецы»: ОБА написания не проходят is_valid_kit_code
+         (например, с запятой — «объединение двух комплектов», патч
+         13) и после _norm_complex_code различаются только точками
+         («АТ-РД-КЖ1,2-С-П2.3.ВР» / «АТ-РД-КЖ1,2-С-П2.3ВР») — один
+         код. Для таблицы плана оба невалидны и в счёт не идут
+         (патч 13); правило нужно диагностике: близнецы считаются
+         ОДНОЙ позицией «вне плана», а не двумя.
+
+    АТ-комплекты с дробью или хвостом, не подпадающие под условия,
+    не зачитываются (strict by default).
+    """
+    nk = _norm_complex_code(kit_code)
+    nc = _norm_complex_code(complex_code)
+    if not nk or not nc:
+        return False
+    # 1. Точное/нормализованное совпадение
+    if nk == nc:
+        return True
+    # 2. (а) комплекс = шифр плана + пробел(ы) + не-шифровый хвост
+    if (is_valid_kit_code(nk)
+            and nc.startswith(nk)
+            and len(nc) > len(nk)
+            and nc[len(nk)] == " "):
+        tail = nc[len(nk):].lstrip(" ")
+        if tail and not looks_like_rd_code(tail):
+            return True
+    # 3. (б) ГИС: база до «/» равна, дробь ровно с одной стороны
+    if nk.startswith(GIS_KIT_PREFIX) and nc.startswith(GIS_KIT_PREFIX):
+        kbase, kfrac, _ = nk.partition("/")
+        cbase, cfrac, _ = nc.partition("/")
+        if kbase and kbase == cbase:
+            if kfrac and not cfrac and is_valid_kit_code(nk):
+                return True
+            if cfrac and not kfrac and is_valid_kit_code(nc):
+                return True
+    # 4. (в) близнецы: оба невалидны, различие только в точках
+    if (not is_valid_kit_code(nk) and not is_valid_kit_code(nc)
+            and nk.replace(".", "") == nc.replace(".", "")):
+        return True
+    return False
+
+
+def _vitro_claim_index(vitro_codes, plan_codes) -> dict[str, str]:
+    """Патч 22.15: индекс зачёта — какой комплект плана зачитывает
+    каждый шифр Витро. Возвращает {шифр комплекса в Витро: шифр
+    комплекта из plan_kits}.
+
+    Сопоставление — единым хелпером _kit_matches_complex. Приоритет у
+    более строгих правил: сначала ВСЕ точные/нормализованные
+    совпадения, затем (а)/(б)/(в) — только для оставшихся без пары.
+    Каждый шифр Витро зачитывается НЕ БОЛЕЕ чем одному комплекту
+    плана — двойного счёта листов нет: если в плане есть и базовый
+    ГИС-код, и его дробный вариант, листы базы уходят базовому
+    (точное совпадение сильнее правила (б)).
+    """
+    plan_list = sorted({str(c or "").strip()
+                        for c in (plan_codes or []) if c})
+    norm_to_plan: dict[str, str] = {}
+    for p in plan_list:
+        np_ = _norm_complex_code(p)
+        if np_ and np_ not in norm_to_plan:
+            norm_to_plan[np_] = p
+    claims: dict[str, str] = {}
+    rest: list[str] = []
+    for cx in (vitro_codes or []):
+        ncx = _norm_complex_code(cx)
+        if not ncx:
+            continue
+        p = norm_to_plan.get(ncx)
+        if p:
+            claims[str(cx)] = p
+        else:
+            rest.append(str(cx))
+    claimed_norms = {_norm_complex_code(cx) for cx in claims}
+    rest_plan = [p for p in plan_list
+                 if _norm_complex_code(p) not in claimed_norms]
+    for cx in rest:
+        for p in rest_plan:
+            if _kit_matches_complex(p, cx):
+                claims[cx] = p
+                break
+    return claims
+
+
 def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     """
     Одна строка = один комплект: план (ведомости) + Витро.
@@ -372,6 +519,13 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     из Витро (статус «Только в Витро») или лежат в plan_kits с
     старых загрузок. Без фильтра «Комплектов всего» оставалось 541
     вместо реальных 421.
+
+    Патч 22.15: сверка plan_kits.code ↔ documents.complex — не только
+    равенство после _norm_complex_code, а единый индекс зачёта
+    (_vitro_claim_index → _kit_matches_complex): зачитываются комплексы
+    с текстовым хвостом («АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ …») и
+    ГИС-план-коды с дробью против базовых комплексов; без двойного
+    счёта. Мусорный шифр не зачитывается (валидация — как в патче 13).
     """
     plan = load_plan_kits()
     drawings = load_plan_drawings()
@@ -398,14 +552,31 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
             .to_dict()
         )
 
+    # Патч 22.15: сопоставление plan_kits.code ↔ documents.complex —
+    # единый индекс зачёта (хелпер _kit_matches_complex): точное/
+    # нормализованное совпадение, затем «шифр + пробел + хвост» (КСТ2),
+    # ГИС-дробь, близнецы. Листы комплекса уходят ОДНОМУ комплекту
+    # плана — двойного счёта нет. Валидация план-кодов — та же, что
+    # в цикле ниже (мусор патча 13 зачёту не подлежит).
+    plan_codes_valid = [
+        r["code"] for _, r in plan.iterrows() if is_valid_kit_code(r["code"])
+    ] if not plan.empty else []
+    claims = _vitro_claim_index(vitro_counts.keys(), plan_codes_valid)
+    sheets_for_plan: dict[str, int] = {}
+    for cx, pc in claims.items():
+        sheets_for_plan[pc] = (
+            sheets_for_plan.get(pc, 0) + int(vitro_counts.get(cx, 0)))
+
     rows = []
     if not plan.empty:
         for _, r in plan.iterrows():
             code = r["code"]
             if not is_valid_kit_code(code):
                 continue  # исторический мусор в plan_kits (патч 13)
-            in_vitro = code in vitro_counts
-            sheets_vitro = vitro_counts.get(code, 0)
+            # Патч 22.15: листы и признак «в Витро» — по индексу зачёта
+            # (хвостовые комплексы и ГИС-дробь зачитываются плану)
+            sheets_vitro = int(sheets_for_plan.get(code, 0))
+            in_vitro = sheets_vitro > 0
             sheets_plan = int(plan_qty.get(code, 0))
             if _is_gis_kit(code):
                 # Патч 22.11: ГИС-комплект передан вне Витро — статус
@@ -435,10 +606,10 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
 
     if include_vitro_only:
         meta = _vitro_kit_meta()
-        known = set(r["code"] for r in rows)
+        claimed = set(claims)
         for code in sorted(vitro_counts):
-            if code in known:
-                continue
+            if code in claimed:
+                continue  # зачтено комплекту плана (патч 22.15)
             if not is_valid_kit_code(code):
                 continue  # мусорный шифр из папок Витро (патч 13)
             info = meta.get(code, {})
@@ -1013,7 +1184,8 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
     Патч 17: стиль Сводки — слева бублик без легенды, справа список
     с маркерами и числами. Загруженные листы разбиты по статусам
     A/B/C/Другие (_vitro_sheet_status_counts — тот же дедуп
-    sheets.unique_vitro_sheets, что и у «Листов в Витро», поэтому
+    документов, что и у «Листов в Витро»; с патча 22.15 — зачёт
+    через единый индекс _vitro_claim_index, поэтому
     A + B + C + Другие = «Листов в Витро» по отбору). Числа — из
     _plan_totals: по всему отфильтрованному отбору (без периода),
     включая комплекты «Только в Витро». «Листов всего» = max(план,
@@ -1085,8 +1257,15 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
     n_a = n_b = n_c = n_other = 0
     if not overview_filtered.empty:
         status_counts = _vitro_sheet_status_counts()
-        for code in overview_filtered["code"]:
-            per = status_counts.get(code)
+        # Патч 22.15: те же правила зачёта, что и в таблице — единый
+        # индекс (комплекс с текстовым хвостом уходит своему комплекту
+        # плана; двойного счёта у пар «базовый ГИС-код + дробный» нет),
+        # поэтому A + B + C + Другие по-прежнему сходится с колонкой
+        # «Листов в Витро».
+        claims = _vitro_claim_index(
+            status_counts.keys(), set(overview_filtered["code"]))
+        for cx in claims:
+            per = status_counts.get(cx)
             if per:
                 n_a += per["A"]
                 n_b += per["B"]
