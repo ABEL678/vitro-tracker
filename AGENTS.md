@@ -37,7 +37,11 @@ streamlit run app.py
 git status
 git add -A
 git commit -m "..."
-git push origin feature/analytics-rework
+git push origin main
+
+# Рабочая ветка: main. Все коммиты — сразу в main, затем push main.
+# Ветка release/1.5-plan более не используется (не коммитить туда);
+# ритуал «commit в release → merge --no-ff в main» отменён.
 ```
 
 ## Структура проекта
