@@ -28,6 +28,7 @@ os.environ["SQLITE_PATH"] = str(Path(_TMPDIR) / "test_vitro.db")
 import pandas as pd  # noqa: E402
 
 import vitro.sqlite_db as sqlite_db  # noqa: E402
+import vitro.ui.authors as authors  # noqa: E402
 from vitro.ui.authors import (  # noqa: E402
     _load_ready_for_a,
     _render_ready_for_a,
@@ -56,6 +57,10 @@ def seed_db() -> None:
     """Очищаем БД для чистого теста + сбрасываем кэш."""
     try:
         _load_ready_for_a.clear()
+    except Exception:
+        pass
+    try:
+        authors._load_closed_comments_for_doc.clear()
     except Exception:
         pass
     with sqlite_db.get_conn() as conn:
@@ -304,12 +309,71 @@ def block3():
 
 
 # ===========================================================================
+#  БЛОК 4 — Развёртка до листов, пробелы, реестр
+# ===========================================================================
+def block4():
+    # (а) два листа одного комплекта, оба со всеми закрытыми → 2 строки
+    seed_db()
+    add_document(1, f"{KIT_B}-1.PDF", KIT_B, "B", discipline="КЖ")
+    add_comment(1, 1, "Закрыто", "2026-01-01T10:00:00")
+    add_document(2, f"{KIT_B}-2.PDF", KIT_B, "B", discipline="КЖ")
+    add_comment(2, 2, "Аннулировано", "2026-02-01T10:00:00")
+
+    df = _load_ready_for_a()
+    check("4а: два листа одного комплекта → 2 строки",
+          len(df) == 2, f"len={len(df)}")
+    check("4а: строки — разные документы (doc_id)",
+          set(df["doc_id"]) == {1, 2}, f"doc_id={list(df['doc_id'])}")
+    check("4а: колонка комплекта сохранена",
+          set(df["complex"]) == {KIT_B})
+
+    # (б) хвостовой пробел в статусе замечания → лист попадает в отбор
+    seed_db()
+    add_document(3, f"{KIT_B}-3.PDF", KIT_B, "B", discipline="КЖ")
+    add_comment(3, 3, "Закрыто ", "2026-03-01T10:00:00")
+
+    df = _load_ready_for_a()
+    check("4б: 'Закрыто ' (хвостовой пробел) → лист в отборе",
+          KIT_B in df["complex"].values, f"complex={list(df['complex'])}")
+
+    # Колонка «Название» берётся из documents.name
+    seed_db()
+    with sqlite_db.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO documents (id, leaf, complex, status, sheet_number, "
+            "discipline, name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (4, f"{KIT_B}-4.PDF", KIT_B, "B", "1", "КЖ", "Название листа X"),
+        )
+    add_comment(4, 4, "Закрыто", "2026-04-01T10:00:00")
+    df = _load_ready_for_a()
+    check("4б: sheet_name = documents.name",
+          len(df) == 1 and df["sheet_name"].iloc[0] == "Название листа X",
+          f"sheet_name={list(df['sheet_name'])}")
+
+    # (в) реестр: лист с «Закрыто» и «Аннулировано» → обе строки видны
+    seed_db()
+    add_document(5, f"{KIT_B}-5.PDF", KIT_B, "B", discipline="КЖ")
+    add_comment(5, 5, "Закрыто", "2026-05-01T10:00:00")
+    add_comment(6, 5, "Аннулировано", "2026-05-02T10:00:00")
+
+    reg = authors._load_closed_comments_for_doc(5)
+    check("4в: реестр — 2 строки (Закрыто + Аннулировано)",
+          len(reg) == 2, f"len={len(reg)}")
+    check("4в: реестр — статусы присутствуют",
+          set(reg["comment_status"]) == {"Закрыто", "Аннулировано"},
+          f"статусы={list(reg['comment_status'])}")
+    check("4в: реестр — есть колонка текста и даты",
+          {"comment_text", "changed_at"}.issubset(reg.columns))
+
+
+# ===========================================================================
 #  Запуск всех блоков
 # ===========================================================================
 block0()
 block1()
 block2()
 block3()
+block4()
 
 # ---------------------------------------------------------------------------
 #  Итог

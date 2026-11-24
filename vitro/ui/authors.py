@@ -867,38 +867,32 @@ def _load_ready_for_a(
     marka: str = "",
 ) -> pd.DataFrame:
     """
-    Листы-кандидаты на перевод в А:
+    Листы-кандидаты на перевод в А (одна строка = один документ/лист):
     - Статус листа ∈ {B, C}
     - Есть хотя бы одно замечание
-    - ВСЕ замечания на листе ∈ {Закрыто, Аннулировано}
+    - ВСЕ замечания листа ∈ {Закрыто, Аннулировано} (пробелы по краям игнорируются)
     """
     with get_conn() as conn:
-        # Проверка закрытости — по КАЖДОМУ листу (документу), а не по группе:
-        # группа (шифр+дисциплина+статус) попадает в выборку, только если
-        # все замечания каждого её листа закрыты/аннулированы.
+        # Проверка закрытости — по КАЖДОМУ листу (документу).
         sql = """
-            WITH doc_stats AS (
-                SELECT
-                    d.id AS doc_id,
-                    d.complex, d.discipline,
-                    UPPER(d.status) AS doc_status,
-                    COUNT(c.id) AS n_total,
-                    SUM(CASE WHEN c.status IN ('Закрыто', 'Аннулировано') THEN 1 ELSE 0 END) AS n_closed,
-                    MAX(c.created) AS last_status_change
-                FROM documents d
-                JOIN comments c ON c.doc_id = d.id
-                WHERE UPPER(d.status) IN ('B', 'C')
-                GROUP BY d.id, d.complex, d.discipline, UPPER(d.status)
-            )
             SELECT
-                complex, discipline, doc_status,
-                SUM(n_total) AS n_total,
-                SUM(n_closed) AS n_closed,
-                MAX(last_status_change) AS last_status_change
-            FROM doc_stats
-            WHERE n_total = n_closed AND n_total > 0
-            GROUP BY complex, discipline, doc_status
-            ORDER BY discipline, complex
+                d.id AS doc_id,
+                d.complex,
+                d.discipline,
+                d.name AS sheet_name,
+                UPPER(d.status) AS doc_status,
+                COUNT(c.id) AS n_total,
+                SUM(CASE WHEN TRIM(c.status) IN ('Закрыто', 'Аннулировано')
+                         THEN 1 ELSE 0 END) AS n_closed,
+                MAX(c.created) AS last_status_change
+            FROM documents d
+            JOIN comments c ON c.doc_id = d.id
+            WHERE UPPER(d.status) IN ('B', 'C')
+            GROUP BY d.id, d.complex, d.discipline, d.name, UPPER(d.status)
+            HAVING COUNT(c.id) = SUM(CASE WHEN TRIM(c.status) IN ('Закрыто', 'Аннулировано')
+                                          THEN 1 ELSE 0 END)
+               AND COUNT(c.id) > 0
+            ORDER BY d.discipline, d.complex, d.id
         """
         df = pd.read_sql(sql, conn)
 
@@ -927,6 +921,25 @@ def _load_ready_for_a(
     return df
 
 
+def _render_ready_for_a_filters_and_load(key_prefix: str):
+    """Общие фильтры и загрузка кандидатов для двух подвкладок."""
+    flt = render_standard_filters(
+        key_prefix=key_prefix,
+        expander_label="🎛 Фильтры",
+        expanded=False,
+        show_remark_status=False,
+        show_sheet_status=False,
+    )
+    df = _load_ready_for_a(
+        disciplines=flt["disc"] or None,
+        kits=flt["kits"] or None,
+        sections=flt["section"] or None,
+        block_codes=flt["block_codes"] or None,
+        marka=flt["marka"],
+    )
+    return df
+
+
 def _render_ready_for_a():
     st.markdown("### ✅ Готовы к переводу в А")
     st.caption(
@@ -936,61 +949,51 @@ def _render_ready_for_a():
         "осталось утверждение листа заказчиком."
     )
 
-    # Единый стандарт фильтров
-    flt = render_standard_filters(
-        key_prefix="ready_a_",
-        expander_label="🎛 Фильтры",
-        expanded=False,
-        show_remark_status=False,
-        show_sheet_status=False,
-    )
-
-    df = _load_ready_for_a(
-        disciplines=flt["disc"] or None,
-        kits=flt["kits"] or None,
-        sections=flt["section"] or None,
-        block_codes=flt["block_codes"] or None,
-        marka=flt["marka"],
-    )
+    df = _render_ready_for_a_filters_and_load("ready_a_")
 
     if df.empty:
         st.success("🎉 Нет кандидатов на перевод в А с учётом фильтров.")
         return
 
-    # Карточки объёма
+    # Карточки объёма (одна строка = один лист)
     n_sheets = len(df)
     n_comments = int(df["n_total"].sum())
-    n_closed = int(df["n_closed"].sum())
-    n_b = int(df[df["doc_status"] == "B"]["n_total"].sum())
-    n_c = int(df[df["doc_status"] == "C"]["n_total"].sum())
+    n_b = int((df["doc_status"] == "B").sum())
+    n_c = int((df["doc_status"] == "C").sum())
 
     st.markdown("##### 📊 Объём")
     c1, c2, c3 = st.columns(3)
     c1.metric("Листов-кандидатов", f"{n_sheets:,}".replace(",", " "))
     c2.metric("Замечаний всего", f"{n_comments:,}".replace(",", " "))
-    c3.metric("Из них B / из них C", f"{n_b} / {n_c}")
-
-    st.divider()
+    c3.metric("Листов B / листов C", f"{n_b} / {n_c}")
 
     # Таблица
     st.markdown(f"##### 📋 Список ({n_sheets:,})")
 
     display = df.copy()
-    display["doc_status_group"] = display["doc_status"].apply(_doc_status_group)
+    display["discipline"] = display["discipline"].apply(
+        lambda c: f"{c} — {discipline_name(c)}" if c else ""
+    )
     display = display.rename(columns={
         "complex": "Шифр листа",
+        "sheet_name": "Название",
         "discipline": "Дисциплина",
         "doc_status": "Статус листа",
         "n_total": "Всего замечаний",
         "n_closed": "Закрыто/аннулировано",
         "last_status_change": "Последнее изменение",
     })
+    display = display[[
+        "Шифр листа", "Название", "Дисциплина", "Статус листа",
+        "Всего замечаний", "Закрыто/аннулировано", "Последнее изменение",
+    ]]
 
     st.dataframe(
         display,
         width='stretch', hide_index=True, height=600,
         column_config={
             "Шифр листа": st.column_config.TextColumn(width="medium"),
+            "Название": st.column_config.TextColumn(width="large"),
             "Дисциплина": st.column_config.TextColumn(width="small"),
             "Статус листа": st.column_config.TextColumn(width="small"),
             "Всего замечаний": st.column_config.NumberColumn(width="small"),
@@ -1344,6 +1347,96 @@ def _render_analytics_tab():
     _render_drilldown(df, df_ours)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_closed_comments_for_doc(doc_id: int) -> pd.DataFrame:
+    """Закрытые и аннулированные замечания одного листа (по doc_id)."""
+    with get_conn() as conn:
+        return pd.read_sql(
+            """
+            SELECT
+                d.complex AS complex,
+                d.name AS sheet_name,
+                TRIM(c.status) AS comment_status,
+                c.comment AS comment_text,
+                c.created AS changed_at
+            FROM comments c
+            JOIN documents d ON d.id = c.doc_id
+            WHERE c.doc_id = ?
+              AND TRIM(c.status) IN ('Закрыто', 'Аннулировано')
+            ORDER BY c.created, c.id
+            """,
+            conn,
+            params=(int(doc_id),),
+        )
+
+
+def _render_closed_comments_registry(df_sheets: pd.DataFrame):
+    """Реестр закрытых/аннулированных замечаний по выбранному листу."""
+    st.markdown("### 🗂 Закрытые и аннулированные замечания")
+    st.caption(
+        "Реестр замечаний по каждому листу-кандидату: статус «Закрыто» или "
+        "«Аннулировано». Выберите лист — таблица покажет его замечания."
+    )
+
+    if df_sheets.empty:
+        st.info("Нет листов-кандидатов с учётом фильтров.")
+        return
+
+    labels = {
+        int(r.doc_id): f"{r.complex} — {r.sheet_name or '(без названия)'} "
+                       f"({r.doc_status})"
+        for r in df_sheets.itertuples(index=False)
+    }
+    doc_ids = list(labels.keys())
+
+    doc_id = st.selectbox(
+        "Лист",
+        options=doc_ids,
+        format_func=lambda i: labels[i],
+        index=0,
+        key="closed_reg_sheet",
+    )
+
+    reg = _load_closed_comments_for_doc(doc_id)
+    if reg.empty:
+        st.info("У выбранного листа нет закрытых или аннулированных замечаний.")
+        return
+
+    st.markdown(f"##### 📋 Замечания ({len(reg):,})")
+
+    display = reg.rename(columns={
+        "complex": "Шифр листа",
+        "sheet_name": "Название",
+        "comment_status": "Статус замечания",
+        "comment_text": "Текст замечания",
+        "changed_at": "Дата изменения",
+    })
+
+    st.dataframe(
+        display,
+        width='stretch', hide_index=True, height=500,
+        column_config={
+            "Шифр листа": st.column_config.TextColumn(width="medium"),
+            "Название": st.column_config.TextColumn(width="medium"),
+            "Статус замечания": st.column_config.TextColumn(width="small"),
+            "Текст замечания": st.column_config.TextColumn(width="large"),
+            "Дата изменения": st.column_config.TextColumn(width="small"),
+        },
+    )
+
+    st.download_button(
+        "📥 Выгрузить в Excel",
+        data=_export_rows_to_excel(display),
+        file_name=(
+            f"Закрытые_замечания_{datetime.now():%Y%m%d_%H%M}.xlsx"
+        ),
+        mime="application/vnd.openxmlformats-officedocument."
+             "spreadsheetml.sheet",
+        width='stretch',
+        key="closed_reg_export",
+    )
+
+
 def render():
     st.header("👤 Авторы замечаний")
     st.caption(
@@ -1351,11 +1444,12 @@ def render():
         "как быстро рассматривают наши ответы."
     )
 
-    tab_analytics, tab_waiting, tab_a_annulled, tab_ready_a = st.tabs([
+    tab_analytics, tab_waiting, tab_a_annulled, tab_ready_a, tab_closed_reg = st.tabs([
         "📊 Аналитика авторов",
         "🔵 Ждут заказчика",
         "📄 К листам A и аннулированным",
         "✅ Готовы к переводу в А",
+        "🗂 Закрытые и аннулированные замечания",
     ])
 
     with tab_analytics:
@@ -1366,3 +1460,7 @@ def render():
         _render_customer_a_annulled()
     with tab_ready_a:
         _render_ready_for_a()
+    with tab_closed_reg:
+        _render_closed_comments_registry(
+            _render_ready_for_a_filters_and_load("closed_reg_")
+        )
