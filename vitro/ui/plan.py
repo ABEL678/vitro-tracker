@@ -251,33 +251,48 @@ def _vitro_sheet_status_counts() -> dict[str, dict[str, int]]:
 
 @versioned_cache(600)
 def _vitro_kit_meta() -> dict[str, dict]:
-    """{шифр: {name, discipline, section}} — справочник комплектов Витро."""
+    """{шифр: {name, discipline, section}} — справочник комплектов Витро.
+
+    Приоритет источников для дисциплины/раздела:
+      1. plan_kits (ведомость комплектов) — основной источник; для ГИС
+         даёт 03_ЭС / КИТСО;
+      2. complexes (Витро);
+      3. documents — только если значение НЕ содержит «ГИС»: там ГИС-
+         шифры попадают в поле дисциплины (parse_path берёт первый
+         элемент пути), и такое значение в таблицу плана не выводим.
+    """
     meta: dict[str, dict] = {}
     with get_conn() as conn:
         for r in conn.execute(
-            "SELECT code, name, discipline FROM complexes"
+            "SELECT code, name, discipline, section FROM plan_kits"
         ).fetchall():
             meta[r["code"]] = {
                 "name": r["name"] or "",
                 "discipline": r["discipline"] or "",
-                "section": "",
+                "section": r["section"] or "",
             }
+        for r in conn.execute(
+            "SELECT code, name, discipline FROM complexes"
+        ).fetchall():
+            info = meta.setdefault(
+                r["code"], {"name": "", "discipline": "", "section": ""})
+            if not info["name"]:
+                info["name"] = r["name"] or ""
+            if not info["discipline"]:
+                info["discipline"] = r["discipline"] or ""
         for r in conn.execute("""
             SELECT complex, discipline, section
             FROM documents WHERE complex IS NOT NULL
         """).fetchall():
             code = r["complex"]
-            if code not in meta:
-                meta[code] = {
-                    "name": "",
-                    "discipline": r["discipline"] or "",
-                    "section": r["section"] or "",
-                }
-            else:
-                if not meta[code]["discipline"]:
-                    meta[code]["discipline"] = r["discipline"] or ""
-                if not meta[code]["section"]:
-                    meta[code]["section"] = r["section"] or ""
+            info = meta.setdefault(
+                code, {"name": "", "discipline": "", "section": ""})
+            disc = r["discipline"] or ""
+            sect = r["section"] or ""
+            if not info["discipline"] and "ГИС" not in disc:
+                info["discipline"] = disc
+            if not info["section"] and sect:
+                info["section"] = sect
     return meta
 
 

@@ -246,17 +246,26 @@ def _sheet_groups_to_sql_or(sheet_groups: tuple, doc_alias: str = "d"):
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def load_discipline_options() -> dict[str, str]:
-    """{код дисциплины: 'код — название'} из таблицы documents."""
+    """{код дисциплины: 'код — название'} из таблицы documents.
+
+    Значения с подстрокой «ГИС» исключаются: в documents.discipline
+    попадают шифры комплектов ГИС (папка 02_ГИС → parse_path берёт
+    первый элемент пути). Настоящая дисциплина ГИС-комплектов — ЭС —
+    уже есть в списке из Витро и plan_kits."""
     with get_conn() as conn:
         codes = [r["discipline"] for r in conn.execute(
             "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL ORDER BY discipline")]
+            "WHERE discipline IS NOT NULL "
+            "AND instr(discipline, 'ГИС') = 0 "
+            "ORDER BY discipline")]
     return {c: f"{c} — {discipline_name(c)}" for c in codes}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_section_options(disciplines: tuple = ()) -> dict[str, str]:
-    """{раздел: раздел} с каскадом по дисциплинам."""
+    """{раздел: раздел} с каскадом по дисциплинам.
+    Источники: documents (Витро) и plan_kits (ведомость комплектов —
+    там есть раздел КИТСО для ГИС-комплектов)."""
     with get_conn() as conn:
         if disciplines:
             ph = ",".join("?" * len(disciplines))
@@ -264,11 +273,18 @@ def load_section_options(disciplines: tuple = ()) -> dict[str, str]:
                 SELECT DISTINCT section FROM documents
                 WHERE section IS NOT NULL AND section <> ''
                   AND discipline IN ({ph})
+                UNION
+                SELECT DISTINCT section FROM plan_kits
+                WHERE section IS NOT NULL AND section <> ''
+                  AND discipline IN ({ph})
                 ORDER BY section
-            """, tuple(disciplines)).fetchall()
+            """, tuple(disciplines) * 2).fetchall()
         else:
             rows = conn.execute("""
                 SELECT DISTINCT section FROM documents
+                WHERE section IS NOT NULL AND section <> ''
+                UNION
+                SELECT DISTINCT section FROM plan_kits
                 WHERE section IS NOT NULL AND section <> ''
                 ORDER BY section
             """).fetchall()
