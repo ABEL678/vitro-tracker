@@ -108,12 +108,25 @@ sheet_number — отдельные листы (пример СМИК: 44, а н
   раньше: is_valid_kit_code в «Только в Витро» и валидация план-кодов
   (патч 13).
 
+Патч 22.17 (приоритет статуса — следствие диагностики 22.11, раунд 2):
+  Патч 22.11 присваивал «Передан (вне Витро)» ВСЕМ ГИС-комплектам плана
+  безусловно, хотя часть из них уже загружена в Витро (в папках
+  GIS_WORK лежат PDF, документы есть в documents). Теперь приоритет:
+  ГИС-комплект, у которого есть хотя бы один PDF-документ в documents,
+  считается «Загружен в Витро»; «Передан (вне Витро)» — только для
+  ГИС без документов в базе. Наличие PDF — _vitro_pdf_complex_codes
+  (расширение .pdf или реестровый «Р-NNN» из патча 22.16), зачёт
+  плану — тем же хелпером сопоставления 22.15 (_kit_matches_complex →
+  _vitro_claim_index). Добавление GIS_WORK в complexes (22.11) и
+  приём реестровых PDF (22.16) не тронуты.
+
 Данные плана хранятся в SQLite: plan_kits, plan_drawings (sqlite_db.py).
 """
 
 from datetime import date, datetime
 
 import io
+import re
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -164,8 +177,14 @@ KIT_STATUS_OPTIONS = [
 # Патч 22.11: статус ГИС-комплекта «передан вне Витро». Засчитывается
 # как выполненный (наравне с «Загружено в Витро»), в «План к загрузке»
 # не попадает. Других статусов не добавлять.
+# Патч 22.17: статус только для ГИС-комплектов БЕЗ PDF-документов в
+# базе; ГИС с документами — «Загружен в Витро» (приоритет статуса).
 KIT_STATUS_PASSED = "Передан (вне Витро)"
 GIS_KIT_PREFIX = "ГИС-РД-"
+
+# Патч 22.17: реестровый PDF («Р-381») хранится в documents без
+# расширения (патч 22.16) — при проверке наличия PDF он тоже PDF.
+_REGISTRY_PDF_LEAF_RE = re.compile(r"^Р-\d+$")
 
 KIT_STATUS_COLORS = {
     "Загружен в Витро":        "#2ca02c",
@@ -260,6 +279,48 @@ def _vitro_sheet_counts() -> dict[str, int]:
         if code:
             counts[code] = counts.get(code, 0) + 1
     return counts
+
+
+def _is_pdf_document_leaf(leaf) -> bool:
+    """Патч 22.17: документ — PDF?
+
+    Признаки: имя файла с расширением «.pdf» (регистр не важен) либо
+    реестровый PDF «Р-NNN» (патч 22.16 хранит его в documents БЕЗ
+    расширения — leaf = «Р-381»). Прочие имена (например «.dwg» или
+    пустые) PDF не считаются.
+    """
+    name = str(leaf or "").strip()
+    if not name:
+        return False
+    if name.lower().endswith(".pdf"):
+        return True
+    return bool(_REGISTRY_PDF_LEAF_RE.match(name))
+
+
+@versioned_cache(600)
+def _vitro_pdf_complex_codes() -> frozenset[str]:
+    """Патч 22.17: шифры комплексов, у которых есть хотя бы один
+    PDF-документ в documents.
+
+    Нужен для приоритета статуса ГИС-комплектов: есть PDF → комплект
+    фактически загружен в Витро («Загружен в Витро»), нет PDF →
+    «Передан (вне Витро)». Сопоставление с планом — НЕ здесь, а тем же
+    хелпером патча 22.15 (_vitro_claim_index → _kit_matches_complex):
+    комплекс с текстовым хвостом или ГИС-дробь зачитываются своему
+    комплекту плана. Дедуп не нужен — важно само наличие PDF.
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT complex, leaf
+            FROM documents
+            WHERE complex IS NOT NULL
+        """).fetchall()
+    return frozenset(
+        str(r["complex"]).strip()
+        for r in rows
+        if str(r["complex"] or "").strip()
+        and _is_pdf_document_leaf(r["leaf"])
+    )
 
 
 @versioned_cache(600)
@@ -526,6 +587,11 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
     с текстовым хвостом («АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ …») и
     ГИС-план-коды с дробью против базовых комплексов; без двойного
     счёта. Мусорный шифр не зачитывается (валидация — как в патче 13).
+
+    Патч 22.17: приоритет статуса ГИС-комплектов. Если у комплекта есть
+    хотя бы один PDF-документ в documents (_vitro_pdf_complex_codes,
+    зачёт плану — тем же индексом 22.15), статус «Загружен в Витро»;
+    «Передан (вне Витро)» — только для ГИС без документов в базе.
     """
     plan = load_plan_kits()
     drawings = load_plan_drawings()
@@ -567,6 +633,14 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
         sheets_for_plan[pc] = (
             sheets_for_plan.get(pc, 0) + int(vitro_counts.get(cx, 0)))
 
+    # Патч 22.17: какие комплекты плана имеют хотя бы один PDF-документ
+    # в базе. Зачёт — тем же хелпером 22.15, что и листы (сортировка —
+    # для детерминированности обхода). Используется только для
+    # приоритета статуса ГИС-комплектов.
+    pdf_claims = _vitro_claim_index(
+        sorted(_vitro_pdf_complex_codes()), plan_codes_valid)
+    plan_with_pdf = set(pdf_claims.values())
+
     rows = []
     if not plan.empty:
         for _, r in plan.iterrows():
@@ -579,9 +653,11 @@ def _build_overview(include_vitro_only: bool) -> pd.DataFrame:
             in_vitro = sheets_vitro > 0
             sheets_plan = int(plan_qty.get(code, 0))
             if _is_gis_kit(code):
-                # Патч 22.11: ГИС-комплект передан вне Витро — статус
-                # безусловно «Передан», даже при листах в Витро.
-                status = KIT_STATUS_PASSED
+                # Патч 22.11 + 22.17: ГИС-комплект с PDF-документом в
+                # базе фактически загружен — приоритет «Загружен в
+                # Витро». «Передан (вне Витро)» — только без документов.
+                status = ("Загружен в Витро" if code in plan_with_pdf
+                          else KIT_STATUS_PASSED)
             elif in_vitro and sheets_plan > 0 and sheets_vitro < sheets_plan:
                 status = "Загружается (частично)"
             elif in_vitro:
@@ -1105,7 +1181,9 @@ def _plan_totals(overview_filtered: pd.DataFrame) -> dict:
             "sheets_remaining", "sheets_done")}
     n_total = len(overview_filtered)
     # Патч 22.11: три категории комплектов — «Загружено в Витро»
-    # (статус), «Передан (вне Витро)» (ГИС), «План к загрузке» (остаток).
+    # (статус), «Передан (вне Витро)» (ГИС без документов),
+    # «План к загрузке» (остаток). Патч 22.17: ГИС с PDF-документами
+    # учитывается в «Загружено» (in_vitro), а не в «Передан».
     n_passed = int((overview_filtered["status"] == KIT_STATUS_PASSED).sum())
     n_loaded = int(overview_filtered["in_vitro"].astype(bool).sum()) - n_passed
     sheets_vitro = int(overview_filtered["sheets_vitro"].astype(int).sum())
@@ -1232,12 +1310,15 @@ def _render_donuts(overview_filtered: pd.DataFrame) -> tuple[int, int]:
             "🟢 Загружено в Витро", _fmt_num(n_loaded),
             help="Комплекты, у которых есть хотя бы один лист в Витро "
                  "(включая «Только в Витро» — отсутствующие в "
-                 "ведомостях).",
+                 "ведомостях). С патча 22.17 сюда же входят "
+                 "ГИС-комплекты с PDF-документами в базе.",
         )
         st.metric(
             "🔵 Передан (вне Витро)", _fmt_num(n_passed),
-            help="ГИС-комплекты (префикс ГИС-РД-): переданы вне Витро, "
-                 "засчитываются выполненными.",
+            help="ГИС-комплекты (префикс ГИС-РД-) БЕЗ PDF-документов в "
+                 "базе: переданы вне Витро, засчитываются выполненными. "
+                 "ГИС-комплекты с документами считаются загруженными "
+                 "(патч 22.17).",
         )
         st.metric(
             "🟣 План к загрузке", _fmt_num(n_plan),

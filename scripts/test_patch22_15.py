@@ -28,7 +28,8 @@
      строки «Только в Витро».
   б. ГИС план-код с дробью совпадает с базовым комплексом; без
      двойного счёта, когда в плане есть и базовый код, и дробный;
-     разные дроби не зачитываются.
+     разные дроби не зачитываются. Патч 22.17: у ГИС с PDF-документами
+     статус «Загружен в Витро» (приоритет статуса), а не «Передан».
   в. Ложные совпадения не возникают: АТ-Р-КИ.ВК-2-00 не матчится на
      АТ-РД-КИ.ВК-С-00 и …ВК-1-00 (в хелпере и в таблице).
   г. Близнецы АТ-РД-КЖ1,2-С-П2.3.ВР / АТ-РД-КЖ1,2-С-П2.3ВР — один
@@ -84,7 +85,8 @@ def reset() -> None:
                   "complexes"):
             conn.execute(f"DELETE FROM {t}")
     for fn in (plan._vitro_sheet_counts, plan._vitro_sheet_status_counts,
-               plan._vitro_kit_meta, plan._vitro_sheet_dates):
+               plan._vitro_kit_meta, plan._vitro_sheet_dates,
+               plan._vitro_pdf_complex_codes):
         try:
             fn.clear()
         except Exception:
@@ -109,7 +111,8 @@ def add_doc(doc_id, complex_code, sheet, status="A"):
 
 
 def overview(include_vitro_only=True):
-    for fn in (plan._vitro_sheet_counts, plan._vitro_sheet_status_counts):
+    for fn in (plan._vitro_sheet_counts, plan._vitro_sheet_status_counts,
+               plan._vitro_pdf_complex_codes):
         fn.clear()
     return plan._build_overview(include_vitro_only)
 
@@ -170,8 +173,8 @@ def block_b():
     check("б: sheets_vitro = 3 (листы базового комплекса)",
           r is not None and int(r["sheets_vitro"]) == 3,
           f"sheets_vitro={None if r is None else r['sheets_vitro']}")
-    check("б: статус «Передан (вне Витро)» (22.11 не сломан)",
-          r is not None and r["status"] == "Передан (вне Витро)",
+    check("б: статус «Загружен в Витро» (ГИС с PDF, патч 22.17)",
+          r is not None and r["status"] == "Загружен в Витро",
           f"status={None if r is None else r['status']}")
     check("б: in_vitro=True — засчитан выполненным",
           r is not None and bool(r["in_vitro"]))

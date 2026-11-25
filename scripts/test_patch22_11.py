@@ -1,9 +1,14 @@
 """Тесты патча 22.11 — ГИС-комплекты: статус «Передан (вне Витро)».
 
+Обновлено патчем 22.17: статус больше не безусловный — ГИС-комплект
+с PDF-документами в базе считается «Загружен в Витро», «Передан»
+остаётся только для ГИС без документов.
+
 Правки:
   1. fetch_complex_names() обходит GIS_WORK (комплекты ГИС → complexes).
-  2. _build_overview(): ГИС-РД-* → статус «Передан (вне Витро)» безусловно;
-     категорий ровно три: «Загружено в Витро», «Передан (вне Витро)»,
+  2. _build_overview(): ГИС-РД-* без документов → «Передан (вне Витро)»;
+     с PDF-документами → «Загружен в Витро» (патч 22.17). Категорий в
+     бублике три: «Загружено в Витро», «Передан (вне Витро)»,
      «План к загрузке». В итогах и статистике «Передан» = выполненный.
   3. Сопоставление plan_kits ↔ documents.complex через _norm_complex_code.
 
@@ -61,7 +66,8 @@ def reset() -> None:
                   "complexes"):
             conn.execute(f"DELETE FROM {t}")
     for fn in (plan._vitro_sheet_counts, plan._vitro_sheet_status_counts,
-               plan._vitro_kit_meta, plan._vitro_sheet_dates):
+               plan._vitro_kit_meta, plan._vitro_sheet_dates,
+               plan._vitro_pdf_complex_codes):
         try:
             fn.clear()
         except Exception:
@@ -86,7 +92,7 @@ def add_doc(doc_id, complex_code, sheet, status="A"):
 
 
 def overview(include_vitro_only=False):
-    for fn in (plan._vitro_sheet_counts,):
+    for fn in (plan._vitro_sheet_counts, plan._vitro_pdf_complex_codes):
         fn.clear()
     return plan._build_overview(include_vitro_only)
 
@@ -116,8 +122,8 @@ def block_a():
     add_doc(2, GIS_B, "2", "B")
     ov = overview()
     r = row_of(ov, GIS_B)
-    check("а: ГИС с листами в Витро → всё равно «Передан (вне Витро)»",
-          r is not None and r["status"] == "Передан (вне Витро)",
+    check("а: ГИС с PDF-документами → «Загружен в Витро» (патч 22.17)",
+          r is not None and r["status"] == "Загружен в Витро",
           f"status={None if r is None else r['status']}")
     check("а: ГИС с листами — листы в Витро посчитаны (sheets_vitro=2)",
           r is not None and int(r["sheets_vitro"]) == 2)
@@ -139,8 +145,9 @@ def block_b():
     totals = plan._plan_totals(ov)
     check("б: kits_total = 1 (без двойного счёта)",
           totals["kits_total"] == 1, f"kits_total={totals['kits_total']}")
-    check("б: kits_passed = 1, kits_loaded = 0 (ГИС не в «Загружено»)",
-          totals["kits_passed"] == 1 and totals["kits_loaded"] == 0,
+    check("б: kits_loaded = 1, kits_passed = 0 (ГИС с PDF — загружен, "
+          "патч 22.17)",
+          totals["kits_passed"] == 0 and totals["kits_loaded"] == 1,
           f"passed={totals['kits_passed']}, loaded={totals['kits_loaded']}")
 
 
