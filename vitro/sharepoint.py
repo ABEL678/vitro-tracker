@@ -11,6 +11,7 @@ from vitro.config import (
     VITRO_USER, VITRO_PASSWORD, VITRO_BASE_URL, VITRO_OKHTA_URL,
     VITRO_VERIFY_SSL, HEADERS,
 )
+from vitro.disciplines import GIS_DISCIPLINE
 from vitro.sheets import looks_like_rd_code
 
 # Гасим предупреждение InsecureRequestWarning ТОЛЬКО когда проверка
@@ -152,11 +153,19 @@ def parse_path(file_dir_ref: str) -> tuple[str, str, str]:
     Патч 19: комплектом считается папка, чьё имя похоже на РД-код
     ЛЮБОЙ организации (looks_like_rd_code: «АТ-РД-…», «ГИС-РД-…» и
     др.), а не только начинающаяся с «АТ-РД-».
+
+    Патч 22.13: для любого пути внутри GIS_WORK дисциплина — всегда
+    константа "ГИС" (одно значение на все ГИС-комплекты), а не имя
+    комплекта/шифр. Раздел и комплект разбираются как раньше.
     """
     # Патч 20: поддержка путей АТП и ГИС
     work_prefixes = (ATP_WORK + "/", GIS_WORK + "/")
     if not file_dir_ref or not any(file_dir_ref.startswith(p) for p in work_prefixes):
         return ("", "", "")
+
+    # Патч 22.13: путь ГИС определяется по префиксу GIS_WORK
+    is_gis = file_dir_ref.startswith(GIS_WORK + "/")
+
     # Определяем, какой префикс совпал, и обрезаем его
     rel = file_dir_ref
     for prefix in work_prefixes:
@@ -176,16 +185,13 @@ def parse_path(file_dir_ref: str) -> tuple[str, str, str]:
     )
     if complex_idx is None:
         # Нет комплекта — возвращаем дисциплину (если есть)
-        return (parts[0], "/".join(parts[1:]), "")
+        discipline = GIS_DISCIPLINE if is_gis else parts[0]
+        return (discipline, "/".join(parts[1:]), "")
 
     # Всё, что до complex_idx — это дисциплина/раздел
-    discipline = parts[0] if complex_idx == 0 else parts[0]
+    discipline = GIS_DISCIPLINE if is_gis else parts[0]
     section = "/".join(parts[1:complex_idx]) if complex_idx > 1 else ""
     comp = parts[complex_idx]
-    return (discipline, section, comp)
-
-    comp = parts[complex_idx]
-    section = "/".join(parts[1:complex_idx]) if complex_idx > 1 else ""
     return (discipline, section, comp)
 
 

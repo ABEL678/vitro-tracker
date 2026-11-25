@@ -301,9 +301,9 @@ def _vitro_kit_meta() -> dict[str, dict]:
       1. plan_kits (ведомость комплектов) — основной источник; для ГИС
          даёт 03_ЭС / КИТСО;
       2. complexes (Витро);
-      3. documents — только если значение НЕ содержит «ГИС»: там ГИС-
-         шифры попадают в поле дисциплины (parse_path берёт первый
-         элемент пути), и такое значение в таблицу плана не выводим.
+      3. documents — резервный источник. Патч 22.13: дисциплина ГИС
+         теперь единая константа "ГИС" (parse_path), поэтому значение
+         больше не отбрасывается.
     """
     meta: dict[str, dict] = {}
     with get_conn() as conn:
@@ -333,7 +333,7 @@ def _vitro_kit_meta() -> dict[str, dict]:
                 code, {"name": "", "discipline": "", "section": ""})
             disc = r["discipline"] or ""
             sect = r["section"] or ""
-            if not info["discipline"] and "ГИС" not in disc:
+            if not info["discipline"] and disc:
                 info["discipline"] = disc
             if not info["section"] and sect:
                 info["section"] = sect

@@ -1,8 +1,8 @@
 """Тест правки 4 — фильтр дисциплин и атрибуты ГИС-строк.
 
-Блок (е):
-  е1. Варианты фильтра «Дисциплина» не содержат ни одного значения
-      с подстрокой «ГИС» (load_discipline_options).
+Обновлён патчем 22.13:
+  е1. Вариант «ГИС» в фильтре «Дисциплина» РОВНО ОДИН — константа
+      "ГИС", без по-комплектных значений (load_discipline_options).
   е2. Фильтр «Комплект» содержит ГИС-комплекты (_plan_kit_options_fn).
   е3. Фильтр «Раздел» содержит КИТСО (load_section_options).
   е4. Строки ГИС-РД-* в таблице плана несут дисциплину 03_ЭС и раздел
@@ -16,17 +16,26 @@
 """
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 _TMPDIR = tempfile.mkdtemp(prefix="vitro_test_gis_filters_")
 _COPY = Path(_TMPDIR) / "vitro_copy.db"
 shutil.copyfile(ROOT / "data" / "vitro.db", _COPY)
 os.environ["SQLITE_PATH"] = str(_COPY)
+
+# Патч 22.13: тест не зависит от того, применена ли миграция к боевой
+# БД — прогоняем её на копии (идемпотентно).
+import migrate_patch22_13 as mig  # noqa: E402
+
+with sqlite3.connect(_COPY) as _conn:
+    mig.migrate_conn(_conn)
 
 import vitro.ui._filters as flt  # noqa: E402
 import vitro.ui.plan as plan  # noqa: E402
@@ -42,11 +51,13 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         FAILED.append(name)
 
 
-# ---- е1: дисциплины без ГИС ----
+# ---- е1: ровно один пункт «ГИС» ----
 disc = flt.load_discipline_options()
-gis_disc = [k for k in disc if "ГИС" in k or "ГИС" in disc[k]]
-check("е1: в «Дисциплине» нет значений с подстрокой «ГИС»",
-      not gis_disc, f"найдено: {gis_disc}")
+gis_keys = [k for k in disc if "ГИС" in k.upper()]
+check("е1: в «Дисциплине» ровно один пункт «ГИС»",
+      gis_keys == ["ГИС"], f"найдено: {gis_keys}")
+check("е1: подпись пункта — «ГИС»",
+      disc.get("ГИС") == "ГИС", f"подпись: {disc.get('ГИС')!r}")
 check("е1: «Дисциплина» не пустая", len(disc) > 0, f"len={len(disc)}")
 
 # ---- е2: ГИС-комплекты в фильтре «Комплект» ----

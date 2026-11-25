@@ -21,7 +21,7 @@ categories, search, export, plan).
 import pandas as pd
 import streamlit as st
 
-from vitro.disciplines import discipline_name
+from vitro.disciplines import GIS_DISCIPLINE, discipline_name
 from vitro.sqlite_db import get_conn
 
 
@@ -248,24 +248,38 @@ def _sheet_groups_to_sql_or(sheet_groups: tuple, doc_alias: str = "d"):
 def load_discipline_options() -> dict[str, str]:
     """{код дисциплины: 'код — название'} из таблицы documents.
 
-    Значения с подстрокой «ГИС» исключаются: в documents.discipline
-    попадают шифры комплектов ГИС (папка 02_ГИС → parse_path берёт
-    первый элемент пути). Настоящая дисциплина ГИС-комплектов — ЭС —
-    уже есть в списке из Витро и plan_kits."""
+    Патч 22.13: все ГИС-значения схлопываются в ОДИН пункт «ГИС»
+    (константа GIS_DISCIPLINE). После миграции в documents уже лежит
+    "ГИС"; схлопывание страхует от старых по-комплектных значений
+    (например, «ГИС-РД-СБ-ТСО-1-00») до/без миграции.
+    """
     with get_conn() as conn:
-        codes = [r["discipline"] for r in conn.execute(
+        rows = conn.execute(
             "SELECT DISTINCT discipline FROM documents "
-            "WHERE discipline IS NOT NULL "
-            "AND instr(discipline, 'ГИС') = 0 "
-            "ORDER BY discipline")]
-    return {c: f"{c} — {discipline_name(c)}" for c in codes}
+            "WHERE discipline IS NOT NULL ORDER BY discipline").fetchall()
+    codes = set()
+    for r in rows:
+        c = str(r["discipline"] or "").strip()
+        if not c:
+            continue
+        codes.add(GIS_DISCIPLINE if "ГИС" in c.upper() else c)
+    return {
+        c: (c if c == GIS_DISCIPLINE
+            else f"{c} — {discipline_name(c)}")
+        for c in sorted(codes)
+    }
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_section_options(disciplines: tuple = ()) -> dict[str, str]:
     """{раздел: раздел} с каскадом по дисциплинам.
     Источники: documents (Витро) и plan_kits (ведомость комплектов —
-    там есть раздел КИТСО для ГИС-комплектов)."""
+    там есть раздел КИТСО для ГИС-комплектов).
+
+    Патч 22.13: при выбранной дисциплине «ГИС» к разделам добавляются
+    разделы ГИС-строк ведомости (plan_kits.code LIKE 'ГИС-РД-%') —
+    у них своя дисциплина 03_ЭС, но раздел КИТСО относится к ГИС.
+    """
     with get_conn() as conn:
         if disciplines:
             ph = ",".join("?" * len(disciplines))
@@ -279,6 +293,13 @@ def load_section_options(disciplines: tuple = ()) -> dict[str, str]:
                   AND discipline IN ({ph})
                 ORDER BY section
             """, tuple(disciplines) * 2).fetchall()
+            rows = list(rows)
+            if GIS_DISCIPLINE in disciplines:
+                rows += conn.execute("""
+                    SELECT DISTINCT section FROM plan_kits
+                    WHERE section IS NOT NULL AND section <> ''
+                      AND code LIKE 'ГИС-РД-%'
+                """).fetchall()
         else:
             rows = conn.execute("""
                 SELECT DISTINCT section FROM documents
@@ -288,7 +309,8 @@ def load_section_options(disciplines: tuple = ()) -> dict[str, str]:
                 WHERE section IS NOT NULL AND section <> ''
                 ORDER BY section
             """).fetchall()
-    return {r["section"]: r["section"] for r in rows}
+    return {r["section"]: r["section"]
+            for r in sorted(rows, key=lambda x: x["section"])}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -302,8 +324,15 @@ def load_kit_options(disciplines: tuple = (),
         params: list = []
 
         if disciplines:
-            where.append(
-                f"c.discipline IN ({','.join('?' * len(disciplines))})")
+            ph = ",".join("?" * len(disciplines))
+            if GIS_DISCIPLINE in disciplines:
+                # Патч 22.13: ГИС-комплекты показываем и в том случае,
+                # если в complexes ещё лежит старое по-комплектное
+                # значение дисциплины (до ближайшего синка).
+                where.append(
+                    f"(c.discipline IN ({ph}) OR c.code LIKE 'ГИС-РД-%')")
+            else:
+                where.append(f"c.discipline IN ({ph})")
             params += list(disciplines)
 
         if sections:
