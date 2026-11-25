@@ -503,6 +503,29 @@ def _load_vitro_sheets_raw() -> list:
     return [dict(r) for r in rows]
 
 
+def _group_sheets_by_complex(rows, include_invalid: bool = False) -> dict:
+    """Строки documents → {шифр комплекса: [уникальные листы]}.
+
+    include_invalid=False — отбор unique_vitro_sheets (валидные шифры,
+    стандарт патча 14/21).
+    include_invalid=True (патч 22.18) — только дедупликация
+    dedup_document_rows, БЕЗ отсечения невалидных написаний: нужен
+    экспорту «Обновить статусы», чтобы комплекс с текстовым хвостом
+    («АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ …») дошёл до сопоставления
+    хелпером 22.15 и получил ревизию/дату. Мусор в отчёт не попадает:
+    он сопоставляется с шифрами Excel только по правилам
+    _kit_matches_complex.
+    """
+    kept = (dedup_document_rows(rows) if include_invalid
+            else unique_vitro_sheets(rows))
+    grouped: dict = {}
+    for r in kept:
+        cx = str(r.get("complex") or "")
+        if cx:
+            grouped.setdefault(cx, []).append(r)
+    return grouped
+
+
 def get_kit_status(complex_code: str) -> str:
     """Статус комплекта по последним ревизиям его листов (патч 21).
 
@@ -526,7 +549,7 @@ def get_kit_status(complex_code: str) -> str:
         r.get("status") for r in kit_sheets)
 
 
-def get_kit_statuses(codes=None) -> dict:
+def get_kit_statuses(codes=None, include_invalid: bool = False) -> dict:
     """Батчевый вариант get_kit_status (патч 21): ОДИН проход по БД
     на весь список шифров.
 
@@ -537,13 +560,18 @@ def get_kit_statuses(codes=None) -> dict:
     канонические шифры (normalize_kit_code), значения — «A» / «B» /
     «C» / «План (не загружен)» — ровно то, что вернул бы
     get_kit_status для каждого шифра (общее ядро правил).
+
+    include_invalid (патч 22.18) — не отсекать написания, не прошедшие
+    is_valid_kit_code: нужен только диагностике экспорта (комплексы
+    с текстовым хвостом). Публичное поведение по умолчанию не меняется.
     """
-    statuses_by_kit: dict = {}
-    for r in unique_vitro_sheets(_load_vitro_sheets_raw()):
-        cx = str(r.get("complex") or "")
-        if not cx:
-            continue
-        statuses_by_kit.setdefault(cx, []).append(r.get("status"))
+    statuses_by_kit: dict = {
+        cx: [r.get("status") for r in rows]
+        for cx, rows in _group_sheets_by_complex(
+            _load_vitro_sheets_raw(),
+            include_invalid=include_invalid,
+        ).items()
+    }
 
     result = {
         cx: _kit_status_from_statuses(sts)
@@ -632,7 +660,7 @@ def _kit_revision_from_rows(rows) -> tuple:
     return best_rev, _format_rev_date(best_iso)
 
 
-def get_kit_revision_info(codes=None) -> dict:
+def get_kit_revision_info(codes=None, include_invalid: bool = False) -> dict:
     """«Ревизия комплекта» и «Дата ревизии» (патч 22) — батчевый API
     в стиле get_kit_statuses: ОДИН проход по БД на весь список шифров.
 
@@ -644,13 +672,17 @@ def get_kit_revision_info(codes=None) -> dict:
     ревизии, «липкое» аннулирование, нормализация шифров, отсечение
     мусорных); правила — _kit_revision_from_rows. Значения: revision —
     строка («10.0») или "", date — «ДД.ММ.ГГГГ» или "".
+
+    include_invalid (патч 22.18) — брать листы из dedup_document_rows
+    БЕЗ отсечения невалидных написаний (стандарт _vitro_sheet_counts
+    «Плана выдачи»): нужен экспорту «Обновить статусы», чтобы комплекс
+    с текстовым хвостом («АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ …») получил
+    ревизию и дату. По умолчанию поведение патча 22 не меняется.
     """
-    rows_by_kit: dict = {}
-    for r in unique_vitro_sheets(_load_vitro_sheets_raw()):
-        cx = str(r.get("complex") or "")
-        if not cx:
-            continue
-        rows_by_kit.setdefault(cx, []).append(r)
+    rows_by_kit: dict = _group_sheets_by_complex(
+        _load_vitro_sheets_raw(),
+        include_invalid=include_invalid,
+    )
 
     result: dict = {}
     for cx, rows in rows_by_kit.items():

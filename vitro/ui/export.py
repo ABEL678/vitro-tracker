@@ -15,6 +15,15 @@
 того же источника, что и полоса даты в шапке приложения
 (deadlines._load_last_sync_date).
 
+Патч 22.18: сопоставление шифров Excel с базой — ЕДИНЫЙ хелпер
+«Плана выдачи» _kit_matches_complex (патч 22.15): точное →
+нормализованное → «шифр + хвост текста» (КСТ2) → ГИС-база без
+дробной части. КСТ2 и загруженные ГИС-комплекты больше не получают
+«План (не загружен)»: у них «Загружено в Витро» + ревизия/дата из
+базы; ГИС без документов — «Передан (вне Витро)» с пустыми
+ревизией/датой; несопоставленные шифры выводятся списком в отчёте.
+Обычные АТ-комплекты со статусом листов сохраняют A/B/C (патч 21).
+
 Форматированные XLSX-шаблоны генерируются в разделе «⚙️ Управление».
 """
 
@@ -39,6 +48,15 @@ from vitro.sheets import (
 from vitro.time_utils import fmt_msk
 from vitro.pdf_builder import build_pdf
 from vitro.ui._filters import render_standard_filters
+# Патч 22.18: сопоставление шифров экспорта — ЕДИНЫЙ хелпер «Плана
+# выдачи» (патч 22.15) и признак ГИС-комплекта (22.11/22.17).
+# Своей логики сверки в экспорте нет: одна правда для диаграммы,
+# «Плана выдачи» и «Обновить статусы».
+from vitro.ui.plan import (
+    KIT_STATUS_PASSED,
+    _is_gis_kit,
+    _vitro_claim_index,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -926,11 +944,18 @@ def _render_analytics():
 
 
 # ---------------------------------------------------------------------------
-#  Секция 4: Обновить статусы комплектов (патчи 21/22)
+#  Секция 4: Обновить статусы комплектов (патчи 21/22/22.18)
 # ---------------------------------------------------------------------------
 KIT_STATUS_COL = "Статус комплекта"
 KIT_REVISION_COL = "Ревизия комплекта"
 KIT_REV_DATE_COL = "Дата ревизии"
+
+# Патч 22.18: статус сопоставленного комплекта, у которого в базе есть
+# документы, но статус листов A/B/C ранее не вычислялся (КСТ2 с
+# текстовым хвостом) либо это ГИС-комплект (приоритет 22.17).
+# Обычные АТ-комплекты со статусом листов сохраняют A/B/C (патч 21,
+# регресс test_patch22_3) — «нет регресса» из ТЗ 22.18.
+KIT_STATUS_LOADED = "Загружено в Витро"
 
 # Стили патча 22 (согласованы): шапки трёх kit-колонок — светло-
 # голубая заливка D9E1F2; у всех ячеек таблицы тонкие границы
@@ -1000,15 +1025,193 @@ def _load_all_kit_statuses() -> dict:
 
 @versioned_cache(600)
 def _load_all_kit_revision_info() -> dict:
-    """{шифр: {"revision": …, "date": …}} — один срез БД (патч 22).
+    """{шифр: {"revision": …, "date": …}} — один срез БД (патчи 22/22.18).
 
-    sheets.get_kit_revision_info(None): тот же unique_vitro_sheets,
-    что и у статусов (последние ревизии листов, нормализация
-    шифров) — максимум ревизии по числовому сравнению и крайняя
-    дата выгрузки ДД.ММ.ГГГГ. versioned_cache — сброс при синке,
-    как у остальных загрузчиков вкладки.
+    sheets.get_kit_revision_info(None, include_invalid=True): дедуп
+    документов БЕЗ отсечения невалидных написаний (стандарт
+    «Плана выдачи», патч 22.15) — так в индекс попадают комплексы
+    с текстовым хвостом («АТ-РД-КСТ2-А-00  КОНТАКТНАЯ СЕТЬ …»),
+    которые раньше терялись и получали «План (не загружен)».
+    Ревизия — максимум по числовому сравнению, дата — крайняя
+    выгрузка ДД.ММ.ГГГГ. Ключи в индексе — нормализованные шифры
+    комплексов базы. versioned_cache — сброс при синке, как у
+    остальных загрузчиков вкладки.
     """
-    return get_kit_revision_info()
+    return get_kit_revision_info(include_invalid=True)
+
+
+def _empty_kit_metrics() -> dict:
+    """Пустые kit-значения для строки без сопоставления (патч 22.18)."""
+    return {"status": KIT_STATUS_NOT_LOADED, "revision": "", "date": ""}
+
+
+def _rev_sort_key(value) -> float:
+    """Ключ сравнения ревизий при склейке нескольких комплексов базы:
+    числовое сравнение («2.0» < «10.0»), нечисловое → -1."""
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _date_sort_key(value) -> tuple:
+    """Ключ сравнения дат «ДД.ММ.ГГГГ» (формат _format_rev_date):
+    неразбираемая дата → (0, 0, 0)."""
+    try:
+        d = datetime.strptime(str(value).strip(), "%d.%m.%Y")
+    except (TypeError, ValueError):
+        return (0, 0, 0)
+    return (d.year, d.month, d.day)
+
+
+def _merge_kit_metrics(items) -> dict:
+    """Максимум ревизии и крайняя дата по нескольким комплексам базы.
+
+    Нужен, когда одному шифру Excel сопоставилось больше одного
+    написания комплекса (например, базовый и дробный ГИС): ревизия —
+    максимум по числовому сравнению, дата — самая поздняя. Пустые
+    значения не выигрывают (ключи -1 / (0,0,0)).
+    """
+    best_rev, best_rev_key = "", -1.0
+    best_date, best_date_key = "", (0, 0, 0)
+    for m in items or []:
+        rev = str((m or {}).get("revision") or "")
+        rk = _rev_sort_key(rev)
+        if rk > best_rev_key:
+            best_rev_key, best_rev = rk, rev
+        dt = str((m or {}).get("date") or "")
+        dk = _date_sort_key(dt)
+        if dk > best_date_key:
+            best_date_key, best_date = dk, dt
+    return {"revision": best_rev, "date": best_date}
+
+
+@versioned_cache(600)
+def _resolve_kit_codes(keys: tuple) -> dict:
+    """Патч 22.18: {нормализованный шифр Excel: kit-значения}.
+
+    Сопоставление — ЕДИНЫЙ индекс зачёта «Плана выдачи»
+    _vitro_claim_index (патч 22.15) → _kit_matches_complex: точное/
+    нормализованное совпадение, затем «шифр + пробел(ы) + не-шифровый
+    хвост» (КСТ2), ГИС-дроби, близнецы. Каждый комплекс базы
+    зачитывается НЕ БОЛЕЕ чем одному шифру Excel — двойного счёта нет:
+    если в перечне есть и базовый ГИС-код, и его дробный вариант,
+    документы достаются базовому (точное совпадение сильнее), а
+    дробный остаётся «Передан (вне Витро)» — как в диаграмме 22.17
+    (5 загруженных ГИС / 26 переданных, а не 7/24). Своей сверки на
+    равенство в экспорте нет.
+
+    Правила значений (ТЗ 22.18):
+      * сопоставился и есть документы:
+          - ГИС-комплект → «Загружено в Витро» (приоритет 22.17);
+          - обычный АТ со статусом листов A/B/C → этот статус
+            (патч 21, без регресса);
+          - все листы «И»/аннулированы → «План (не загружен)»
+            (правило 21 не меняем);
+          - сопоставился только хелпером 22.15 (хвост/дробь) →
+            «Загружено в Витро»;
+        ревизия/дата — по данным комплекса из базы;
+      * ГИС без документов → «Передан (вне Витро)», ревизия/дата
+        пустые (ничего не выдумываем);
+      * иначе → «План (не загружен)», ревизия/дата пустые.
+
+    keys — кортеж нормализованных шифров (хешируемый аргумент кэша);
+    пустые пропускаются. versioned_cache — сброс при синке.
+    """
+    metrics = _load_all_kit_revision_info()
+    valid_statuses = _load_all_kit_statuses()
+
+    # Единый индекс зачёта 22.15: {шифр комплекса в базе: шифр Excel}.
+    claims = _vitro_claim_index(list(metrics), list(keys or ()))
+    matched_by_key: dict = {}
+    for db_code, excel_code in claims.items():
+        matched_by_key.setdefault(excel_code, []).append(db_code)
+
+    resolved: dict = {}
+    for key in keys or ():
+        if not key:
+            continue
+        matched = matched_by_key.get(key, [])
+        if not matched:
+            if _is_gis_kit(key):
+                resolved[key] = {
+                    "status": KIT_STATUS_PASSED, "revision": "", "date": "",
+                }
+            else:
+                resolved[key] = _empty_kit_metrics()
+            continue
+
+        merged = _merge_kit_metrics([metrics[cx] for cx in matched])
+        if _is_gis_kit(key):
+            status = KIT_STATUS_LOADED
+        else:
+            known = [valid_statuses[cx] for cx in matched
+                     if cx in valid_statuses]
+            graded = [s for s in known if s in ("A", "B", "C")]
+            if graded:
+                status = max(graded, key="ABC".index)
+            elif known:
+                # Все листы «И»/аннулированы — правило 21 (не регресс)
+                status = KIT_STATUS_NOT_LOADED
+            else:
+                # Документы есть, но комплекс не проходил валидацию
+                # (хвост/дробь-вариант) — ровно случай КСТ2 (22.18)
+                status = KIT_STATUS_LOADED
+        resolved[key] = {
+            "status": status,
+            "revision": merged["revision"],
+            "date": merged["date"],
+        }
+    return resolved
+
+
+def _apply_kit_statuses_resolved(df: pd.DataFrame, col: str) -> tuple:
+    """Патч 22.18: kit-колонки по базе + список несопоставленных.
+
+    Возвращает (DataFrame с тремя kit-колонками, [шифры-расхождения]).
+    Сопоставление — _resolve_kit_codes (единый хелпер 22.15);
+    исходный DataFrame не мутируется.
+
+    В расхождения попадают шифры со статусом «План (не загружен)»
+    (нет документов в базе и это не ГИС-комплект вне Витро) — чтобы
+    пользователь видел опечатки и чужие строки перечня, а не молча
+    получал пустой статус. Пустые ячейки не считаются расхождением.
+    """
+    codes = df[col].tolist()
+    keys: list = []
+    seen: set = set()
+    for code in codes:
+        key = normalize_kit_code(code)
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    resolved = _resolve_kit_codes(tuple(keys))
+
+    out = df.copy()
+    statuses: list = []
+    revisions: list = []
+    dates: list = []
+    unmatched: list = []
+    for code in codes:
+        key = normalize_kit_code(code)
+        info = resolved.get(key) if key else None
+        if info is None:
+            info = _empty_kit_metrics()
+        statuses.append(info["status"])
+        revisions.append(info["revision"])
+        dates.append(info["date"])
+        if key and info["status"] == KIT_STATUS_NOT_LOADED:
+            try:
+                raw = "" if pd.isna(code) else str(code).strip()
+            except (TypeError, ValueError):
+                raw = str(code).strip()
+            if raw and raw not in unmatched:
+                unmatched.append(raw)
+
+    out[KIT_STATUS_COL] = statuses
+    out[KIT_REVISION_COL] = revisions
+    out[KIT_REV_DATE_COL] = dates
+    return out, unmatched
 
 
 def _apply_kit_statuses(df: pd.DataFrame, col: str, statuses: dict,
@@ -1147,8 +1350,11 @@ def _render_kit_status_update():
     st.caption(
         "Загрузите перечень комплектов (Excel) — для каждого шифра "
         "подставятся «Статус комплекта», «Ревизия комплекта» и "
-        "«Дата ревизии» по листам Витро: «A» / «B» / «C» / "
-        "«План (не загружен)»."
+        "«Дата ревизии» по базе Витро. Статус: «A» / «B» / «C» — "
+        "известный статус листов комплекта; «Загружено в Витро» — "
+        "документы в базе есть, но комплекс сопоставлен по хвосту/"
+        "дроби (КСТ2, ГИС); «Передан (вне Витро)» — ГИС-комплект без "
+        "документов; «План (не загружен)» — нет ни в базе, ни вне Витро."
     )
 
     uploaded = st.file_uploader(
@@ -1191,16 +1397,30 @@ def _render_kit_status_update():
     st.info(f"Найден лист «{sheet_name}» с колонкой «{col}».")
 
     # --- Предпросмотр через pandas ---
-    statuses = _load_all_kit_statuses()
-    rev_info = _load_all_kit_revision_info()
-    result = _apply_kit_statuses(df, col, statuses, rev_info)
+    result, unmatched = _apply_kit_statuses_resolved(df, col)
 
-    n_found = int((result[KIT_STATUS_COL] != KIT_STATUS_NOT_LOADED).sum())
+    n_loaded = int((result[KIT_STATUS_COL] == KIT_STATUS_LOADED).sum())
+    n_graded = int(result[KIT_STATUS_COL].isin(["A", "B", "C"]).sum())
+    n_passed = int((result[KIT_STATUS_COL] == KIT_STATUS_PASSED).sum())
+    n_plan = int((result[KIT_STATUS_COL] == KIT_STATUS_NOT_LOADED).sum())
     st.success(
         f"Колонки «{KIT_STATUS_COL}», «{KIT_REVISION_COL}», "
         f"«{KIT_REV_DATE_COL}» добавлены (шифры — «{col}»). "
-        f"Строк: {len(result)}, из них в Витро: {n_found}."
+        f"Строк: {len(result)}: в Витро {n_graded + n_loaded} "
+        f"(со статусом A/B/C — {n_graded}, «{KIT_STATUS_LOADED}» — "
+        f"{n_loaded}), «{KIT_STATUS_PASSED}» — {n_passed}, "
+        f"«{KIT_STATUS_NOT_LOADED}» — {n_plan}."
     )
+
+    if unmatched:
+        st.warning(
+            f"Не сопоставлено с базой и не ГИС вне Витро: "
+            f"{len(unmatched)} шифр(ов). Проверьте написание — эти "
+            f"строки получат «{KIT_STATUS_NOT_LOADED}»."
+        )
+        with st.expander("Показать несопоставленные шифры"):
+            for code in unmatched:
+                st.markdown(f"• `{code}`")
 
     result = result.astype(str)
     st.dataframe(
@@ -1218,7 +1438,7 @@ def _render_kit_status_update():
     st.download_button(
         "📥 Скачать обновлённый Excel",
         data=_xlsx_add_kit_status(
-            uploaded, sheet_name, col, statuses, KIT_STATUS_COL,
+            uploaded, sheet_name, col, None, KIT_STATUS_COL,
             sync_ts=_load_last_sync_date(),
         ),
         file_name=f"{_extract_filename(uploaded)}_статусы_{datetime.now():%Y%m%d}.xlsx",
@@ -1261,11 +1481,16 @@ def _xlsx_add_kit_status(
        #808080, kit-колонки по центру, автофильтр по диапазону
        таблицы.
 
-    2. pd.DataFrame (уже с kit-колонками от _apply_kit_statuses —
-       так зовут тесты scripts/test_patch22.py и fallback) —
+    2. pd.DataFrame (уже с kit-колонками от _apply_kit_statuses /
+       _apply_kit_statuses_resolved — так зовут тесты
+       scripts/test_patch22.py и fallback) —
        сборка новой книги «с нуля»: строка 1 — полоса даты,
        строка 2 — шапка, данные с 3-й, те же стили; sheet_name —
        имя листа.
+
+    statuses (патч 21) в режиме 1 больше не используется: значения
+    трёх колонок вычисляются единым резолвером _resolve_kit_codes
+    (патч 22.18) — параметр сохранён для совместимости вызовов.
 
     sync_ts — timestamp последнего синка
     (deadlines._load_last_sync_date()); пусто → «База актуальна
@@ -1445,13 +1670,19 @@ def _styled_upload_to_xlsx(
             break
 
     if header_row_idx is None:
-        # Не нашли — fallback к pandas + стилизованная сборка «с нуля»
+        # Не нашли — fallback к pandas + стилизованная сборка «с нуля».
+        # Патч 22.18: значения — тем же резолвером, что и в основном
+        # режиме (колонка шифров ищется, если не передана).
         df_fb = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        fb_col = kit_col or _find_kit_code_column(df_fb)
+        if fb_col is None:
+            return _styled_df_to_xlsx(
+                df_fb, sheet_name=(sheet_name or "Комплекты")[:31],
+                sync_ts=sync_ts,
+            )
+        df_fb, _ = _apply_kit_statuses_resolved(df_fb, fb_col)
         return _styled_df_to_xlsx(
-            _apply_kit_statuses(
-                df_fb, kit_col, statuses or {},
-                rev_info=get_kit_revision_info(),
-            ),
+            df_fb,
             sheet_name=(sheet_name or "Комплекты")[:31],
             sync_ts=sync_ts,
         )
@@ -1537,27 +1768,34 @@ def _styled_upload_to_xlsx(
         # Ширина — 16 символов (статус/ревизия/дата помещаются)
         ws.column_dimensions[get_column_letter(col_num)].width = 16
 
-    # --- 7. Батч-вычисление статусов и ревизий: словарь
+    # --- 7. Батч-вычисление kit-значений: словарь
     # {фактическая строка: шифр} — пустые строки в середине данных
-    # не сдвигают kit-значения вверх ---
+    # не сдвигают kit-значения вверх. Патч 22.18: ЕДИНЫЙ резолвер
+    # _resolve_kit_codes (хелпер сопоставления 22.15): собственной
+    # проверки на равенство здесь нет ---
     row_codes = {}
     for r in range(header_row_idx + 1, last_row + 1):
         val = ws.cell(row=r, column=kit_col_num).value
         if val is not None and not pd.isna(val):
             row_codes[r] = val
 
-    codes = list(row_codes.values())
-    kit_statuses = get_kit_statuses(codes)
-    kit_revisions = get_kit_revision_info(codes)
+    norm_keys: list = []
+    seen_keys: set = set()
+    for code in row_codes.values():
+        key = normalize_kit_code(code)
+        if key and key not in seen_keys:
+            seen_keys.add(key)
+            norm_keys.append(key)
+    resolved = _resolve_kit_codes(tuple(norm_keys))
 
     # --- 8. Значения трёх kit-колонок в фактические строки ---
     for r, code in row_codes.items():
         norm = normalize_kit_code(code)
-        rev = kit_revisions.get(norm) or {}
+        info = resolved.get(norm) or _empty_kit_metrics()
         for col_num, value in (
-            (col_status, kit_statuses.get(norm, KIT_STATUS_NOT_LOADED)),
-            (col_rev, rev.get("revision", "")),
-            (col_date, rev.get("date", "")),
+            (col_status, info["status"]),
+            (col_rev, info["revision"]),
+            (col_date, info["date"]),
         ):
             c = ws.cell(row=r, column=col_num, value=value)
             c.alignment = Alignment(horizontal="center",
