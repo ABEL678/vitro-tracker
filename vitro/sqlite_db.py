@@ -66,7 +66,9 @@ def init_db() -> None:
             status_date    TEXT,
             sheet_number   TEXT,
             vitro_guid     TEXT,
-            vitro_version  INTEGER
+            vitro_version  INTEGER,
+            send_date      TEXT,
+            workflow_id    INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_documents_complex    ON documents(complex);
         CREATE INDEX IF NOT EXISTS idx_documents_discipline ON documents(discipline);
@@ -189,16 +191,21 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_documents_sovr_complex ON documents_sovr(complex);
         CREATE INDEX IF NOT EXISTS idx_documents_sovr_sheet   ON documents_sovr(sheet_number);
 
-        -- Таблица-каркас для Excel-перечня листов СО/ВР (патч 22.21)
-        -- Заполняется парсером (следующий патч). Пока — заглушки.
+        -- Таблица-каркас: перечень комплектов СО/ВОР из Excel (СВОК).
+        -- Патч 22.24: одна строка = комплект; заполняется парсером СВОК.
         CREATE TABLE IF NOT EXISTS sheets_sovr_template (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            kit_code     TEXT NOT NULL,        -- шифр комплекта
-            sheet_no     TEXT,                -- номер листа ('СО', 'ВР', …)
-            title        TEXT,                -- наименование
-            source       TEXT,                -- источник (имя файла Excel)
-            created_at   TEXT,
-            updated_at   TEXT
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            kit_code        TEXT NOT NULL,     -- шифр комплекта
+            sheet_no        TEXT,              -- 'СО'/'ВР' (совместимость)
+            title           TEXT,              -- наименование комплекта
+            discipline      TEXT,              -- дисциплина (группа)
+            section         TEXT,              -- раздел
+            marka           TEXT,              -- марка комплекта
+            vor_status      TEXT,              -- сырой текст колонки T
+            vor_not_issued  INTEGER DEFAULT 0, -- 1 = «Не выдается»
+            source          TEXT,              -- имя файла Excel
+            created_at      TEXT,
+            updated_at      TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_sheets_sovr_template_kit ON sheets_sovr_template(kit_code);
         """)
@@ -217,9 +224,25 @@ def init_db() -> None:
         for col, ddl in [
             ("vitro_guid",    "TEXT"),
             ("vitro_version", "INTEGER"),
+            ("send_date",     "TEXT"),      # патч 22.24: дата выдачи
+            ("workflow_id",   "INTEGER"),   # патч 22.24: № процесса
         ]:
             if col not in doc_cols:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {ddl}")
+
+        # Мягкая миграция sheets_sovr_template — поля перечня СВОК (22.24)
+        tmp_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(sheets_sovr_template)")}
+        for col, ddl in [
+            ("discipline",     "TEXT"),
+            ("section",        "TEXT"),
+            ("marka",          "TEXT"),
+            ("vor_status",     "TEXT"),
+            ("vor_not_issued", "INTEGER DEFAULT 0"),
+        ]:
+            if col not in tmp_cols:
+                conn.execute(
+                    f"ALTER TABLE sheets_sovr_template ADD COLUMN {col} {ddl}")
 
         # Мягкая миграция plan_drawings — колонка «номер листа»
         # (добавлена в v1.4.1 для реальных регистров «Комплекты чертежей»)
@@ -434,14 +457,15 @@ def save_all(docs: list[dict], comments: list[dict], doc_ids: set) -> tuple:
                 INSERT INTO documents
                     (id, leaf, discipline, section, complex, status,
                      revision, dir_ref, name, status_date, sheet_number,
-                     vitro_guid, vitro_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     vitro_guid, vitro_version, send_date, workflow_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 (d["id"], d["leaf"], d.get("discipline"), d.get("section"),
                  d.get("complex"), d.get("status"), d.get("revision"),
                  d.get("dir_ref"), d.get("name"), d.get("status_date"),
                  d.get("sheet_number"),
-                 d.get("vitro_guid"), d.get("vitro_version"))
+                 d.get("vitro_guid"), d.get("vitro_version"),
+                 d.get("send_date"), d.get("workflow_id"))
                 for d in docs
             ])
 
@@ -747,68 +771,78 @@ def clear_plan() -> None:
 
 
 # ===========================================================================
-#  СО и ВР (патч 22.21)
+#  СО и ВР (патч 22.21; маппинг send_date/workflow_id — патч 22.24)
 # ===========================================================================
+def _sovr_latest_rows(docs: list) -> list:
+    """«Последний по процессу» лист СО/ВР из строк documents.
+
+    Правило 22.21: для каждой пары (complex, sheet_number) — MAX(status_date),
+    при равенстве — MAX(id). Все поля (status, send_date, workflow_id,
+    revision, name, vitro_guid, doc_id) берутся из ОДНОЙ строки-победителя
+    (патч 22.24, блок B) — никакого смешивания полей разных ревизий.
+
+    Вход — list[dict|sqlite3.Row] с ключами documents. Возвращает
+    list[dict] с нормализованными sheet_number ('СО'/'ВР') и
+    doc_id (id исходной строки). Чистая функция: БД не трогает.
+    """
+    from vitro.sheet_kind import normalize_sheet_number
+
+    best: dict[tuple, dict] = {}
+    for r in docs or []:
+        row = dict(r)
+        kind = normalize_sheet_number(row.get("sheet_number"))
+        if kind not in ("СО", "ВР"):
+            continue
+        key = (row.get("complex") or "", kind)
+        row["sheet_number"] = kind
+        row["doc_id"] = row.get("id")
+        winner = best.get(key)
+        if winner is None:
+            best[key] = row
+            continue
+        w_sd = winner.get("status_date") or ""
+        r_sd = row.get("status_date") or ""
+        if r_sd > w_sd or (r_sd == w_sd and (row.get("id") or 0) > (winner.get("id") or 0)):
+            best[key] = row
+    return list(best.values())
+
+
 def load_sovr_statuses(user: str = "") -> int:
     """
     Загружает/обновляет витрину статусов СО/ВР из таблицы documents.
 
-    Правило «последний по процессу»:
-      - Для каждой пары (complex, sheet_number) берётся строка с MAX(status_date),
-        при равенстве дат — MAX(id).
+    Правило «последний по процессу» — _sovr_latest_rows: MAX(status_date),
+    при равенстве MAX(id); send_date и workflow_id берутся из той же
+    строки-победителя (патч 22.24).
     - sheet_number нормализуется через sheet_kind.normalize_sheet_number().
     - Идемпотентно: DELETE FROM documents_sovr + INSERT заново.
 
     Возвращает число вставленных строк.
     """
-    from vitro.sheet_kind import normalize_sheet_number
+    # Гарантируем наличие колонок send_date/workflow_id (патч 22.24):
+    # init_db идемпотентен и вызывается здесь, чтобы функция работала
+    # и до первого старта приложения на «старой» базе.
+    init_db()
 
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT id, complex, sheet_number, status, status_date,
-                   revision, name, vitro_guid
+                   send_date, workflow_id, revision, name, vitro_guid
             FROM documents
             WHERE complex IS NOT NULL AND sheet_number IS NOT NULL
         """).fetchall()
 
-    if not rows:
-        return 0
-
-    # Нормализуем sheet_number и отбираем только СО/ВР
-    sovr_rows = []
-    for r in rows:
-        kind = normalize_sheet_number(r["sheet_number"])
-        if kind not in ("СО", "ВР"):
-            continue
-        sovr_rows.append(dict(r))
-
-    if not sovr_rows:
+    best_rows = _sovr_latest_rows(rows)
+    if not best_rows:
         return 0
 
     now = msk_now_str()
 
-    # «Последний по процессу»: MAX(status_date), при равенстве MAX(id)
-    # Группируем по (complex, sheet_number) и берём победителя
-    best: dict[tuple[str, str], dict] = {}
-    for row in sovr_rows:
-        key = (row["complex"], row["sheet_number"])
-        winner = best.get(key)
-        if winner is None:
-            best[key] = row
-            continue
-
-        # Сравниваем: MAX(status_date), при равенстве MAX(id)
-        w_sd = winner.get("status_date") or ""
-        r_sd = row.get("status_date") or ""
-        if r_sd > w_sd or (r_sd == w_sd and row["id"] > winner["id"]):
-            best[key] = row
-
-    # Очищаем и вставляем заново (идемпотентно)
     with get_conn() as conn:
         conn.execute("DELETE FROM documents_sovr")
 
         inserted = 0
-        for key, row in best.items():
+        for row in best_rows:
             conn.execute("""
                 INSERT INTO documents_sovr
                     (complex, sheet_number, doc_id, status, send_date,
@@ -818,7 +852,7 @@ def load_sovr_statuses(user: str = "") -> int:
             """, (
                 row["complex"],
                 row["sheet_number"],
-                row["id"],
+                row["doc_id"],
                 row.get("status"),
                 row.get("send_date"),
                 row.get("status_date"),
@@ -834,15 +868,173 @@ def load_sovr_statuses(user: str = "") -> int:
     return inserted
 
 
+def upsert_documents(docs: list[dict]) -> int:
+    """Вставка/обновление документов БЕЗ удаления comments (патч 22.24).
+
+    Полная перезапись (save_all) удаляет comments, поэтому для сервисной
+    кнопки «Обновить статусы СО и ВОР из Витро» нужен точечный upsert:
+    свежие поля документов (status, status_date, send_date, workflow_id,
+    revision, name, ...) сохраняются в documents, замечания не трогаются.
+
+    Возвращает число обработанных строк.
+    """
+    if not docs:
+        return 0
+    init_db()
+    with get_conn() as conn:
+        conn.executemany("""
+            INSERT INTO documents
+                (id, leaf, discipline, section, complex, status,
+                 revision, dir_ref, name, status_date, sheet_number,
+                 vitro_guid, vitro_version, send_date, workflow_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                leaf          = excluded.leaf,
+                discipline    = excluded.discipline,
+                section       = excluded.section,
+                complex       = excluded.complex,
+                status        = excluded.status,
+                revision      = excluded.revision,
+                dir_ref       = excluded.dir_ref,
+                name          = excluded.name,
+                status_date   = excluded.status_date,
+                sheet_number  = excluded.sheet_number,
+                vitro_guid    = excluded.vitro_guid,
+                vitro_version = excluded.vitro_version,
+                send_date     = excluded.send_date,
+                workflow_id   = excluded.workflow_id
+        """, [
+            (d["id"], d["leaf"], d.get("discipline"), d.get("section"),
+             d.get("complex"), d.get("status"), d.get("revision"),
+             d.get("dir_ref"), d.get("name"), d.get("status_date"),
+             d.get("sheet_number"),
+             d.get("vitro_guid"), d.get("vitro_version"),
+             d.get("send_date"), d.get("workflow_id"))
+            for d in docs
+        ])
+    return len(docs)
+
+
 def load_sovr_table():
-    """Все строки витрины СО/ВР (для UI, патч 22.22)."""
+    """Все строки витрины СО/ВР + дисциплина/раздел/лист из documents.
+
+    LEFT JOIN нужен фильтрам «Дисциплина»/«Раздел» (патч 22.24, A1):
+    в самой витрине эти поля не хранятся, источник — documents.doc_id.
+    """
     import pandas as pd
 
     with get_conn() as conn:
         return pd.read_sql("""
-            SELECT complex, sheet_number, doc_id, status, send_date,
-                   status_date, workflow_id, revision, name, vitro_guid,
-                   updated_at, updated_by
-            FROM documents_sovr
-            ORDER BY complex, sheet_number, status_date DESC
+            SELECT s.complex, s.sheet_number, s.doc_id, s.status,
+                   s.send_date, s.status_date, s.workflow_id,
+                   s.revision, s.name, s.vitro_guid,
+                   s.updated_at, s.updated_by,
+                   d.discipline AS discipline,
+                   d.section    AS section,
+                   d.leaf       AS leaf
+            FROM documents_sovr s
+            LEFT JOIN documents d ON d.id = s.doc_id
+            ORDER BY s.complex, s.sheet_number, s.status_date DESC
         """, conn)
+
+
+# ---------------------------------------------------------------------------
+#  Перечень СВОК (патч 22.24, блок C)
+# ---------------------------------------------------------------------------
+_SOVR_TEMPLATE_COLS = (
+    "kit_code", "title", "discipline", "section", "marka",
+    "vor_status", "vor_not_issued", "source", "created_at", "updated_at",
+)
+
+
+def replace_sovr_template(rows: list[dict], source: str = "") -> dict:
+    """Полная синхронизация перечня СВОК с таблицей sheets_sovr_template.
+
+    Повторная загрузка: обновляет существующие комплекты, добавляет новые
+    и удаляет исчезнувшие (одинаково с полной перезаписью состава других
+    перечней проекта). created_at сохраняется у комплектов, которые уже
+    были в перечне; updated_at — общий для загрузки.
+
+    Возвращает {"kits": N, "not_issued": K, "removed": R, "added": A}.
+    """
+    now = msk_now_str()
+
+    # Нормализуем и дедуплицируем вход по kit_code (последняя строка побеждает)
+    normalized: dict[str, dict] = {}
+    for r in rows or []:
+        code = str(r.get("kit_code") or "").strip()
+        if not code:
+            continue
+        normalized[code] = {
+            "kit_code": code,
+            "title": r.get("title") or "",
+            "discipline": r.get("discipline") or "",
+            "section": r.get("section") or "",
+            "marka": r.get("marka") or "",
+            "vor_status": r.get("vor_status") or "",
+            "vor_not_issued": 1 if r.get("vor_not_issued") else 0,
+            "source": r.get("source") or source or "",
+        }
+
+    with get_conn() as conn:
+        existing = {
+            r["kit_code"]: (r["created_at"], r["title"], r["discipline"],
+                            r["section"], r["marka"], r["vor_status"],
+                            r["vor_not_issued"])
+            for r in conn.execute(
+                "SELECT kit_code, created_at, title, discipline, section, "
+                "marka, vor_status, vor_not_issued "
+                "FROM sheets_sovr_template")
+        }
+        removed = len(set(existing) - set(normalized))
+        added = len(set(normalized) - set(existing))
+
+        conn.execute("DELETE FROM sheets_sovr_template")
+        for code, row in normalized.items():
+            created_at = (existing.get(code) or (None,))[0] or now
+            conn.execute("""
+                INSERT INTO sheets_sovr_template
+                    (kit_code, sheet_no, title, discipline, section, marka,
+                     vor_status, vor_not_issued, source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                code, None, row["title"], row["discipline"], row["section"],
+                row["marka"], row["vor_status"], row["vor_not_issued"],
+                row["source"], created_at, now,
+            ))
+
+        not_issued = sum(1 for r in normalized.values()
+                         if r["vor_not_issued"])
+
+    return {
+        "kits": len(normalized),
+        "not_issued": not_issued,
+        "removed": removed,
+        "added": added,
+        "updated_at": now,
+    }
+
+
+def load_sovr_template():
+    """Перечень СВОК из БД (DataFrame). Пустая таблица → пустой DataFrame
+    с ожидаемыми колонками."""
+    import pandas as pd
+
+    with get_conn() as conn:
+        df = pd.read_sql(
+            "SELECT kit_code, title, discipline, section, marka, "
+            "vor_status, vor_not_issued, source, created_at, updated_at "
+            "FROM sheets_sovr_template ORDER BY kit_code", conn)
+    if df.empty:
+        df = pd.DataFrame(columns=list(_SOVR_TEMPLATE_COLS))
+    return df
+
+
+def sovr_template_meta() -> dict:
+    """Количество комплектов и время последней загрузки перечня СВОК."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt, MAX(updated_at) AS upd "
+            "FROM sheets_sovr_template").fetchone()
+    return {"count": int(row["cnt"] or 0) if row else 0,
+            "updated_at": (row["upd"] if row else None) or ""}

@@ -1,16 +1,25 @@
 """
-📑 СО и ВОР — листы СО и ВР (патч 22.22-22.23).
+📑 СО и ВОР — листы СО и ВР (патчи 22.22–22.24).
 
 Витрина статусов листов СО/ВР из таблицы documents_sovr.
-Две подвкладки: основная (таблица, бублики, экспорт) и сервисная (обновление).
+Две подвкладки: «Основная» (фильтры, бублики, таблица, экспорт) и
+«Сервисная» (обновление из Витро + загрузка перечня СВОК).
 
-Структура вкладки:
-  1. Фильтры — стандартные (Дисциплина/Раздел/Комплект) + статус листа + период.
-  2. Бублики — СО и ВР (статусы + загружено/план) — всегда оба блока.
-  3. Сводная таблица — строка = лист (complex + sheet_number).
-  4. Экспорт в Excel.
-  5. Обогащение пользовательского Excel (СВОК) — колонки СО/ВР.
-  6. Сервисная подвкладка — обновление статусов СО/ВР из Витро (патч 22.23).
+Патч 22.24:
+  A1 — бублики статусов зависят от всех фильтров, КРОМЕ периода
+       (send_date); таблица — от всех, включая период.
+  A2 — переключатель подвкладок (st.tabs), по умолчанию «Основная».
+  A3 — развёрнутые названия блоков без иконок:
+       «Спецификация оборудования и материалов» и
+       «Ведомость объемов работ»; краткие «СО»/«ВОР» — в шапках групп.
+  A4 — легенда статусов A/B/C/другие — общий компонент проекта
+       (_pie_with_legend из deadlines.py), цвета SHEET_STATUS_COLORS.
+  A5 — бублики в st.columns рядом: «Статусы» и «Загружено / План».
+  B  — send_date/workflow_id берутся из той же записи витрины, что и
+       статус («последний по процессу»); None → пусто, без «None».
+  C  — парсер перечня СВОК (лист «СВОК», шапка по «Шифр РД» в колонке C,
+       колонка T «Текущий статус ВОР»), план к загрузке, строки
+       «Не загружен», фильтр по ним.
 """
 
 from datetime import date, datetime
@@ -24,13 +33,24 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils import range_boundaries
 
 from vitro._cache import versioned_cache
-from vitro.sqlite_db import get_conn, load_sovr_table
-from vitro.sheet_kind import normalize_sheet_number
-from vitro.time_utils import fmt_msk
+from vitro.sheets import looks_like_rd_code, normalize_kit_code
+from vitro.sqlite_db import (
+    get_conn, load_sovr_table, load_sovr_template,
+    replace_sovr_template, sovr_template_meta,
+)
 
 # ---------------------------------------------------------------------------
 #  Константы
 # ---------------------------------------------------------------------------
+KIND_SO = "СО"
+KIND_VR = "ВР"
+
+KIND_TITLES = {
+    KIND_SO: "Спецификация оборудования и материалов",
+    KIND_VR: "Ведомость объемов работ",
+}
+KIND_SHORT = {KIND_SO: "СО", KIND_VR: "ВОР"}
+
 SHEET_STATUS_COLORS = {
     "Статус A — утверждён": "#2ca02c",
     "Статус B — к сдаче":   "#ffdd57",
@@ -38,43 +58,94 @@ SHEET_STATUS_COLORS = {
     "Другие статусы":       "#9467bd",
 }
 
+SHEET_STATUS_ORDER = [
+    "Статус A — утверждён",
+    "Статус B — к сдаче",
+    "Статус C — в работе",
+    "Другие статусы",
+]
+
 SHEET_STATUS_COLORS_LOADED = {
     "Загружено": "#2ca02c",
 }
 
+PLAN_COLORS = {
+    "Загружено": "#2ca02c",
+    "План к загрузке": "#9467bd",
+}
+
 STATUS_OPTIONS = ["Не загружен", "A", "B", "C", "Другие"]
+STATUS_NOT_LOADED = "Не загружен"
 
 # ---------------------------------------------------------------------------
 #  Кэшированные данные
 # ---------------------------------------------------------------------------
 @versioned_cache(3600)
 def _load_sovr_data() -> pd.DataFrame:
-    """Все строки витрины СО/ВР."""
+    """Все строки витрины СО/ВР (+ дисциплина/раздел из documents)."""
     return load_sovr_table()
 
 
 @versioned_cache(600)
+def _load_sovr_template() -> pd.DataFrame:
+    """Перечень СВОК: одна строка = комплект (kit_code, признак ВОР)."""
+    return load_sovr_template()
+
+
+@versioned_cache(600)
+def _load_sovr_template_meta() -> dict:
+    """Количество комплектов перечня и время последней загрузки."""
+    return sovr_template_meta()
+
+
+@versioned_cache(600)
 def _load_sheets_sovr_template_count() -> int:
-    """Количество строк в таблице-каркасе sheets_sovr_template."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM sheets_sovr_template"
-        ).fetchone()
-    return row["cnt"] if row else 0
+    """Количество комплектов в перечне (совместимость с 22.22)."""
+    return int(_load_sovr_template_meta().get("count", 0))
 
 
 # ---------------------------------------------------------------------------
-#  Утилиты
+#  Утилиты форматирования
 # ---------------------------------------------------------------------------
 def _fmt_date(v) -> str:
-    """Формат даты ДД.ММ.ГГГГ."""
-    if v is None or str(v).strip() == "":
+    """Дата → ДД.ММ.ГГГГ. Пусто → «—» (как на других вкладках).
+
+    Патч 22.24 (B3): ISO-строка, datetime, date и null поддерживаются;
+    непарсируемое значение → пустая строка (без «None»).
+    """
+    if v is None:
+        return "—"
+    if isinstance(v, datetime):
+        return v.strftime("%d.%m.%Y")
+    if isinstance(v, date):
+        return v.strftime("%d.%m.%Y")
+    s = str(v).strip()
+    if not s or s.lower() in ("none", "nan", "nat", "—"):
         return "—"
     try:
-        dt = datetime.fromisoformat(str(v)[:10])
-        return dt.strftime("%d.%m.%Y")
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%d.%m.%Y")
     except (ValueError, TypeError):
-        return str(v)
+        pass
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (ValueError, TypeError):
+        return ""
+
+
+def _fmt_workflow(v) -> str:
+    """№ процесса → строка. null/None/NaN → «» (никогда «None»)."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s or s.lower() in ("none", "nan", "nat", "<na>"):
+        return ""
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return s
 
 
 def _fmt_num(n) -> str:
@@ -97,11 +168,16 @@ def _classify_status(status: str) -> str:
     return "Другие статусы"
 
 
+def _is_not_loaded(status) -> bool:
+    return str(status or "").strip() == STATUS_NOT_LOADED
+
+
 # ---------------------------------------------------------------------------
 #  Фильтры
 # ---------------------------------------------------------------------------
 def _render_filters() -> dict:
-    """Фильтры вкладки СО и ВОР: стандартные + статус + период."""
+    """Фильтры вкладки: стандартные (дисциплина/раздел/комплект/марка) +
+    статус листа + период по дате выдачи."""
     from vitro.ui._filters import render_standard_filters
 
     def _extra_row():
@@ -147,64 +223,123 @@ def _render_filters() -> dict:
     )
 
     return {
+        "disc": std["disc"],
+        "section": std["section"],
         "kits": std["kits"],
         "block_codes": std["block_codes"],
+        "marka": std["marka"],
         "status": std["extra"].get("status", ()),
         "date_from": std["extra"].get("date_from"),
         "date_to": std["extra"].get("date_to"),
     }
 
 
-def _apply_filters(df: pd.DataFrame, flt: dict) -> pd.DataFrame:
-    """Применяет фильтры к DataFrame витрины."""
-    if df.empty:
+def _extract_4th_block(code) -> str:
+    if not code:
+        return ""
+    parts = str(code).split("-")
+    return parts[3].strip().upper() if len(parts) >= 4 else ""
+
+
+def _filter_by_marka(df: pd.DataFrame, marka: str) -> pd.DataFrame:
+    """Строгий фильтр по марке (3-й блок шифра) — общий хелпер проекта."""
+    if not marka:
         return df
+    from vitro.ui._filters import _filter_by_marka as _fbm
+    return _fbm(df, marka)
+
+
+def _apply_filters(df: pd.DataFrame, flt: dict,
+                   apply_period: bool = True) -> pd.DataFrame:
+    """Применяет фильтры к DataFrame витрины.
+
+    A1: дисциплина/раздел/комплект/расположение/марка/статус режут выборку
+    одинаково и для бубликов, и для таблицы; период (send_date) —
+    единственный фильтр, от которого бублики статусов не зависят
+    (вызываются с apply_period=False).
+
+    «Не загружен» — не статус витрины: реальные строки по нему пустые,
+    синтетические строки добавляет _build_sovr_table по перечню СВОК.
+    """
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
 
     out = df.copy()
 
-    # Комплект (complex)
-    kits = flt.get("kits", ())
+    disc = tuple(flt.get("disc") or ())
+    if disc and "discipline" in out.columns:
+        out = out[out["discipline"].isin(disc)]
+
+    section = tuple(flt.get("section") or ())
+    if section and "section" in out.columns:
+        out = out[out["section"].isin(section)]
+
+    kits = tuple(flt.get("kits") or ())
     if kits:
         out = out[out["complex"].isin(kits)]
 
-    # Расположение (4-й блок complex)
-    block_codes = flt.get("block_codes", ())
+    block_codes = tuple(flt.get("block_codes") or ())
     if block_codes:
-        def _get_4th_block(val):
-            if not val:
-                return ""
-            parts = str(val).split("-")
-            return parts[3].strip().upper() if len(parts) >= 4 else ""
-        out = out[out["complex"].apply(_get_4th_block).isin(block_codes)]
+        out = out[out["complex"].apply(_extract_4th_block).isin(block_codes)]
 
-    # Статус листа
-    if flt["status"]:
-        statuses = flt["status"]
-        if "Не загружен" in statuses:
-            # "Не загружен" — это когда нет записи в витрине
-            # В контексте витрины это пустая выборка (пока нет перечня)
-            # Остальные статусы — обычные
-            other_statuses = [s for s in statuses if s != "Не загружен"]
-            if not other_statuses:
-                return pd.DataFrame(columns=out.columns)
-            out = out[out["status"].isin(other_statuses)]
-        else:
-            out = out[out["status"].isin(statuses)]
+    out = _filter_by_marka(out, flt.get("marka") or "")
 
-    # Период по send_date
-    date_from = flt.get("date_from")
-    date_to = flt.get("date_to")
-    if date_from or date_to:
-        # Исключаем пустые send_date
-        mask = out["send_date"].notna() & (out["send_date"].astype(str).str.strip() != "")
-        out = out[mask]
-        if not out.empty:
-            iso = out["send_date"].astype(str).str.slice(0, 10)
-            if date_from:
-                out = out.loc[iso >= date_from.isoformat()]
-            if date_to:
-                out = out.loc[iso <= date_to.isoformat()]
+    statuses = tuple(flt.get("status") or ())
+    if statuses:
+        real_statuses = [s for s in statuses if s != STATUS_NOT_LOADED]
+        if not real_statuses:
+            # только «Не загружен» — реальных строк нет
+            return out.iloc[0:0]
+        out = out[out["status"].isin(real_statuses)]
 
+    if apply_period:
+        date_from = flt.get("date_from")
+        date_to = flt.get("date_to")
+        if date_from or date_to:
+            mask = (out["send_date"].notna()
+                    & (out["send_date"].astype(str).str.strip() != ""))
+            out = out[mask]
+            if not out.empty:
+                iso = out["send_date"].astype(str).str.slice(0, 10)
+                if date_from:
+                    out = out.loc[iso >= date_from.isoformat()]
+                if date_to:
+                    out = out.loc[iso <= date_to.isoformat()]
+
+    return out
+
+
+def _filter_template(template_df: pd.DataFrame, flt: dict) -> pd.DataFrame:
+    """Перечень СВОК под те же фильтры, что и витрина (без статуса/периода).
+
+    Синтетические строки «Не загружен» не имеют send_date/статуса,
+    поэтому при заданном периоде они не показываются (правило пустых дат).
+    """
+    if template_df is None or template_df.empty:
+        return template_df if template_df is not None else pd.DataFrame()
+    if flt.get("date_from") or flt.get("date_to"):
+        return template_df.iloc[0:0]
+
+    out = template_df.copy()
+
+    disc = tuple(flt.get("disc") or ())
+    if disc and "discipline" in out.columns:
+        out = out[out["discipline"].isin(disc)]
+    section = tuple(flt.get("section") or ())
+    if section and "section" in out.columns:
+        out = out[out["section"].isin(section)]
+    kits = tuple(flt.get("kits") or ())
+    if kits:
+        out = out[out["kit_code"].isin(kits)]
+    block_codes = tuple(flt.get("block_codes") or ())
+    if block_codes:
+        out = out[out["kit_code"].apply(_extract_4th_block).isin(block_codes)]
+
+    marka = flt.get("marka") or ""
+    if marka and not out.empty:
+        tmp = out.rename(columns={"kit_code": "complex"})
+        keep = _filter_by_marka(tmp, marka).index
+        out = out.loc[out.index.intersection(keep)]
     return out
 
 
@@ -215,34 +350,30 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
            key: str, center_total: str,
            color_map: dict | None = None) -> None:
     """Бублик в стиле Сводки: без легенды, проценты внутри."""
-    # Защита от пустых данных и NaN
-    if fig_data.empty:
+    if fig_data is None or fig_data.empty:
         st.caption("Нет данных для диаграммы.")
         return
-    # Проверка что колонки существуют
     if names_col not in fig_data.columns or values_col not in fig_data.columns:
         st.caption("Нет данных для диаграммы.")
         return
-    # Приводим names_col к str, убираем NaN
     fig_data = fig_data.copy()
     fig_data[names_col] = fig_data[names_col].astype(str).replace("nan", "")
     fig_data = fig_data[fig_data[names_col] != ""]
     if fig_data.empty or int(fig_data[values_col].sum()) == 0:
         st.caption("Нет данных для диаграммы.")
         return
-    # Фильтруем color_map только по ключам, присутствующим в данных
     if color_map:
-        present_keys = set(fig_data[names_col].unique())
-        filtered_map = {k: v for k, v in color_map.items() if k in present_keys}
+        present = set(fig_data[names_col].unique())
+        color_map = {k: v for k, v in color_map.items() if k in present}
     else:
-        filtered_map = {}
+        color_map = {}
     fig = px.pie(
         fig_data,
         names=names_col,
         values=values_col,
         hole=0.45,
         color=names_col,
-        color_discrete_map=filtered_map,
+        color_discrete_map=color_map,
     )
     fig.update_traces(
         textposition="inside",
@@ -263,151 +394,286 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
     st.plotly_chart(fig, width='stretch', key=key)
 
 
-def _render_sovr_donuts(df: pd.DataFrame) -> None:
-    """Бублики для СО и ВР — всегда оба блока."""
-    for label, sn in [("СО", "СО"), ("ВР", "ВР")]:
+def _status_donut_data(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """Счётчики статусов A/B/C/Другие для листов одного вида (СО/ВР).
 
-        st.markdown(f"##### 🍩 {label}")
+    Все четыре категории остаются в данных (даже с нулём) — легенда
+    показывает полный набор статусов.
+    """
+    if df is None or df.empty or "sheet_number" not in df.columns:
+        return pd.DataFrame(columns=["Группа", "Количество"])
+    sub = df[df["sheet_number"] == kind]
+    counts = {label: 0 for label in SHEET_STATUS_ORDER}
+    for s in sub.get("status", pd.Series(dtype=object)):
+        counts[_classify_status(s)] += 1
+    return pd.DataFrame(
+        [{"Группа": label, "Количество": counts[label]}
+         for label in SHEET_STATUS_ORDER])
 
-        # --- Бублик «Статусы» ---
-        status_counts = df[df["sheet_number"] == sn].copy()
-        if not status_counts.empty:
-            status_counts["_status_bucket"] = status_counts["status"].apply(
-                lambda s: _classify_status(s) if pd.notna(s) else "—"
-            )
-            status_data = (
-                status_counts.groupby("_status_bucket")
-                .size()
-                .reset_index(name="Количество")
-            )
-            # Переименуем колонку для единообразия
-            status_data.columns = ["Группа", "Количество"]
+
+def _plan_donut_counts(template_df: pd.DataFrame,
+                       loaded_df: pd.DataFrame, kind: str) -> dict:
+    """Числа для бублика «Загружено / План» (C2).
+
+    План СО — все комплекты перечня; план ВОР — комплекты перечня без
+    «Не выдается» в колонке T (N «Наличие ВОР» игнорируется).
+    «Загружено» — комплекты с записью листа этого вида в витрине.
+    Бублик рисуется в границах плана: loaded_in_plan + remaining = plan;
+    загруженные сверх перечня показываются в подписи (extra).
+
+    Возвращает {"has_template", "plan", "loaded_total", "loaded_in_plan",
+    "remaining", "extra"}.
+    """
+    result = {
+        "has_template": False, "plan": 0, "loaded_total": 0,
+        "loaded_in_plan": 0, "remaining": 0, "extra": 0,
+    }
+
+    loaded_set: set = set()
+    if loaded_df is not None and not loaded_df.empty \
+            and "sheet_number" in loaded_df.columns:
+        loaded_set = set(
+            loaded_df.loc[loaded_df["sheet_number"] == kind, "complex"]
+            .dropna().astype(str))
+
+    result["loaded_total"] = len(loaded_set)
+
+    if template_df is None or template_df.empty:
+        return result
+
+    result["has_template"] = True
+    plan_df = template_df
+    if kind == KIND_VR:
+        if "vor_not_issued" in template_df.columns:
+            not_issued = pd.to_numeric(
+                template_df["vor_not_issued"], errors="coerce").fillna(0)
         else:
-            status_data = pd.DataFrame(columns=["Группа", "Количество"])
+            not_issued = pd.Series(0, index=template_df.index)
+        plan_df = template_df[not_issued.astype(int) == 0]
 
-        total_status = int(status_data["Количество"].sum()) if not status_data.empty else 0
-        status_data = status_data[status_data["Количество"] > 0]
+    plan_set = set(plan_df["kit_code"].dropna().astype(str))
+    all_template = set(template_df["kit_code"].dropna().astype(str))
+    result["plan"] = len(plan_set)
+    result["loaded_in_plan"] = len(loaded_set & plan_set)
+    result["remaining"] = len(plan_set - loaded_set)
+    # «сверх перечня» — загружено то, чего нет в перечне вовсе;
+    # комплекты с «Не выдается» из плана ВОР исключены правилом, а не
+    # «сверх перечня».
+    result["extra"] = len(loaded_set - all_template)
+    return result
 
-        st.markdown("###### Статусы")
-        if status_data.empty:
-            st.caption("Нет данных для диаграммы.")
-        else:
-            _donut(status_data, "Группа", "Количество",
-                   f"sovr_donut_{label.lower()}_status",
-                   center_total=_fmt_num(total_status),
-                   color_map=SHEET_STATUS_COLORS)
 
-        # --- Бублик «Загружено / План» ---
-        st.markdown("###### Загружено / План")
-        loaded_count = total_status  # в витрине = загружено
+def _render_sovr_donuts(df_status: pd.DataFrame,
+                        template_df: pd.DataFrame | None = None,
+                        loaded_df: pd.DataFrame | None = None) -> None:
+    """Бублики СО и ВОРО: «Статусы» и «Загружено / План» рядом (A5).
 
-        template_count = _load_sheets_sovr_template_count()
+    df_status — витрина под всеми фильтрами, КРОМЕ периода (A1).
+    loaded_df — вся витрина (для плана бублика, C2: план от фильтров
+    не зависит).
+    """
+    if loaded_df is None:
+        loaded_df = df_status
 
-        if template_count == 0 and loaded_count > 0:
-            # Перечень не загружен — показываем только фактическое «Загружено»
-            st.caption(
-                f"📦 Перечень не загружен — план не рассчитывается. "
-                f"Загружено: **{loaded_count}** лист(ов)."
-            )
-            loaded_data = pd.DataFrame([{
-                "Группа": "Загружено",
-                "Количество": loaded_count,
-            }])
-            _donut(loaded_data, "Группа", "Количество",
-                   f"sovr_donut_{label.lower()}_loaded",
-                   center_total=_fmt_num(loaded_count),
-                   color_map=SHEET_STATUS_COLORS_LOADED)
-        elif template_count == 0:
-            st.caption("Перечень не загружен — нет данных.")
-        else:
-            # Перечень загружен — считаем план
-            plan_count = template_count
-            st.markdown(
-                f"Загружено: **{loaded_count}** · "
-                f"План: **{plan_count}**"
-            )
-            loaded_data = pd.DataFrame([
-                {"Группа": "Загружено", "Количество": loaded_count},
-                {"Группа": "План к загрузке", "Количество": plan_count},
+    for kind in (KIND_SO, KIND_VR):
+        st.markdown(f"##### {KIND_TITLES[kind]}")
+        left, right = st.columns(2)
+
+        # --- Статусы (A4: общий компонент легенды проекта) ---
+        with left:
+            st.markdown("###### Статусы")
+            status_data = _status_donut_data(df_status, kind)
+            total_status = int(status_data["Количество"].sum()) \
+                if not status_data.empty else 0
+            if status_data.empty or total_status == 0:
+                st.caption("Нет данных для диаграммы.")
+            else:
+                from vitro.ui.deadlines import _pie_with_legend
+                _pie_with_legend(
+                    status_data, "Группа", "Количество",
+                    colors=SHEET_STATUS_COLORS,
+                    key=f"sovr_pie_{kind.lower()}_status",
+                    order=SHEET_STATUS_ORDER,
+                )
+
+        # --- Загружено / План (C2) ---
+        with right:
+            st.markdown("###### Загружено / План")
+            counts = _plan_donut_counts(template_df, loaded_df, kind)
+
+            if not counts["has_template"]:
+                st.caption(
+                    "Перечень не загружен — план не рассчитывается. "
+                    "Загрузите перечень на подвкладке «Сервисная»."
+                )
+                loaded_data = pd.DataFrame([{
+                    "Группа": "Загружено",
+                    "Количество": counts["loaded_total"],
+                }])
+                _donut(loaded_data, "Группа", "Количество",
+                       f"sovr_donut_{kind.lower()}_plan",
+                       center_total=_fmt_num(counts["loaded_total"]),
+                       color_map=SHEET_STATUS_COLORS_LOADED)
+                continue
+
+            plan_data = pd.DataFrame([
+                {"Группа": "Загружено",
+                 "Количество": counts["loaded_in_plan"]},
+                {"Группа": "План к загрузке",
+                 "Количество": counts["remaining"]},
             ])
-            loaded_data = loaded_data[loaded_data["Количество"] > 0]
-            _donut(loaded_data, "Группа", "Количество",
-                   f"sovr_donut_{label.lower()}_loaded",
-                   center_total=_fmt_num(loaded_count + plan_count),
-                   color_map={
-                       "Загружено": SHEET_STATUS_COLORS_LOADED["Загружено"],
-                       "План к загрузке": "#9467bd",
-                   })
+            plan_data = plan_data[plan_data["Количество"] > 0]
+            caption = (f"План: **{_fmt_num(counts['plan'])}** · "
+                       f"Загружено: **{_fmt_num(counts['loaded_total'])}**")
+            if counts["extra"]:
+                caption += f" · сверх перечня: **{counts['extra']}**"
+            st.caption(caption)
+            _donut(plan_data, "Группа", "Количество",
+                   f"sovr_donut_{kind.lower()}_plan",
+                   center_total=_fmt_num(counts["plan"]),
+                   color_map=PLAN_COLORS)
 
 
 # ---------------------------------------------------------------------------
 #  Сводная таблица
 # ---------------------------------------------------------------------------
-def _build_sovr_table(df: pd.DataFrame, flt: dict) -> pd.DataFrame:
-    """Сборка сводной таблицы: строка = лист."""
-    if df.empty:
-        return pd.DataFrame()
+_TABLE_COLUMNS = [
+    "complex", "sheet_number", "name", "revision", "status",
+    "send_date", "status_date", "workflow_id", "doc_id",
+]
 
-    out = df.copy()
 
-    # Группируем по (complex, sheet_number) — берём первую строку (уже дедуп)
-    groups = out.groupby(["complex", "sheet_number"])
+def _build_sovr_table(df: pd.DataFrame, flt: dict,
+                      template_df: pd.DataFrame | None = None,
+                      base_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Сборка сводной таблицы: строка = лист + строки «Не загружен» (C3).
 
-    rows = []
-    for (complex_code, sheet_no), group in groups:
-        row = group.iloc[0]
-        rows.append({
-            "complex": complex_code,
-            "sheet_number": sheet_no,
-            "status": row["status"],
-            "send_date": row["send_date"],
-            "status_date": row["status_date"],
-            "workflow_id": row["workflow_id"],
-            "revision": row["revision"],
-            "name": row["name"],
-            "doc_id": row["doc_id"],
-        })
+    df        — реальные строки витрины (уже отфильтрованы статусом/периодом);
+    base_df   — витрина без статуса/периода (для определения «загружен ли
+                комплект»); по умолчанию = df;
+    template  — перечень СВОК; комплекты из него без записи в витрине
+                дают строку со статусом «Не загружен» (для ВОР — кроме
+                признака «Не выдается», C2).
+
+    Синтетические строки добавляются, если фильтр статуса не задан или
+    среди выбранных есть «Не загружен» (C4); при заданном периоде они
+    исключаются (пустая дата выдачи).
+    """
+    if base_df is None:
+        base_df = df
+
+    rows: list[dict] = []
+
+    if df is not None and not df.empty:
+        groups = df.groupby(["complex", "sheet_number"], dropna=False)
+        for (complex_code, sheet_no), group in groups:
+            row = group.iloc[0]
+            rows.append({
+                "complex": complex_code,
+                "sheet_number": sheet_no,
+                "status": row.get("status"),
+                "send_date": row.get("send_date"),
+                "status_date": row.get("status_date"),
+                "workflow_id": row.get("workflow_id"),
+                "revision": row.get("revision"),
+                "name": row.get("name"),
+                "doc_id": row.get("doc_id"),
+                "discipline": row.get("discipline"),
+                "section": row.get("section"),
+            })
+
+    statuses = tuple(flt.get("status") or ())
+    want_not_loaded = (not statuses) or (STATUS_NOT_LOADED in statuses)
+    template_filtered = _filter_template(template_df, flt) \
+        if template_df is not None else pd.DataFrame()
+
+    if want_not_loaded and not template_filtered.empty:
+        loaded_by_kind = {}
+        for kind in (KIND_SO, KIND_VR):
+            if base_df is not None and not base_df.empty:
+                loaded_by_kind[kind] = set(
+                    base_df.loc[base_df["sheet_number"] == kind, "complex"]
+                    .dropna().astype(str))
+            else:
+                loaded_by_kind[kind] = set()
+
+        for kind in (KIND_SO, KIND_VR):
+            if kind == KIND_VR:
+                if "vor_not_issued" in template_filtered.columns:
+                    not_issued = pd.to_numeric(
+                        template_filtered["vor_not_issued"],
+                        errors="coerce").fillna(0)
+                else:
+                    not_issued = pd.Series(0, index=template_filtered.index)
+                tdf = template_filtered[not_issued.astype(int) == 0]
+            else:
+                tdf = template_filtered
+
+            for _, t in tdf.iterrows():
+                code = str(t.get("kit_code") or "")
+                if not code or code in loaded_by_kind[kind]:
+                    continue
+                rows.append({
+                    "complex": code,
+                    "sheet_number": kind,
+                    "status": STATUS_NOT_LOADED,
+                    "send_date": None,
+                    "status_date": None,
+                    "workflow_id": None,
+                    "revision": None,
+                    "name": t.get("title") or "",
+                    "doc_id": None,
+                    "discipline": t.get("discipline"),
+                    "section": t.get("section"),
+                })
+
+    if not rows:
+        return pd.DataFrame(columns=_TABLE_COLUMNS + ["discipline", "section"])
 
     result = pd.DataFrame(rows)
+    for col in _TABLE_COLUMNS + ["discipline", "section"]:
+        if col not in result.columns:
+            result[col] = None
 
-    # Сортировка
-    result = result.sort_values(["complex", "sheet_number"]).reset_index(drop=True)
-    return result
+    order = {KIND_SO: 0, KIND_VR: 1}
+    result["_ord"] = result["sheet_number"].map(order).fillna(9)
+    result = result.sort_values(
+        ["complex", "_ord", "sheet_number"]).drop(columns="_ord")
+    return result.reset_index(drop=True)
 
 
-def _render_sovr_table(df: pd.DataFrame, flt: dict) -> None:
-    """Отображение сводной таблицы."""
-    table = _build_sovr_table(df, flt)
+def _render_sovr_table(df: pd.DataFrame, flt: dict,
+                       template_df: pd.DataFrame | None = None,
+                       base_df: pd.DataFrame | None = None) -> None:
+    """Отображение сводной таблицы: два блока с развёрнутыми названиями."""
+    table = _build_sovr_table(df, flt, template_df, base_df)
 
     if table.empty:
-        st.info(
-            "Нет данных по выбранным фильтрам. "
-            "Если выбран «Не загружен» — таблица пустая (перечень не загружен)."
-        )
+        st.info("Нет данных по выбранным фильтрам.")
         return
 
-    # Разделяем на СО и ВР
-    so_df = table[table["sheet_number"] == "СО"]
-    vr_df = table[table["sheet_number"] == "ВР"]
-
-    # --- Таблица СО ---
-    if not so_df.empty:
-        st.markdown("###### 📑 СО")
-        so_display = so_df[["complex", "sheet_number", "name", "revision",
-                            "status", "send_date", "status_date", "workflow_id"]].copy()
-        so_display.columns = [
+    for kind in (KIND_SO, KIND_VR):
+        sub = table[table["sheet_number"] == kind]
+        if sub.empty:
+            continue
+        st.markdown(f"##### {KIND_TITLES[kind]}")
+        display = sub[["complex", "sheet_number", "name", "revision",
+                       "status", "send_date", "status_date",
+                       "workflow_id"]].copy()
+        display.columns = [
             "Комплект", "Номер листа", "Наименование", "Ревизия",
             "Статус", "Дата выдачи", "Дата получения статуса", "№ процесса",
         ]
-        # Форматируем даты
-        so_display["Дата выдачи"] = so_display["Дата выдачи"].apply(_fmt_date)
-        so_display["Дата получения статуса"] = so_display["Дата получения статуса"].apply(_fmt_date)
+        display["Дата выдачи"] = display["Дата выдачи"].apply(_fmt_date)
+        display["Дата получения статуса"] = display[
+            "Дата получения статуса"].apply(_fmt_date)
+        display["№ процесса"] = display["№ процесса"].apply(_fmt_workflow)
 
         st.dataframe(
-            so_display,
+            display,
             width='stretch',
             hide_index=True,
-            height=min(max(len(so_display) * 36 + 40, 200), 600),
+            height=min(max(len(display) * 36 + 40, 200), 600),
             column_config={
                 "Комплект": st.column_config.TextColumn(width="medium"),
                 "Номер листа": st.column_config.TextColumn(width="small"),
@@ -420,42 +686,14 @@ def _render_sovr_table(df: pd.DataFrame, flt: dict) -> None:
             },
         )
 
-    # --- Таблица ВР ---
-    if not vr_df.empty:
-        st.markdown("###### 📑 ВР")
-        vr_display = vr_df[["complex", "sheet_number", "name", "revision",
-                            "status", "send_date", "status_date", "workflow_id"]].copy()
-        vr_display.columns = [
-            "Комплект", "Номер листа", "Наименование", "Ревизия",
-            "Статус", "Дата выдачи", "Дата получения статуса", "№ процесса",
-        ]
-        vr_display["Дата выдачи"] = vr_display["Дата выдачи"].apply(_fmt_date)
-        vr_display["Дата получения статуса"] = vr_display["Дата получения статуса"].apply(_fmt_date)
-
-        st.dataframe(
-            vr_display,
-            width='stretch',
-            hide_index=True,
-            height=min(max(len(vr_display) * 36 + 40, 200), 600),
-            column_config={
-                "Комплект": st.column_config.TextColumn(width="medium"),
-                "Номер листа": st.column_config.TextColumn(width="small"),
-                "Наименование": st.column_config.TextColumn(width="large"),
-                "Ревизия": st.column_config.TextColumn(width="small"),
-                "Статус": st.column_config.TextColumn(width="small"),
-                "Дата выдачи": st.column_config.TextColumn(width="small"),
-                "Дата получения статуса": st.column_config.TextColumn(width="small"),
-                "№ процесса": st.column_config.TextColumn(width="small"),
-            },
-        )
-
-    # Итого
-    total = len(table)
-    so_count = len(so_df)
-    vr_count = len(vr_df)
-    st.caption(
-        f"Листов всего: **{total}** · СО: **{so_count}** · ВР: **{vr_count}**"
-    )
+    so_count = int((table["sheet_number"] == KIND_SO).sum())
+    vr_count = int((table["sheet_number"] == KIND_VR).sum())
+    not_loaded = int((table["status"] == STATUS_NOT_LOADED).sum())
+    caption = (f"Листов всего: **{len(table)}** · СО: **{so_count}** · "
+               f"ВОР: **{vr_count}**")
+    if not_loaded:
+        caption += f" · «Не загружен»: **{not_loaded}**"
+    st.caption(caption)
 
 
 # ---------------------------------------------------------------------------
@@ -467,76 +705,64 @@ _THIN = Side(style="thin", color="B0B0B0")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 _WRAP = Alignment(wrap_text=True, vertical="top")
 
+_EXPORT_HEADERS = ["Комплект", "Номер листа", "Наименование", "Ревизия",
+                   "Статус", "Дата выдачи", "Дата получения статуса",
+                   "№ процесса"]
+_EXPORT_KEYS = ["complex", "sheet_number", "name", "revision", "status",
+                "send_date", "status_date", "workflow_id"]
 
-def _export_sovr_excel(df: pd.DataFrame, flt: dict) -> bytes:
-    """Сводная таблица СО/ВР → Excel с форматированием."""
+
+def _write_sovr_sheet(ws, kind: str, sub: pd.DataFrame) -> None:
+    """Лист одного вида: развёрнутое название + шапка + данные."""
+    ncols = len(_EXPORT_HEADERS)
+
+    # Строка 1 — развёрнутое название блока (A3)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    title_cell = ws.cell(row=1, column=1, value=KIND_TITLES[kind])
+    title_cell.font = Font(bold=True, size=12, color="1F4E78")
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    # Строка 2 — шапка колонок
+    for j, h in enumerate(_EXPORT_HEADERS, start=1):
+        cell = ws.cell(row=2, column=j, value=h)
+        cell.fill = _HEADER_FILL
+        cell.font = _HEADER_FONT
+        cell.border = _BORDER
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+
+    for i, (_, row) in enumerate(sub.iterrows(), start=3):
+        for j, (key, header) in enumerate(zip(_EXPORT_KEYS, _EXPORT_HEADERS),
+                                          start=1):
+            val = row.get(key)
+            if key in ("send_date", "status_date"):
+                val = _fmt_date(val)
+            elif key == "workflow_id":
+                val = _fmt_workflow(val)
+            cell = ws.cell(row=i, column=j, value=val)
+            cell.border = _BORDER
+            cell.alignment = _WRAP
+
+    for j in range(1, ncols + 1):
+        ws.column_dimensions[get_column_letter(j)].width = 20
+
+    ws.freeze_panes = "A3"
+    if ws.max_row >= 3:
+        ws.auto_filter.ref = f"A2:{get_column_letter(ncols)}{ws.max_row}"
+
+
+def _export_sovr_excel(df: pd.DataFrame, flt: dict | None = None) -> bytes:
+    """Сводная таблица СО/ВОР → Excel (листы «СО» и «ВОР»)."""
     from openpyxl import Workbook
 
     wb = Workbook()
-
-    # Лист СО
-    ws_so = wb.active
-    ws_so.title = "СО"
-    headers_so = ["Комплект", "Номер листа", "Наименование", "Ревизия",
-                  "Статус", "Дата выдачи", "Дата получения статуса", "№ процесса"]
-    for j, h in enumerate(headers_so, start=1):
-        cell = ws_so.cell(row=1, column=j, value=h)
-        cell.fill = _HEADER_FILL
-        cell.font = _HEADER_FONT
-        cell.border = _BORDER
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-
-    so_df = df[df["sheet_number"] == "СО"] if not df.empty else pd.DataFrame()
-    if not so_df.empty:
-        for i, (_, row) in enumerate(so_df.iterrows(), start=2):
-            for j, col_name in enumerate(["complex", "sheet_number", "name",
-                                          "revision", "status", "send_date",
-                                          "status_date", "workflow_id"], start=1):
-                val = row[col_name]
-                cell = ws_so.cell(row=i, column=j, value=val)
-                cell.border = _BORDER
-                cell.alignment = _WRAP
-                # Форматируем даты
-                if col_name in ("send_date", "status_date"):
-                    cell.value = _fmt_date(val)
-
-    # Ширина колонок
-    for j in range(1, len(headers_so) + 1):
-        ws_so.column_dimensions[get_column_letter(j)].width = 20
-
-    ws_so.freeze_panes = "A2"
-    if ws_so.max_row >= 2:
-        ws_so.auto_filter.ref = f"A1:{get_column_letter(len(headers_so))}{ws_so.max_row}"
-
-    # Лист ВР
-    ws_vr = wb.create_sheet(title="ВР")
-    headers_vr = headers_so
-    for j, h in enumerate(headers_vr, start=1):
-        cell = ws_vr.cell(row=1, column=j, value=h)
-        cell.fill = _HEADER_FILL
-        cell.font = _HEADER_FONT
-        cell.border = _BORDER
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-
-    vr_df = df[df["sheet_number"] == "ВР"] if not df.empty else pd.DataFrame()
-    if not vr_df.empty:
-        for i, (_, row) in enumerate(vr_df.iterrows(), start=2):
-            for j, col_name in enumerate(["complex", "sheet_number", "name",
-                                          "revision", "status", "send_date",
-                                          "status_date", "workflow_id"], start=1):
-                val = row[col_name]
-                cell = ws_vr.cell(row=i, column=j, value=val)
-                cell.border = _BORDER
-                cell.alignment = _WRAP
-                if col_name in ("send_date", "status_date"):
-                    cell.value = _fmt_date(val)
-
-    for j in range(1, len(headers_vr) + 1):
-        ws_vr.column_dimensions[get_column_letter(j)].width = 20
-
-    ws_vr.freeze_panes = "A2"
-    if ws_vr.max_row >= 2:
-        ws_vr.auto_filter.ref = f"A1:{get_column_letter(len(headers_vr))}{ws_vr.max_row}"
+    for idx, kind in enumerate((KIND_SO, KIND_VR)):
+        if df is None or df.empty:
+            sub = pd.DataFrame(columns=_EXPORT_KEYS)
+        else:
+            sub = df[df["sheet_number"] == kind]
+        ws = wb.active if idx == 0 else wb.create_sheet()
+        ws.title = KIND_SHORT[kind]
+        _write_sovr_sheet(ws, kind, sub)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -544,7 +770,7 @@ def _export_sovr_excel(df: pd.DataFrame, flt: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-#  Обогащение пользовательского Excel (СВОК)
+#  Обогащение пользовательского Excel (СВОК) — патч 22.23, без изменений
 # ---------------------------------------------------------------------------
 _SOVSo_HEADERS = ["Ревизия СО", "Статус СО", "Дата выдачи СО", "Дата получения статуса СО", "№ процесса СО"]
 _SOVr_HEADERS = ["Ревизия ВР", "Статус ВР", "Дата выдачи ВР", "Дата получения статуса ВР", "№ процесса ВР"]
@@ -755,47 +981,274 @@ def _enrich_svok_excel(
 
 
 # ---------------------------------------------------------------------------
+#  Парсер перечня СВОК (блок C патча 22.24)
+# ---------------------------------------------------------------------------
+def _norm_header(value) -> str:
+    """Нормализация заголовка: нижний регистр, ё→е, схлопнутые пробелы."""
+    s = str(value or "").replace("\xa0", " ").strip().lower().replace("ё", "е")
+    return " ".join(s.split())
+
+
+def _find_svok_sheet(wb) -> str | None:
+    """Лист, в имени которого есть «свок» (регистронезависимо)."""
+    for name in wb.sheetnames:
+        if "свок" in _norm_header(name):
+            return name
+    return None
+
+
+def _find_svok_header(ws) -> int | None:
+    """Строка шапки: в колонке C есть «Шифр РД» (эвристика 22.23).
+
+    Приоритет — «шифр» + «рд» в колонке C; запасной вариант — любая
+    строка с «шифр» в колонке C. Сводный блок сверху (строки 3–8)
+    не считается: там нет «Шифр РД» в C.
+    """
+    limit = min(int(ws.max_row or 1), 80)
+    fallback = None
+    for r in range(1, limit + 1):
+        h = _norm_header(ws.cell(row=r, column=3).value)
+        if not h:
+            continue
+        if "шифр" in h and "рд" in h:
+            return r
+        if fallback is None and "шифр" in h:
+            fallback = r
+    return fallback
+
+
+def _find_col(ws, header_row: int, keywords: tuple) -> int | None:
+    """Первая колонка шапки, в заголовке которой есть любой из keywords."""
+    max_col = int(ws.max_column or 0)
+    for j in range(1, max_col + 1):
+        h = _norm_header(ws.cell(row=header_row, column=j).value)
+        if h and any(k in h for k in keywords):
+            return j
+    return None
+
+
+def _find_vor_status_col(ws, header_row: int) -> int:
+    """Колонка «Текущий статус ВОР»: по заголовку, иначе T (20)."""
+    max_col = int(ws.max_column or 0)
+    for j in range(1, max_col + 1):
+        h = _norm_header(ws.cell(row=header_row, column=j).value)
+        if not h:
+            continue
+        if "вор" in h or ("статус" in h and "вр" in h):
+            return j
+    return 20  # T
+
+
+def _is_not_issued_text(value) -> bool:
+    """«Не выдается» — trim + регистронезависимо (в т.ч. «Не выдаётся»)."""
+    s = str(value or "").strip().lower().replace("ё", "е")
+    return "не выд" in s
+
+
+def _parse_svok_workbook(data: bytes, filename: str = "") -> dict:
+    """Разбирает Excel-перечень СВОК.
+
+    Образец: лист «СВОК», шапка в строке 13 (в колонке C — «Шифр РД»),
+    данные со строки 16 (сводный блок строк 3–8 не трогается — читаем
+    только нужные строки). Возвращает:
+      {"rows": [ {kit_code, title, discipline, section, marka,
+                  vor_status, vor_not_issued} ],
+       "warnings": [...], "sheet": имя листа, "header_row": N}
+
+    Ничего не пишет в БД и не меняет файл.
+    """
+    from openpyxl import load_workbook
+
+    is_xlsm = str(filename).lower().endswith(".xlsm")
+    try:
+        wb = load_workbook(io.BytesIO(data), data_only=True,
+                           keep_vba=is_xlsm)
+    except Exception as e:  # noqa: BLE001
+        return {"rows": [], "warnings": [f"Не удалось открыть файл: {e}"],
+                "sheet": "", "header_row": 0}
+
+    sheet = _find_svok_sheet(wb)
+    if not sheet:
+        return {"rows": [],
+                "warnings": ["Лист «СВОК» не найден в файле."],
+                "sheet": "", "header_row": 0}
+
+    ws = wb[sheet]
+    header_row = _find_svok_header(ws)
+    if not header_row:
+        return {"rows": [],
+                "warnings": ["Не найдена шапка: в колонке C нет «Шифр РД»."],
+                "sheet": sheet, "header_row": 0}
+
+    title_col = _find_col(ws, header_row, ("наименован",))
+    disc_col = _find_col(ws, header_row, ("дисциплин", "группа"))
+    section_col = _find_col(ws, header_row, ("раздел",))
+    marka_col = _find_col(ws, header_row, ("марка",))
+    vor_col = _find_vor_status_col(ws, header_row)
+
+    warnings: list[str] = []
+    missing = [name for name, col in (
+        ("Наименование", title_col), ("Дисциплина", disc_col),
+        ("Раздел", section_col), ("Марка", marka_col)) if col is None]
+    if missing:
+        warnings.append(
+            "Не найдены колонки: " + ", ".join(missing) + " — поля пустые.")
+
+    rows: list[dict] = []
+    seen: set = set()
+    duplicates = 0
+    skipped = 0
+    not_issued_count = 0
+
+    for r in range(header_row + 1, int(ws.max_row or header_row) + 1):
+        raw_code = ws.cell(row=r, column=3).value
+        if raw_code is None or str(raw_code).strip() == "":
+            continue
+        code = normalize_kit_code(str(raw_code))
+        if not code or not looks_like_rd_code(code):
+            skipped += 1
+            continue
+        if code in seen:
+            duplicates += 1
+            continue
+        seen.add(code)
+
+        def _cell(col):
+            if col is None:
+                return ""
+            return ws.cell(row=r, column=col).value
+
+        vor_status = _cell(vor_col)
+        not_issued = _is_not_issued_text(vor_status)
+        if not_issued:
+            not_issued_count += 1
+
+        rows.append({
+            "kit_code": code,
+            "title": str(_cell(title_col) or "").strip(),
+            "discipline": str(_cell(disc_col) or "").strip(),
+            "section": str(_cell(section_col) or "").strip(),
+            "marka": str(_cell(marka_col) or "").strip(),
+            "vor_status": str(vor_status or "").strip(),
+            "vor_not_issued": 1 if not_issued else 0,
+        })
+
+    if duplicates:
+        warnings.append(f"Повторяющихся шифров: {duplicates} (взят первый).")
+    if skipped:
+        warnings.append(f"Строк без РД-шифра пропущено: {skipped}.")
+    if not rows:
+        warnings.append("В перечне не найдено ни одного шифра АТ-РД-*.")
+
+    return {"rows": rows, "warnings": warnings,
+            "sheet": sheet, "header_row": header_row,
+            "not_issued": not_issued_count}
+
+
+# ---------------------------------------------------------------------------
 #  Рендер
 # ---------------------------------------------------------------------------
-def render() -> None:
-    """Основной рендер вкладки СО и ВОР."""
+def _render_main() -> None:
+    """Основная подвкладка: фильтры, бублики, таблица, экспорт."""
     flt = _render_filters()
 
-    # Загрузка данных
-    df = _load_sovr_data()
+    df_all = _load_sovr_data()
+    template_df = _load_sovr_template()
 
-    # Применяем фильтры
-    df_filtered = _apply_filters(df, flt)
+    # A1: бублики статусов — все фильтры, КРОМЕ периода
+    df_no_period = _apply_filters(df_all, flt, apply_period=False)
+    # Таблица — все фильтры, включая период
+    df_table = _apply_filters(df_all, flt, apply_period=True)
+    # Для «Не загружен»: загруженность комплекта без статуса/периода
+    df_base = _apply_filters(
+        df_all, {**flt, "status": (), "date_from": None, "date_to": None},
+        apply_period=False)
 
-    # Бублики (оба блока всегда)
-    _render_sovr_donuts(df_filtered)
+    _render_sovr_donuts(df_no_period, template_df, df_all)
+    _render_sovr_table(df_table, flt, template_df, df_base)
 
-    # Сводная таблица
-    _render_sovr_table(df_filtered, flt)
-
-    # Экспорт
-    if not df_filtered.empty:
-        excel_bytes = _export_sovr_excel(df_filtered, flt)
+    table = _build_sovr_table(df_table, flt, template_df, df_base)
+    if not table.empty:
+        excel_bytes = _export_sovr_excel(table, flt)
         st.download_button(
             "📥 Выгрузить в Excel",
             data=excel_bytes,
-            file_name=f"СО_и_ВР_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            file_name=f"СО_и_ВОР_{datetime.now():%Y%m%d_%H%M}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             width='content',
             key="sovr_export_excel",
-            help="Выгрузка витрины статусов СО/ВР в Excel.",
+            help="Выгрузка витрины статусов СО/ВОР и строк «Не загружен».",
         )
 
 
-def render_service() -> None:
-    """Сервисная подвкладка: обновление статусов СО/ВР из Витро."""
-    st.markdown("### ⚙️ Обновление статусов СО и ВОР из Витро")
-    st.caption(
-        "Загрузка актуальных статусов листов СО/ВР из SharePoint Витро. "
-        "Обновляет витрину documents_sovr."
+def _render_template_upload() -> None:
+    """Загрузка перечня СВОК (C1): полная синхронизация состава."""
+    st.markdown("#### 📋 Перечень СО и ВОР (СВОК)")
+
+    meta = _load_sovr_template_meta()
+    if meta.get("count"):
+        st.caption(
+            f"В перечне комплектов: **{meta['count']}** · обновлён: "
+            f"{meta.get('updated_at') or '—'}")
+    else:
+        st.caption("Перечень ещё не загружен.")
+
+    uploaded = st.file_uploader(
+        "Файл перечня (.xlsx / .xlsm)",
+        type=["xlsx", "xlsm"],
+        key="sovr_svok_file",
+        help="Лист «СВОК», шапка с «Шифр РД» в колонке C, "
+             "признак «Не выдается» — в колонке T.",
     )
 
-    # Блокировка повторного запуска
+    if uploaded is not None:
+        st.caption(f"Выбран файл: **{uploaded.name}**")
+
+    if st.button(
+        "Загрузить перечень СО/ВОР",
+        type="primary",
+        key="sovr_svok_load",
+        disabled=uploaded is None,
+    ):
+        parsed = _parse_svok_workbook(uploaded.getvalue(), uploaded.name)
+        for w in parsed["warnings"]:
+            st.warning(w)
+        if not parsed["rows"]:
+            st.error("Перечень не загружен: не найдено ни одного комплекта.")
+            return
+
+        result = replace_sovr_template(parsed["rows"], source=uploaded.name)
+        # Сброс кэшей витрины/перечня (versioned_cache также ловит
+        # изменение data_version, но точечный сброс даёт мгновенный эффект)
+        _load_sovr_template.clear()
+        _load_sovr_template_meta.clear()
+        _load_sovr_data.clear()
+
+        st.success(
+            f"Перечень загружен: комплектов **{result['kits']}**, "
+            f"из них «Не выдается» (ВОР) — **{result['not_issued']}**. "
+            f"Добавлено: {result['added']}, удалено: {result['removed']}.")
+        st.caption(
+            f"Лист: «{parsed['sheet']}», шапка: строка {parsed['header_row']}.")
+
+
+def render_service() -> None:
+    """Сервисная подвкладка: обновление витрины и загрузка перечня."""
+    st.markdown("### ⚙️ Сервисные операции")
+
+    # --- Перечень СВОК (C1) ---
+    _render_template_upload()
+
+    st.divider()
+
+    # --- Обновление статусов из Витро (22.23) ---
+    st.markdown("#### 🔄 Обновление статусов СО и ВОР из Витро")
+    st.caption(
+        "Загрузка актуальных статусов листов СО/ВР из SharePoint Витро. "
+        "Обновляет витрину documents_sovr; дата выдачи и № процесса "
+        "берутся из той же записи, что и статус."
+    )
+
     if st.session_state.get("sovr_refresh_running", False):
         st.warning("⏳ Обновление уже запущено. Подождите завершения.")
         return
@@ -807,50 +1260,59 @@ def render_service() -> None:
     ):
         st.session_state["sovr_refresh_running"] = True
 
-        import time
-        from vitro.sync import fetch_atp_documents
-        from vitro.sqlite_db import load_sovr_statuses as _load_sovr_statuses
+        from vitro.sharepoint import fetch_atp_documents
+        from vitro.sqlite_db import (
+            load_sovr_statuses as _load_sovr_statuses,
+            upsert_documents,
+        )
 
         progress_bar = st.progress(0, text="Инициализация...")
         status_text = st.empty()
 
         try:
-            # Шаг 1: Загрузка документов из Витро
             progress_bar.progress(20, text="Шаг 1/2: Загрузка документов из Витро...")
             status_text.caption("Подключение к SharePoint Витро...")
             docs = fetch_atp_documents()
             status_text.caption(f"Загружено документов: **{len(docs)}**")
 
-            # Шаг 2: Загрузка статусов СО/ВР
             progress_bar.progress(60, text="Шаг 2/2: Обновление витрины СО/ВР...")
-            status_text.caption("Сохранение статусов в локальную базу...")
+            status_text.caption("Сохранение документов и статусов в локальную базу...")
+            n_saved = upsert_documents(docs)
             inserted = _load_sovr_statuses(user="service_subtab")
             progress_bar.progress(100, text="Готово!")
 
-            # Сводка
-            st.success(f"✅ Витрина обновлена: вставлено **{inserted}** строк СО/ВР.")
+            _load_sovr_data.clear()
+            st.success(
+                f"✅ Витрина обновлена: документов сохранено **{n_saved}**, "
+                f"строк СО/ВР — **{inserted}**.")
 
-            # Время обновления
             with get_conn() as conn:
                 row = conn.execute(
                     "SELECT MAX(updated_at) as max_updated FROM documents_sovr"
                 ).fetchone()
-            updated_at = row["max_updated"] if row and row["max_updated"] else None
+                updated_at = row["max_updated"] if row and row["max_updated"] else None
+                so_count = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM documents_sovr "
+                    "WHERE sheet_number = 'СО'").fetchone()["cnt"]
+                vr_count = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM documents_sovr "
+                    "WHERE sheet_number = 'ВР'").fetchone()["cnt"]
 
             if updated_at:
                 st.caption(f"Последняя запись обновлена: **{updated_at}**")
+            st.caption(f"Листов СО: **{so_count}** · ВОР: **{vr_count}**")
 
-            # Количество листов СО и ВР
-            so_count = conn.execute(
-                "SELECT COUNT(*) as cnt FROM documents_sovr WHERE sheet_number = 'СО'"
-            ).fetchone()["cnt"]
-            vr_count = conn.execute(
-                "SELECT COUNT(*) as cnt FROM documents_sovr WHERE sheet_number = 'ВР'"
-            ).fetchone()["cnt"]
-            st.caption(f"Листов СО: **{so_count}** · ВР: **{vr_count}**")
-
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             st.error(f"❌ Ошибка обновления: {e}")
         finally:
             st.session_state["sovr_refresh_running"] = False
             status_text.empty()
+
+
+def render() -> None:
+    """Вкладка «СО и ВОР»: подвкладки «Основная» и «Сервисная» (A2)."""
+    tab_main, tab_service = st.tabs(["Основная", "Сервисная"])
+    with tab_main:
+        _render_main()
+    with tab_service:
+        render_service()

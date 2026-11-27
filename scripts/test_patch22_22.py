@@ -479,7 +479,8 @@ class TestExportXlsx(unittest.TestCase):
         wb = load_workbook(filename=io.BytesIO(excel_bytes))
         self.assertEqual(len(wb.sheetnames), 2)
         self.assertIn("СО", wb.sheetnames)
-        self.assertIn("ВР", wb.sheetnames)
+        # Патч 22.24: краткая шапка группы для ВОР — «ВОР» (было «ВР»)
+        self.assertIn("ВОР", wb.sheetnames)
 
     def test_export_format_dates(self):
         """Формат дат в экспорте — ДД.ММ.ГГГГ."""
@@ -487,6 +488,127 @@ class TestExportXlsx(unittest.TestCase):
         self.assertEqual(_fmt_date("2026-06-11T06:00:19Z"), "11.06.2026")
         self.assertEqual(_fmt_date(""), "—")
         self.assertEqual(_fmt_date(None), "—")
+
+
+# ===========================================================================
+#  Патч 22.24: дисциплина режет бублики и таблицу (A1)
+# ===========================================================================
+class TestDisciplineFilterPatch2224(unittest.TestCase):
+    """A1: дисциплина/раздел режут выборку одинаково для бубликов и таблицы."""
+
+    def setUp(self):
+        self.df = pd.DataFrame([
+            {"complex": "АТ-РД-ЭО1-С-00", "sheet_number": "СО", "status": "B",
+             "send_date": "2026-11-01", "status_date": "2026-11-02",
+             "workflow_id": 1, "revision": "01", "name": "СО-ЭО1",
+             "doc_id": 1, "discipline": "03_ЭС", "section": "ЭОМ"},
+            {"complex": "АТ-РД-ЭО2-С-00", "sheet_number": "СО", "status": "A",
+             "send_date": "2026-11-01", "status_date": "2026-11-03",
+             "workflow_id": 2, "revision": "01", "name": "СО-ЭО2",
+             "doc_id": 2, "discipline": "03_ЭС", "section": "ЭОМ"},
+            {"complex": "АТ-РД-КЖ1-С-00", "sheet_number": "ВР", "status": "C",
+             "send_date": "2026-11-01", "status_date": "2026-11-04",
+             "workflow_id": 3, "revision": "01", "name": "ВР-КЖ1",
+             "doc_id": 3, "discipline": "02_КР", "section": "КЖ"},
+        ])
+
+    def test_discipline_filters_table(self):
+        from vitro.ui.so_vr import _apply_filters
+        flt = {"disc": ("03_ЭС",), "kits": (), "block_codes": (),
+               "status": (), "date_from": None, "date_to": None}
+        result = _apply_filters(self.df, flt)
+        self.assertEqual(len(result), 2)
+        self.assertTrue((result["discipline"] == "03_ЭС").all())
+
+    def test_discipline_filters_donuts_consistent(self):
+        """Сумма бублика статусов = число отфильтрованных листов."""
+        from vitro.ui.so_vr import _apply_filters, _status_donut_data
+        flt = {"disc": ("02_КР",), "kits": (), "block_codes": (),
+               "status": (), "date_from": None, "date_to": None}
+        filtered = _apply_filters(self.df, flt)
+        data = _status_donut_data(filtered, "ВР")
+        self.assertEqual(int(data["Количество"].sum()), len(filtered))
+        self.assertEqual(len(filtered), 1)
+
+    def test_section_filter(self):
+        from vitro.ui.so_vr import _apply_filters
+        flt = {"section": ("КЖ",), "kits": (), "block_codes": (),
+               "status": (), "date_from": None, "date_to": None}
+        result = _apply_filters(self.df, flt)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["complex"], "АТ-РД-КЖ1-С-00")
+
+
+# ===========================================================================
+#  Патч 22.24: строки «Не загружен» из перечня СВОК (C3/C4)
+# ===========================================================================
+class TestNotLoadedRowsPatch2224(unittest.TestCase):
+    """C3/C4: комплект перечня без записи в Витро → «Не загружен»."""
+
+    def setUp(self):
+        self.df = pd.DataFrame([
+            {"complex": "АТ-РД-ЭО1-С-00", "sheet_number": "СО", "status": "B",
+             "send_date": "2026-11-01", "status_date": "2026-11-02",
+             "workflow_id": 1, "revision": "01", "name": "СО",
+             "doc_id": 1, "discipline": "03_ЭС", "section": "ЭОМ"},
+        ])
+        self.template = pd.DataFrame([
+            {"kit_code": "АТ-РД-ЭО1-С-00", "title": "ЭО1",
+             "discipline": "03_ЭС", "section": "ЭОМ", "marka": "ЭО1",
+             "vor_not_issued": 0},
+            {"kit_code": "АТ-РД-ЭО2-С-00", "title": "ЭО2",
+             "discipline": "03_ЭС", "section": "ЭОМ", "marka": "ЭО2",
+             "vor_not_issued": 0},
+            {"kit_code": "АТ-РД-ЭО3-С-00", "title": "ЭО3",
+             "discipline": "03_ЭС", "section": "ЭОМ", "marka": "ЭО3",
+             "vor_not_issued": 1},
+        ])
+
+    def _flt(self, **kw):
+        base = {"kits": (), "block_codes": (), "status": (),
+                "date_from": None, "date_to": None}
+        base.update(kw)
+        return base
+
+    def test_not_loaded_rows_added(self):
+        from vitro.ui.so_vr import _build_sovr_table
+        table = _build_sovr_table(
+            self.df, self._flt(), self.template, self.df)
+        not_loaded = table[table["status"] == "Не загружен"]
+        # ЭО2 — без записи; ВОР ЭО2 есть в плане (not_issued=0)
+        self.assertIn(("АТ-РД-ЭО2-С-00", "ВР"),
+                      set(zip(not_loaded["complex"], not_loaded["sheet_number"])))
+        # ЭО3 «Не выдается» — строки ВОР-«Не загружен» нет
+        self.assertNotIn(("АТ-РД-ЭО3-С-00", "ВР"),
+                         set(zip(not_loaded["complex"], not_loaded["sheet_number"])))
+        # Загруженный ЭО1 не даёт строки «Не загружен» по СО
+        self.assertNotIn(("АТ-РД-ЭО1-С-00", "СО"),
+                         set(zip(not_loaded["complex"],
+                                 not_loaded["sheet_number"])))
+
+    def test_filter_not_loaded_only(self):
+        from vitro.ui.so_vr import _apply_filters, _build_sovr_table
+        flt = self._flt(status=("Не загружен",))
+        real = _apply_filters(self.df, flt)
+        table = _build_sovr_table(real, flt, self.template, self.df)
+        self.assertFalse(table.empty)
+        self.assertTrue((table["status"] == "Не загружен").all())
+
+    def test_status_a_hides_not_loaded(self):
+        from vitro.ui.so_vr import _apply_filters, _build_sovr_table
+        flt = self._flt(status=("A",))
+        real = _apply_filters(self.df, flt)
+        # реальных строк со статусом A нет — таблица пустая
+        table = _build_sovr_table(real, flt, self.template, self.df)
+        self.assertTrue(table.empty)
+
+    def test_period_hides_not_loaded(self):
+        from datetime import date
+        from vitro.ui.so_vr import _build_sovr_table
+        table = _build_sovr_table(
+            self.df, self._flt(date_from=date(2026, 1, 1)),
+            self.template, self.df)
+        self.assertTrue((table["status"] != "Не загружен").all())
 
 
 # ===========================================================================
