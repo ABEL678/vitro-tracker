@@ -201,6 +201,7 @@ def init_db() -> None:
             discipline      TEXT,              -- дисциплина (группа)
             section         TEXT,              -- раздел
             marka           TEXT,              -- марка комплекта
+            location        TEXT,              -- «Здание, Сооружение, Корпус»
             vor_status      TEXT,              -- сырой текст колонки T
             vor_not_issued  INTEGER DEFAULT 0, -- 1 = «Не выдается»
             source          TEXT,              -- имя файла Excel
@@ -237,6 +238,7 @@ def init_db() -> None:
             ("discipline",     "TEXT"),
             ("section",        "TEXT"),
             ("marka",          "TEXT"),
+            ("location",       "TEXT"),   # 22.24b: «Здание, Сооружение, Корпус»
             ("vor_status",     "TEXT"),
             ("vor_not_issued", "INTEGER DEFAULT 0"),
         ]:
@@ -942,7 +944,7 @@ def load_sovr_table():
 #  Перечень СВОК (патч 22.24, блок C)
 # ---------------------------------------------------------------------------
 _SOVR_TEMPLATE_COLS = (
-    "kit_code", "title", "discipline", "section", "marka",
+    "kit_code", "title", "discipline", "section", "marka", "location",
     "vor_status", "vor_not_issued", "source", "created_at", "updated_at",
 )
 
@@ -971,6 +973,7 @@ def replace_sovr_template(rows: list[dict], source: str = "") -> dict:
             "discipline": r.get("discipline") or "",
             "section": r.get("section") or "",
             "marka": r.get("marka") or "",
+            "location": r.get("location") or "",
             "vor_status": r.get("vor_status") or "",
             "vor_not_issued": 1 if r.get("vor_not_issued") else 0,
             "source": r.get("source") or source or "",
@@ -979,8 +982,8 @@ def replace_sovr_template(rows: list[dict], source: str = "") -> dict:
     with get_conn() as conn:
         existing = {
             r["kit_code"]: (r["created_at"], r["title"], r["discipline"],
-                            r["section"], r["marka"], r["vor_status"],
-                            r["vor_not_issued"])
+                            r["section"], r["marka"],
+                            r["vor_status"], r["vor_not_issued"])
             for r in conn.execute(
                 "SELECT kit_code, created_at, title, discipline, section, "
                 "marka, vor_status, vor_not_issued "
@@ -995,12 +998,13 @@ def replace_sovr_template(rows: list[dict], source: str = "") -> dict:
             conn.execute("""
                 INSERT INTO sheets_sovr_template
                     (kit_code, sheet_no, title, discipline, section, marka,
-                     vor_status, vor_not_issued, source, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     location, vor_status, vor_not_issued,
+                     source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 code, None, row["title"], row["discipline"], row["section"],
-                row["marka"], row["vor_status"], row["vor_not_issued"],
-                row["source"], created_at, now,
+                row["marka"], row["location"], row["vor_status"],
+                row["vor_not_issued"], row["source"], created_at, now,
             ))
 
         not_issued = sum(1 for r in normalized.values()
@@ -1022,7 +1026,7 @@ def load_sovr_template():
 
     with get_conn() as conn:
         df = pd.read_sql(
-            "SELECT kit_code, title, discipline, section, marka, "
+            "SELECT kit_code, title, discipline, section, marka, location, "
             "vor_status, vor_not_issued, source, created_at, updated_at "
             "FROM sheets_sovr_template ORDER BY kit_code", conn)
     if df.empty:

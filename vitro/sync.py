@@ -27,9 +27,59 @@ from vitro.sqlite_db import (
     save_complexes,
     save_history_summary,
     save_history_status,
+    upsert_documents,
+    load_sovr_statuses,
     log_event,
     get_conn,
 )
+
+
+def refresh_sovr_statuses(docs: list[dict] | None = None,
+                          verbose: bool = True,
+                          user: str = "sync") -> dict:
+    """Шаг синка: витрина статусов СО/ВР (патч 22.24b).
+
+    Порядок:
+      1. fetch_atp_documents (только если docs не переданы — в регулярном
+         синке используются уже загруженные документы, без второго fetch);
+      2. upsert_documents — обновляет документы, НЕ удаляя comments
+         (логика 22.24, не дублируется);
+      3. load_sovr_statuses — пересобирает documents_sovr по правилу
+         «последний по процессу»; заодно обновляет updated_at строк,
+         поэтому versioned_cache сбросится по PRAGMA data_version.
+
+    Журнал событий ведёт вызывающая сторона (контракт «одно событие
+    refresh в конце синка»):
+      - регулярный синк складывает результат шага в сообщение события
+        'refresh';
+      - ручная кнопка «Обновить статусы СО и ВОР из Витро» пишет
+        отдельное событие 'sovr_sync' со своей сводкой.
+
+    Ошибка шага (в т.ч. недоступность Витро при самостоятельном fetch)
+    НЕ выбрасывается наружу: остальные сущности синка продолжают работу.
+
+    Возвращает {"ok", "documents", "sheets"} (+ "error" при сбое).
+    """
+    def log(msg):
+        if verbose:
+            try:
+                print(msg)
+            except UnicodeEncodeError:
+                print(msg.encode("ascii", "replace").decode("ascii"))
+
+    try:
+        init_db()
+        if docs is None:
+            log("📑 Загрузка документов для витрины СО/ВР...")
+            docs = fetch_atp_documents(max_items=0)
+        n_docs = upsert_documents(docs)
+        n_sheets = load_sovr_statuses(user=user)
+        log(f"   Витрина СО/ВР: документов {n_docs}, листов {n_sheets}")
+        return {"ok": True, "documents": n_docs, "sheets": n_sheets}
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+        log(f"   ⚠️ Витрина СО/ВР не обновлена: {err}")
+        return {"ok": False, "documents": 0, "sheets": 0, "error": err}
 
 
 def refresh_data(verbose: bool = True) -> dict:
@@ -88,6 +138,27 @@ def refresh_data(verbose: bool = True) -> dict:
     n_complexes = save_complexes(complexes)
     log(f"   Документов: {n_docs}, замечаний: {n_comments}, комплектов: {n_complexes}")
 
+    # 4b. Витрина статусов СО/ВР (патч 22.24b).
+    # Документы уже сохранены save_all; upsert обновляет свежие поля,
+    # load_sovr_statuses пересобирает витрину. Шаг изолирован: его сбой
+    # не прерывает остальные сущности синка. Отдельное событие журнала
+    # здесь НЕ пишется: итог шага складывается в сообщение единственного
+    # события 'refresh' в конце синка (контракт теста 22.9).
+    log("📑 Обновление витрины СО/ВР...")
+    try:
+        sovr = refresh_sovr_statuses(docs=docs, verbose=verbose)
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+        log(f"   ⚠️ Витрина СО/ВР не обновлена: {err}")
+        sovr = {"ok": False, "documents": 0, "sheets": 0, "error": err}
+
+    if sovr.get("ok"):
+        sovr_summary = (f"Витрина СО/ВР: документов {sovr.get('documents', 0)}, "
+                        f"листов {sovr.get('sheets', 0)}")
+    else:
+        sovr_summary = (f"Витрина СО/ВР: ошибка — "
+                        f"{sovr.get('error') or 'неизвестная'}")
+
     # 5. Снимок истории
     log("📈 Построение снимка истории...")
     summary = build_comments_summary(docs, comments)
@@ -97,8 +168,10 @@ def refresh_data(verbose: bool = True) -> dict:
     log(f"   Снимок за {today}: {len(summary)} комплектов")
 
     elapsed = round(time.time() - t0, 1)
-    log_event("refresh", f"Загружено {len(comments)} замечаний", rows=len(comments))
-    log(f"\n✅ Готово за {elapsed} сек")
+    refresh_message = f"Загружено {len(comments)} замечаний; {sovr_summary}"
+    log_event("refresh", refresh_message, rows=len(comments))
+    log(f"\n✅ {refresh_message}")
+    log(f"✅ Готово за {elapsed} сек")
 
     # WAL-checkpoint: сбросить -wal в основной файл, чтобы данные
     # при копировании vitro.db на сервер включали все записи.
@@ -123,6 +196,8 @@ def refresh_data(verbose: bool = True) -> dict:
         "documents": n_docs,
         "comments":  n_comments,
         "complexes": n_complexes,
+        "sovr_sheets": sovr.get("sheets", 0),
+        "sovr_ok": bool(sovr.get("ok")),
         "elapsed":   elapsed,
     }
 

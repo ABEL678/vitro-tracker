@@ -441,7 +441,7 @@ class TestExportXlsx(unittest.TestCase):
     """Выгрузка xlsx: две группы колонок, формат дат."""
 
     def test_export_soa_vr_excel(self):
-        """Экспорт СО+ВР → Excel с двумя листами."""
+        """22.24b: экспорт СО+ВР → одна таблица с группами «СО» и «ВОР»."""
         from vitro.ui.so_vr import _export_sovr_excel
         import io
 
@@ -477,10 +477,15 @@ class TestExportXlsx(unittest.TestCase):
 
         from openpyxl import load_workbook
         wb = load_workbook(filename=io.BytesIO(excel_bytes))
-        self.assertEqual(len(wb.sheetnames), 2)
-        self.assertIn("СО", wb.sheetnames)
-        # Патч 22.24: краткая шапка группы для ВОР — «ВОР» (было «ВР»)
-        self.assertIn("ВОР", wb.sheetnames)
+        # Патч 22.24b: один лист, комплекты, два блока колонок
+        self.assertEqual(wb.sheetnames, ["СО и ВОР"])
+        ws = wb["СО и ВОР"]
+        self.assertEqual(ws.cell(row=2, column=2).value, "СО")
+        self.assertEqual(ws.cell(row=2, column=7).value, "ВОР")
+        codes = {ws.cell(row=r, column=1).value
+                 for r in range(4, ws.max_row + 1)}
+        self.assertIn("АТ-РД-ЭО1-С-00", codes)
+        self.assertIn("АТ-РД-ССЛ-С-00", codes)
 
     def test_export_format_dates(self):
         """Формат дат в экспорте — ДД.ММ.ГГГГ."""
