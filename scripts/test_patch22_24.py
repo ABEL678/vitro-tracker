@@ -823,23 +823,6 @@ class TestSovrSyncStep(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(r["sheets"], 2)
 
-    def test_fetch_failure_logged_not_raised(self):
-        """Ручной путь кнопки: сбой fetch логируется, наружу не бросается."""
-        from vitro.ui.so_vr import _refresh_sovr_manual
-
-        with patch("vitro.sync.fetch_atp_documents",
-                   side_effect=RuntimeError("Витро недоступно")):
-            r = _refresh_sovr_manual()   # не должно бросить
-        self.assertFalse(r["ok"])
-        self.assertIn("Витро недоступно", r["error"])
-        with self.db_mod.get_conn() as conn:
-            row = conn.execute(
-                "SELECT status, message FROM log WHERE event = 'sovr_sync' "
-                "ORDER BY rowid DESC LIMIT 1").fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(row["status"], "ERROR")
-        self.assertIn("Витро недоступно", row["message"])
-
     def test_step_failure_does_not_break_sync(self):
         """Сбой load_sovr_statuses не мешает документам/журналу синка."""
         from vitro.sync import refresh_data

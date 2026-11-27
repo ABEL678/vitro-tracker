@@ -3,7 +3,8 @@
 
 Витрина статусов листов СО/ВР из таблицы documents_sovr.
 Две подвкладки: «Основная» (фильтры, бублики, таблица, экспорт) и
-«Сервисная» (обновление из Витро + загрузка перечня СВОК).
+«Сервисная» (перечень СВОК и добавление статусов СО/ВОР в Excel).
+Статусы витрины обновляются общей синхронизацией («Управление»).
 
 Патч 22.24:
   A1 — бублики статусов зависят от всех фильтров, КРОМЕ периода
@@ -45,7 +46,7 @@ from openpyxl.worksheet.cell_range import CellRange
 from vitro._cache import versioned_cache
 from vitro.sheets import looks_like_rd_code, normalize_kit_code
 from vitro.sqlite_db import (
-    get_conn, load_sovr_table, load_sovr_template,
+    load_sovr_table, load_sovr_template,
     replace_sovr_template, sovr_template_meta,
 )
 
@@ -1577,28 +1578,15 @@ def _render_template_upload() -> None:
     if uploaded is not None:
         st.caption(f"Выбран файл: **{uploaded.name}**")
 
-    # Фикс 27.11.2026: рядом с загрузкой перечня — кнопка добавления
-    # статусов СО и ВОР по тому же файлу (без повторной загрузки).
-    col_load, col_enrich = st.columns([1, 1])
-    with col_load:
-        load_clicked = st.button(
-            "Загрузить перечень СО/ВОР",
-            type="primary",
-            key="sovr_svok_load",
-            disabled=uploaded is None,
-            width='stretch',
-        )
-    with col_enrich:
-        if uploaded is not None:
-            _render_enrich_download(
-                uploaded,
-                key_prefix="sovr_svok_enrich",
-            )
-        else:
-            st.caption(
-                "После выбора файла нажмите кнопку — получите файл "
-                "с добавленными статусами СО и ВОР.")
-
+    # Единственная кнопка добавления статусов — в отдельном блоке
+    # «Добавить статусы СО и ВОР в Excel» ниже (фикс дубля 28.11.2026).
+    load_clicked = st.button(
+        "Загрузить перечень СО/ВОР",
+        type="primary",
+        key="sovr_svok_load",
+        disabled=uploaded is None,
+        width='stretch',
+    )
     if load_clicked:
         parsed = _parse_svok_workbook(uploaded.getvalue(), uploaded.name)
         for w in parsed["warnings"]:
@@ -1862,20 +1850,21 @@ def _render_enrich_download(uploaded, key_prefix: str) -> None:
         st.session_state[name_key] = f"{_file_stem(filename)}_СО_ВОР.xlsx"
         st.session_state.pop(sheets_key, None)
 
-    if st.button(
+    payload = st.session_state.get(payload_key)
+
+    # Пока файл не обработан — одна кнопка запуска. После успешной
+    # обработки показывается только кнопка скачивания: двух одинаковых
+    # кнопок «Добавить статусы СО и ВОР» на экране больше нет.
+    if not payload and st.button(
         "📥 Добавить статусы СО и ВОР",
         width='stretch',
         key=f"{key_prefix}_add",
         help="Файл читается только при нажатии: лист с шифрами РД "
              "определяется в этот момент.",
     ):
-        # Результат по этому же файлу уже собран: повторное нажатие не
-        # запускает тяжёлый проход заново (пересборка — повторный выбор
-        # файла, у него новый file_id).
-        if not st.session_state.get(payload_key):
-            st.session_state.pop(sheets_key, None)
-            st.session_state.pop(f"{key_prefix}_sheet", None)
-            add_statuses(None)
+        st.session_state.pop(sheets_key, None)
+        st.session_state.pop(f"{key_prefix}_sheet", None)
+        add_statuses(None)
 
     sheets = st.session_state.get(sheets_key) or []
     if sheets:
@@ -1895,10 +1884,9 @@ def _render_enrich_download(uploaded, key_prefix: str) -> None:
     if error:
         st.error(error)
 
-    payload = st.session_state.get(payload_key)
     if payload:
         st.download_button(
-            "📥 Добавить статусы СО и ВОР",
+            "📥 Скачать файл со статусами СО и ВОР",
             data=payload,
             file_name=st.session_state.get(name_key)
             or f"{_file_stem(filename)}_СО_ВОР.xlsx",
@@ -1947,39 +1935,9 @@ def _render_enrich_excel() -> None:
         )
 
 
-def _refresh_sovr_manual(user: str = "service_subtab") -> dict:
-    """Ручное обновление витрины СО/ВР (кнопка «Сервисной» подвкладки).
-
-    Единственный путь, который пишет отдельное событие журнала
-    ``sovr_sync``: это самостоятельное действие пользователя, у него
-    должна быть своя запись. Регулярный синк пишет одно событие
-    ``refresh`` в конце и складывает туда же итог шага витрины.
-
-    Возвращает словарь ``refresh_sovr_statuses``:
-    ``{"ok", "documents", "sheets"}`` (+ ``"error"`` при сбое).
-    """
-    from vitro.sqlite_db import log_event
-    from vitro.sync import refresh_sovr_statuses
-
-    result = refresh_sovr_statuses(verbose=False, user=user)
-    if result.get("ok"):
-        log_event(
-            "sovr_sync",
-            f"Витрина СО/ВР: документов {result.get('documents', 0)}, "
-            f"листов {result.get('sheets', 0)}",
-            rows=result.get("sheets", 0),
-        )
-    else:
-        try:
-            log_event("sovr_sync", result.get("error") or "ошибка",
-                      status="ERROR")
-        except Exception:
-            pass
-    return result
-
-
 def render_service() -> None:
-    """Сервисная подвкладка: обновление витрины и загрузка перечня."""
+    """Сервисная подвкладка: перечень СВОК и добавление статусов в Excel.
+    """
     st.markdown("### ⚙️ Сервисные операции")
 
     # --- Перечень СВОК (C1) ---
@@ -1989,70 +1947,6 @@ def render_service() -> None:
 
     # --- Добавление статусов СО/ВОР в пользовательский Excel (22.23) ---
     _render_enrich_excel()
-
-    st.divider()
-
-    # --- Обновление статусов из Витро (22.23) ---
-    st.markdown("#### 🔄 Обновление статусов СО и ВОР из Витро")
-    st.caption(
-        "Загрузка актуальных статусов листов СО/ВР из SharePoint Витро. "
-        "Обновляет витрину documents_sovr; дата выдачи и № процесса "
-        "берутся из той же записи, что и статус."
-    )
-
-    if st.session_state.get("sovr_refresh_running", False):
-        st.warning("⏳ Обновление уже запущено. Подождите завершения.")
-        return
-
-    if st.button(
-        "🔄 Обновить статусы СО и ВОР из Витро",
-        type="primary",
-        key="sovr_refresh_btn",
-    ):
-        st.session_state["sovr_refresh_running"] = True
-
-        progress_bar = st.progress(0, text="Инициализация...")
-        status_text = st.empty()
-
-        try:
-            progress_bar.progress(20, text="Шаг 1/2: Загрузка документов из Витро...")
-            status_text.caption("Подключение к SharePoint Витро...")
-            result = _refresh_sovr_manual()
-
-            if not result.get("ok"):
-                raise RuntimeError(
-                    result.get("error") or "неизвестная ошибка")
-
-            n_saved = result.get("documents", 0)
-            inserted = result.get("sheets", 0)
-            progress_bar.progress(100, text="Готово!")
-
-            _load_sovr_data.clear()
-            st.success(
-                f"✅ Витрина обновлена: документов сохранено **{n_saved}**, "
-                f"строк СО/ВР — **{inserted}**.")
-
-            with get_conn() as conn:
-                row = conn.execute(
-                    "SELECT MAX(updated_at) as max_updated FROM documents_sovr"
-                ).fetchone()
-                updated_at = row["max_updated"] if row and row["max_updated"] else None
-                so_count = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM documents_sovr "
-                    "WHERE sheet_number = 'СО'").fetchone()["cnt"]
-                vr_count = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM documents_sovr "
-                    "WHERE sheet_number = 'ВР'").fetchone()["cnt"]
-
-            if updated_at:
-                st.caption(f"Последняя запись обновлена: **{updated_at}**")
-            st.caption(f"Листов СО: **{so_count}** · ВОР: **{vr_count}**")
-
-        except Exception as e:  # noqa: BLE001
-            st.error(f"❌ Ошибка обновления: {e}")
-        finally:
-            st.session_state["sovr_refresh_running"] = False
-            status_text.empty()
 
 
 def render() -> None:
