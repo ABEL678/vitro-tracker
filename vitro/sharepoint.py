@@ -348,7 +348,8 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
                  "FileLeafRef", "FileDirRef",
                  "VitroBaseStatus", "VitroBaseDocumentRevision",
                  "VitroBaseFullName", "VitroBaseStatusDate",
-                 "VitroBaseDocSheetNumber"],
+                 "VitroBaseDocSheetNumber",
+                 "VitroBaseSendDate", "VitroBaseWorkflowId"],
                 flt=flt, max_items=max_items,
             )
         )
@@ -401,6 +402,8 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             "sheet_number": it.get("VitroBaseDocSheetNumber"),
             "vitro_guid": it.get("UniqueId"),
             "vitro_version": vitro_version,
+            "send_date": it.get("VitroBaseSendDate"),
+            "workflow_id": it.get("VitroBaseWorkflowId"),
         }
         # Патч 22.10: для «Ведомости комплектов» discipline = код комплекта,
         # а не первый элемент пути (parse_path вернул бы "01_РД")
@@ -447,6 +450,8 @@ def fetch_atp_documents(max_items: int = 0) -> list[dict]:
             "sheet_number": it.get("VitroBaseDocSheetNumber"),
             "vitro_guid": it.get("UniqueId"),
             "vitro_version": vitro_version,
+            "send_date": it.get("VitroBaseSendDate"),
+            "workflow_id": it.get("VitroBaseWorkflowId"),
         }
         guid = record["vitro_guid"]
         if guid:

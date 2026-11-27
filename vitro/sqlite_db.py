@@ -166,6 +166,41 @@ def init_db() -> None:
             FOREIGN KEY (kit_code) REFERENCES plan_kits(code)
         );
         CREATE INDEX IF NOT EXISTS idx_plan_drawings_kit ON plan_drawings(kit_code);
+
+        -- Витрина статусов СО/ВР (патч 22.21)
+        -- Одна строка = один лист СО/ВР в одном комплекте.
+        -- Ключ: (complex, sheet_number, doc_id).
+        CREATE TABLE IF NOT EXISTS documents_sovr (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            complex        TEXT NOT NULL,      -- шифр комплекта
+            sheet_number   TEXT NOT NULL,      -- 'СО' или 'ВР' (нормализованный)
+            doc_id         INTEGER NOT NULL,   -- id из таблицы documents
+            status         TEXT,               -- статус листа (A/B/C/…)
+            send_date      TEXT,               -- дата отправки на согласование (МСК)
+            status_date    TEXT,               -- дата получения статуса (МСК)
+            workflow_id    INTEGER,            -- номер процесса
+            revision       TEXT,               -- ревизия
+            name           TEXT,               -- полное наименование
+            vitro_guid     TEXT,               -- GUID документа в Витро
+            updated_at     TEXT,               -- время последней загрузки
+            updated_by     TEXT,
+            UNIQUE(complex, sheet_number, doc_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_documents_sovr_complex ON documents_sovr(complex);
+        CREATE INDEX IF NOT EXISTS idx_documents_sovr_sheet   ON documents_sovr(sheet_number);
+
+        -- Таблица-каркас для Excel-перечня листов СО/ВР (патч 22.21)
+        -- Заполняется парсером (следующий патч). Пока — заглушки.
+        CREATE TABLE IF NOT EXISTS sheets_sovr_template (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            kit_code     TEXT NOT NULL,        -- шифр комплекта
+            sheet_no     TEXT,                -- номер листа ('СО', 'ВР', …)
+            title        TEXT,                -- наименование
+            source       TEXT,                -- источник (имя файла Excel)
+            created_at   TEXT,
+            updated_at   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sheets_sovr_template_kit ON sheets_sovr_template(kit_code);
         """)
 
         # Мягкая миграция: если БД была создана старой версией — добавим колонки
@@ -709,3 +744,105 @@ def clear_plan() -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM plan_drawings")
         conn.execute("DELETE FROM plan_kits")
+
+
+# ===========================================================================
+#  СО и ВР (патч 22.21)
+# ===========================================================================
+def load_sovr_statuses(user: str = "") -> int:
+    """
+    Загружает/обновляет витрину статусов СО/ВР из таблицы documents.
+
+    Правило «последний по процессу»:
+      - Для каждой пары (complex, sheet_number) берётся строка с MAX(status_date),
+        при равенстве дат — MAX(id).
+    - sheet_number нормализуется через sheet_kind.normalize_sheet_number().
+    - Идемпотентно: DELETE FROM documents_sovr + INSERT заново.
+
+    Возвращает число вставленных строк.
+    """
+    from vitro.sheet_kind import normalize_sheet_number
+
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, complex, sheet_number, status, status_date,
+                   revision, name, vitro_guid
+            FROM documents
+            WHERE complex IS NOT NULL AND sheet_number IS NOT NULL
+        """).fetchall()
+
+    if not rows:
+        return 0
+
+    # Нормализуем sheet_number и отбираем только СО/ВР
+    sovr_rows = []
+    for r in rows:
+        kind = normalize_sheet_number(r["sheet_number"])
+        if kind not in ("СО", "ВР"):
+            continue
+        sovr_rows.append(dict(r))
+
+    if not sovr_rows:
+        return 0
+
+    now = msk_now_str()
+
+    # «Последний по процессу»: MAX(status_date), при равенстве MAX(id)
+    # Группируем по (complex, sheet_number) и берём победителя
+    best: dict[tuple[str, str], dict] = {}
+    for row in sovr_rows:
+        key = (row["complex"], row["sheet_number"])
+        winner = best.get(key)
+        if winner is None:
+            best[key] = row
+            continue
+
+        # Сравниваем: MAX(status_date), при равенстве MAX(id)
+        w_sd = winner.get("status_date") or ""
+        r_sd = row.get("status_date") or ""
+        if r_sd > w_sd or (r_sd == w_sd and row["id"] > winner["id"]):
+            best[key] = row
+
+    # Очищаем и вставляем заново (идемпотентно)
+    with get_conn() as conn:
+        conn.execute("DELETE FROM documents_sovr")
+
+        inserted = 0
+        for key, row in best.items():
+            conn.execute("""
+                INSERT INTO documents_sovr
+                    (complex, sheet_number, doc_id, status, send_date,
+                     status_date, workflow_id, revision, name, vitro_guid,
+                     updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row["complex"],
+                row["sheet_number"],
+                row["id"],
+                row.get("status"),
+                row.get("send_date"),
+                row.get("status_date"),
+                row.get("workflow_id"),
+                row.get("revision"),
+                row.get("name"),
+                row.get("vitro_guid"),
+                now,
+                user,
+            ))
+            inserted += 1
+
+    return inserted
+
+
+def load_sovr_table():
+    """Все строки витрины СО/ВР (для UI, патч 22.22)."""
+    import pandas as pd
+
+    with get_conn() as conn:
+        return pd.read_sql("""
+            SELECT complex, sheet_number, doc_id, status, send_date,
+                   status_date, workflow_id, revision, name, vitro_guid,
+                   updated_at, updated_by
+            FROM documents_sovr
+            ORDER BY complex, sheet_number, status_date DESC
+        """, conn)
