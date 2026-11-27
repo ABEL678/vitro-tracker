@@ -11,7 +11,7 @@
 6. Идемпотентность повторной загрузки витрины
 
 Запуск:
-    .venv\Scripts\python.exe scripts\test_patch22_21.py
+    .venv\\Scripts\\python.exe scripts\\test_patch22_21.py
 """
 
 import sys

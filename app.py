@@ -27,7 +27,7 @@ from vitro.config import APP_VERSION
 from vitro.time_utils import fmt_msk
 from vitro.ui import (
     summary, dynamics, authors, deadlines,
-    plan, categories, search, export, admin,
+    plan, categories, so_vr, search, export, admin,
 )
 
 import time
@@ -268,6 +268,7 @@ _TABS = [
     "👤 Авторы",
     "⏰ Сроки",
     "🏷 Категории",
+    "📑 СО и ВОР",
     "🔍 Поиск",
     "📄 Экспорт",
     "⚙️ Управление",
@@ -337,6 +338,8 @@ elif _active == "📅 План выдачи":
     plan.render()
 elif _active == "🏷 Категории":
     categories.render()
+elif _active == "📑 СО и ВОР":
+    so_vr.render()
 elif _active == "🔍 Поиск":
     search.render()
 elif _active == "📄 Экспорт":
