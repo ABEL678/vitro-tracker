@@ -1,15 +1,16 @@
 """
-📑 СО и ВОР — листы СО и ВР (патч 22.22).
+📑 СО и ВОР — листы СО и ВР (патч 22.22-22.23).
 
 Витрина статусов листов СО/ВР из таблицы documents_sovr.
-Две подвкладки: основная (таблица, бублики) и сервисная (заглушка).
+Две подвкладки: основная (таблица, бублики, экспорт) и сервисная (обновление).
 
 Структура вкладки:
   1. Фильтры — стандартные (Дисциплина/Раздел/Комплект) + статус листа + период.
   2. Бублики — СО и ВР (статусы + загружено/план) — всегда оба блока.
   3. Сводная таблица — строка = лист (complex + sheet_number).
   4. Экспорт в Excel.
-  5. Сервисная подвкладка — заглушка (патч 22.23).
+  5. Обогащение пользовательского Excel (СВОК) — колонки СО/ВР.
+  6. Сервисная подвкладка — обновление статусов СО/ВР из Витро (патч 22.23).
 """
 
 from datetime import date, datetime
@@ -20,6 +21,7 @@ import plotly.express as px
 import streamlit as st
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils import range_boundaries
 
 from vitro._cache import versioned_cache
 from vitro.sqlite_db import get_conn, load_sovr_table
@@ -194,13 +196,14 @@ def _apply_filters(df: pd.DataFrame, flt: dict) -> pd.DataFrame:
     date_to = flt.get("date_to")
     if date_from or date_to:
         # Исключаем пустые send_date
-        out = out[out["send_date"].notna() & (out["send_date"].astype(str).str.strip() != "")]
+        mask = out["send_date"].notna() & (out["send_date"].astype(str).str.strip() != "")
+        out = out[mask]
         if not out.empty:
             iso = out["send_date"].astype(str).str.slice(0, 10)
             if date_from:
-                out = out[iso >= date_from.isoformat()]
+                out = out.loc[iso >= date_from.isoformat()]
             if date_to:
-                out = out[iso <= date_to.isoformat()]
+                out = out.loc[iso <= date_to.isoformat()]
 
     return out
 
@@ -516,6 +519,217 @@ def _export_sovr_excel(df: pd.DataFrame, flt: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+#  Обогащение пользовательского Excel (СВОК)
+# ---------------------------------------------------------------------------
+_SOVSo_HEADERS = ["Ревизия СО", "Статус СО", "Дата выдачи СО", "Дата получения статуса СО", "№ процесса СО"]
+_SOVr_HEADERS = ["Ревизия ВР", "Статус ВР", "Дата выдачи ВР", "Дата получения статуса ВР", "№ процесса ВР"]
+
+_SOV_HEADER_FILL_SO = PatternFill("solid", fgColor="1F4E78")
+_SOV_HEADER_FILL_VR = PatternFill("solid", fgColor="2E75B6")
+_SOV_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+
+
+def _enrich_svok_excel(
+    source_bytes: bytes,
+    sheet_name: str,
+    sovr_data: pd.DataFrame,
+    is_xlsm: bool,
+) -> bytes:
+    """
+    Обогащает пользовательский Excel (СВОК) колонками СО/ВР.
+
+    - Находит лист СВОК, шапку по "Шифр РД" в колонке C.
+    - Добавляет справа блок СО (5 колонок) и блок ВР (5 колонок).
+    - Двухэтажная шапка: строка с "СО" / "ВОР" (объединённые ячейки),
+      под ней — подколонки.
+    - Заполняет данные по complex из sovr_data.
+    - Учитывает "Не выдается" в колонке T файла для ВР.
+    - Сохраняет VBA для .xlsm.
+    """
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(source_bytes), read_only=False, keep_vba=is_xlsm)
+
+    if sheet_name not in wb:
+        # Ищем лист с "СВОК" в имени
+        found = None
+        for name in wb.sheetnames:
+            if "свок" in name.lower():
+                found = name
+                break
+        if found:
+            sheet_name = found
+        else:
+            st.error(f"Лист «{sheet_name}» не найден. Доступные листы: {', '.join(wb.sheetnames)}")
+            return source_bytes
+
+    ws = wb[sheet_name]
+
+    # Находим колонку "Шифр РД" (ищем в первых 50 строках)
+    kit_col_num = None
+    kit_header_row = None
+    for row in ws.iter_rows(min_row=1, max_row=50, max_col=ws.max_column):
+        for cell in row:
+            if cell.value and "шифр" in str(cell.value).lower():
+                kit_col_num = cell.column
+                kit_header_row = cell.row
+                break
+        if kit_col_num:
+            break
+
+    if kit_col_num is None:
+        st.error("Не найдена колонка с шифрами (ожидался заголовок 'Шифр РД').")
+        return source_bytes
+
+    # Последняя колонка данных
+    max_col = ws.max_column
+
+    # Определяем колонку T (для проверки "Не выдается")
+    col_t_num = 20  # T = 20
+
+    # Собираем словарь "Не выдается" по шифрам (после insert_rows данные сдвинулись)
+    not_issued: set = set()
+    for row in ws.iter_rows(min_row=kit_header_row + 2, max_row=ws.max_row, min_col=col_t_num, max_col=col_t_num):
+        cell = row[0]
+        if cell.value and "не выд" in str(cell.value).lower():
+            # Ищем шифр в этой строке (колонка kit_col_num)
+            for r in ws.iter_rows(min_row=cell.row, max_row=cell.row, min_col=kit_col_num, max_col=kit_col_num):
+                code_cell = r[0]
+                if code_cell.value:
+                    not_issued.add(str(code_cell.value).strip())
+                break
+
+    # Добавляем колонки СО и ВР справа
+    col_start_so = max_col + 1
+    col_end_so = col_start_so + 4  # 5 колонок СО
+    col_start_vr = col_end_so + 1
+    col_end_vr = col_start_vr + 4  # 5 колонок ВР
+
+    last_letter = get_column_letter(col_end_vr)
+
+    # Двухэтажная шапка: строка над шапкой — объединённые ячейки "СО" / "ВОР"
+    header_merge_row = kit_header_row - 1
+    ws.insert_rows(header_merge_row)
+
+    # Сдвигаем существующие merges
+    src_merges = [str(_r) for _r in ws.merged_cells.ranges]
+    for _m in src_merges:
+        ws.unmerge_cells(_m)
+
+    # Вставляем объединённые ячейки для "СО" и "ВОР"
+    ws.merge_cells(
+        start_row=header_merge_row, start_column=col_start_so,
+        end_row=header_merge_row, end_column=col_end_so
+    )
+    cell_merge_so = ws.cell(row=header_merge_row, column=col_start_so, value="СО")
+    cell_merge_so.font = Font(bold=True)
+    cell_merge_so.fill = _SOV_HEADER_FILL_SO
+    cell_merge_so.border = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+    cell_merge_so.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.merge_cells(
+        start_row=header_merge_row, start_column=col_start_vr,
+        end_row=header_merge_row, end_column=col_end_vr
+    )
+    cell_merge_vr = ws.cell(row=header_merge_row, column=col_start_vr, value="ВОР")
+    cell_merge_vr.font = Font(bold=True)
+    cell_merge_vr.fill = _SOV_HEADER_FILL_VR
+    cell_merge_vr.border = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+    cell_merge_vr.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Возвращаем merges (со сдвигом)
+    for _m in src_merges:
+        _c1, _r1, _c2, _r2 = range_boundaries(_m)
+        if _r1 >= header_merge_row:
+            _r1 += 1
+            _r2 += 1
+        elif _r2 >= header_merge_row:
+            _r2 += 1
+        ws.merge_cells(start_row=_r1, start_column=_c1,
+                       end_row=_r2, end_column=_c2)
+
+    # Шапки подколонок
+    for i, name in enumerate(_SOVSo_HEADERS, start=col_start_so):
+        c = ws.cell(row=kit_header_row, column=i, value=name)
+        c.font = Font(bold=True)
+        c.fill = PatternFill("solid", fgColor="D9E1F2")
+        c.border = _BORDER
+        c.alignment = Alignment(wrap_text=True, vertical="center")
+
+    for i, name in enumerate(_SOVr_HEADERS, start=col_start_vr):
+        c = ws.cell(row=kit_header_row, column=i, value=name)
+        c.font = Font(bold=True)
+        c.fill = PatternFill("solid", fgColor="D9E1F2")
+        c.border = _BORDER
+        c.alignment = Alignment(wrap_text=True, vertical="center")
+
+    # Ширина колонок
+    for col in range(col_start_so, col_end_so + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 18
+    for col in range(col_start_vr, col_end_vr + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 18
+
+    # Заполняем данные (после insert_rows данные сдвинулись на +1)
+    # Создаём индекс sovr_data по complex + sheet_number
+    sovr_index: dict[tuple, dict] = {}
+    for _, row in sovr_data.iterrows():
+        key = (row["complex"], row["sheet_number"])
+        sovr_index[key] = {
+            "revision": row.get("revision") or "",
+            "status": row.get("status") or "",
+            "send_date": _fmt_date(row.get("send_date")) if row.get("send_date") else "",
+            "status_date": _fmt_date(row.get("status_date")) if row.get("status_date") else "",
+            "workflow_id": row.get("workflow_id") or "",
+        }
+
+    # Заполняем строки данных (после insert_rows данные с kit_header_row+2)
+    for row_idx in range(kit_header_row + 2, ws.max_row + 1):
+        # Получаем шифр
+        code_cell = ws.cell(row=row_idx, column=kit_col_num)
+        code = code_cell.value
+        if not code or (isinstance(code, float) and pd.isna(code)):
+            continue
+
+        code_str = str(code).strip()
+
+        # Блок СО — по всем строкам
+        so_key = (code_str, "СО")
+        so_info = sovr_index.get(so_key)
+        for i, key_field in enumerate(["revision", "status", "send_date", "status_date", "workflow_id"]):
+            val = so_info[key_field] if so_info else ""
+            ws.cell(row=row_idx, column=col_start_so + i, value=val)
+
+        # Блок ВР — если "Не выдается" → пусто
+        vr_key = (code_str, "ВР")
+        if code_str in not_issued:
+            # Пустые ячейки
+            for i in range(5):
+                ws.cell(row=row_idx, column=col_start_vr + i, value="")
+        else:
+            vr_info = sovr_index.get(vr_key)
+            for i, key_field in enumerate(["revision", "status", "send_date", "status_date", "workflow_id"]):
+                val = vr_info[key_field] if vr_info else ""
+                ws.cell(row=row_idx, column=col_start_vr + i, value=val)
+
+    # Форматирование данных (после insert_rows данные с kit_header_row+2)
+    for row_idx in range(kit_header_row + 2, ws.max_row + 1):
+        for col in range(col_start_so, col_end_so + 1):
+            c = ws.cell(row=row_idx, column=col)
+            c.border = _THIN
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        for col in range(col_start_vr, col_end_vr + 1):
+            c = ws.cell(row=row_idx, column=col)
+            c.border = _THIN
+            c.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Сохраняем
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 #  Рендер
 # ---------------------------------------------------------------------------
 def render() -> None:
@@ -549,9 +763,69 @@ def render() -> None:
 
 
 def render_service() -> None:
-    """Сервисная подвкладка — заглушка (патч 22.23)."""
-    st.info("⚙️ Сервисная подвкладка в разработке (патч 22.23).")
+    """Сервисная подвкладка: обновление статусов СО/ВР из Витро."""
+    st.markdown("### ⚙️ Обновление статусов СО и ВОР из Витро")
     st.caption(
-        "Здесь будет функционал обновления статусов СО/ВР из Витро, "
-        "загрузки Excel-перечня и управления данными."
+        "Загрузка актуальных статусов листов СО/ВР из SharePoint Витро. "
+        "Обновляет витрину documents_sovr."
     )
+
+    # Блокировка повторного запуска
+    if st.session_state.get("sovr_refresh_running", False):
+        st.warning("⏳ Обновление уже запущено. Подождите завершения.")
+        return
+
+    if st.button(
+        "🔄 Обновить статусы СО и ВОР из Витро",
+        type="primary",
+        key="sovr_refresh_btn",
+    ):
+        st.session_state["sovr_refresh_running"] = True
+
+        import time
+        from vitro.sync import fetch_atp_documents
+        from vitro.sqlite_db import load_sovr_statuses as _load_sovr_statuses
+
+        progress_bar = st.progress(0, text="Инициализация...")
+        status_text = st.empty()
+
+        try:
+            # Шаг 1: Загрузка документов из Витро
+            progress_bar.progress(20, text="Шаг 1/2: Загрузка документов из Витро...")
+            status_text.caption("Подключение к SharePoint Витро...")
+            docs = fetch_atp_documents()
+            status_text.caption(f"Загружено документов: **{len(docs)}**")
+
+            # Шаг 2: Загрузка статусов СО/ВР
+            progress_bar.progress(60, text="Шаг 2/2: Обновление витрины СО/ВР...")
+            status_text.caption("Сохранение статусов в локальную базу...")
+            inserted = _load_sovr_statuses(user="service_subtab")
+            progress_bar.progress(100, text="Готово!")
+
+            # Сводка
+            st.success(f"✅ Витрина обновлена: вставлено **{inserted}** строк СО/ВР.")
+
+            # Время обновления
+            with get_conn() as conn:
+                row = conn.execute(
+                    "SELECT MAX(updated_at) as max_updated FROM documents_sovr"
+                ).fetchone()
+            updated_at = row["max_updated"] if row and row["max_updated"] else None
+
+            if updated_at:
+                st.caption(f"Последняя запись обновлена: **{updated_at}**")
+
+            # Количество листов СО и ВР
+            so_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM documents_sovr WHERE sheet_number = 'СО'"
+            ).fetchone()["cnt"]
+            vr_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM documents_sovr WHERE sheet_number = 'ВР'"
+            ).fetchone()["cnt"]
+            st.caption(f"Листов СО: **{so_count}** · ВР: **{vr_count}**")
+
+        except Exception as e:
+            st.error(f"❌ Ошибка обновления: {e}")
+        finally:
+            st.session_state["sovr_refresh_running"] = False
+            status_text.empty()
