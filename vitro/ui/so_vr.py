@@ -215,16 +215,34 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
            key: str, center_total: str,
            color_map: dict | None = None) -> None:
     """Бублик в стиле Сводки: без легенды, проценты внутри."""
+    # Защита от пустых данных и NaN
+    if fig_data.empty:
+        st.caption("Нет данных для диаграммы.")
+        return
+    # Проверка что колонки существуют
+    if names_col not in fig_data.columns or values_col not in fig_data.columns:
+        st.caption("Нет данных для диаграммы.")
+        return
+    # Приводим names_col к str, убираем NaN
+    fig_data = fig_data.copy()
+    fig_data[names_col] = fig_data[names_col].astype(str).replace("nan", "")
+    fig_data = fig_data[fig_data[names_col] != ""]
     if fig_data.empty or int(fig_data[values_col].sum()) == 0:
         st.caption("Нет данных для диаграммы.")
         return
+    # Фильтруем color_map только по ключам, присутствующим в данных
+    if color_map:
+        present_keys = set(fig_data[names_col].unique())
+        filtered_map = {k: v for k, v in color_map.items() if k in present_keys}
+    else:
+        filtered_map = {}
     fig = px.pie(
         fig_data,
         names=names_col,
         values=values_col,
         hole=0.45,
         color=names_col,
-        color_discrete_map=color_map or {},
+        color_discrete_map=filtered_map,
     )
     fig.update_traces(
         textposition="inside",
@@ -254,12 +272,16 @@ def _render_sovr_donuts(df: pd.DataFrame) -> None:
         # --- Бублик «Статусы» ---
         status_counts = df[df["sheet_number"] == sn].copy()
         if not status_counts.empty:
-            status_counts["_status_bucket"] = status_counts["status"].apply(_classify_status)
+            status_counts["_status_bucket"] = status_counts["status"].apply(
+                lambda s: _classify_status(s) if pd.notna(s) else "—"
+            )
             status_data = (
                 status_counts.groupby("_status_bucket")
                 .size()
                 .reset_index(name="Количество")
             )
+            # Переименуем колонку для единообразия
+            status_data.columns = ["Группа", "Количество"]
         else:
             status_data = pd.DataFrame(columns=["Группа", "Количество"])
 
@@ -267,10 +289,13 @@ def _render_sovr_donuts(df: pd.DataFrame) -> None:
         status_data = status_data[status_data["Количество"] > 0]
 
         st.markdown("###### Статусы")
-        _donut(status_data, "Группа", "Количество",
-               f"sovr_donut_{label.lower()}_status",
-               center_total=_fmt_num(total_status),
-               color_map=SHEET_STATUS_COLORS)
+        if status_data.empty:
+            st.caption("Нет данных для диаграммы.")
+        else:
+            _donut(status_data, "Группа", "Количество",
+                   f"sovr_donut_{label.lower()}_status",
+                   center_total=_fmt_num(total_status),
+                   color_map=SHEET_STATUS_COLORS)
 
         # --- Бублик «Загружено / План» ---
         st.markdown("###### Загружено / План")

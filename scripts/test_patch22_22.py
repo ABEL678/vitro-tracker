@@ -9,10 +9,12 @@
 4. Стандартные фильтры: Дисциплина, Комплект (по complex)
 5. Фильтр "Статус листа" (включая "Не загружен" → пустая таблица)
 6. Период по send_date: пустые send_date при заданном периоде исключаются
-7. Навигация: вкладка "СО и ВОР" в списке вкладок стоит ПЕРЕД "Поиск"
-8. Оба блока (СО и ВР) отображаются всегда
-9. Выгрузка xlsx: две группы колонок, формат дат
-10. Пустой Комплект → бублики пустые, таблица пустая
+7. Бублики — защита от пустых данных (NaN, пустой df, zero sum)
+8. _render_sovr_donuts на пустой витрине не падает
+9. Навигация: вкладка "СО и ВОР" в списке вкладок стоит ПЕРЕД "Поиск"
+10. Оба блока (СО и ВР) отображаются всегда
+11. Выгрузка xlsx: две группы колонок, формат дат
+12. Пустой Комплект → бублики пустые, таблица пустая
 
 Запуск:
     .venv\Scripts\python.exe scripts\test_patch22_22.py
@@ -27,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vitro.ui.so_vr import (
     _apply_filters, _classify_status, _fmt_date, _build_sovr_table,
-    STATUS_OPTIONS,
+    STATUS_OPTIONS, _donut, _render_sovr_donuts,
 )
 import pandas as pd
 
@@ -345,6 +347,63 @@ class TestNavigation(unittest.TestCase):
         self.assertGreater(search_pos, 0, 'Вкладка "Поиск" не найдена в _TABS')
         self.assertLess(sovr_pos, search_pos,
                         'Вкладка "СО и ВОР" должна быть ПЕРЕД "Поиск"')
+
+
+# ===========================================================================
+#  Тест 7.5: Бублики — защита от пустых данных (фикс 22.23)
+# ===========================================================================
+class TestDonutEmptyProtection(unittest.TestCase):
+    """Проверка что _donut не падает на пустых/NaN данных."""
+
+    def test_donut_empty_df(self):
+        """_donut не падает на пустом DataFrame."""
+        empty_df = pd.DataFrame(columns=["label", "count"])
+        # Не должно выбросить исключение
+        _donut(empty_df, "label", "count", "test_empty", "0")
+
+    def test_donut_nan_labels(self):
+        """_donut не падает на NaN в label."""
+        df = pd.DataFrame({"label": [None, "", "A"], "count": [1, 2, 3]})
+        # Не должно выбросить исключение — NaN должны быть отфильтрованы
+        _donut(df, "label", "count", "test_nan", "3")
+
+    def test_donut_all_nan_labels(self):
+        """_donut не падает когда все label NaN."""
+        df = pd.DataFrame({"label": [None, None], "count": [1, 2]})
+        # Не должно выбросить исключение
+        _donut(df, "label", "count", "test_all_nan", "0")
+
+    def test_donut_zero_sum(self):
+        """_donut не падает когда сумма значений = 0."""
+        df = pd.DataFrame({"label": ["A", "B"], "count": [0, 0]})
+        # Не должно выбросить исключение
+        _donut(df, "label", "count", "test_zero", "0")
+
+
+# ===========================================================================
+#  Тест 7.6: _render_sovr_donuts на пустой витрине
+# ===========================================================================
+class TestRenderDonutsEmptyTable(unittest.TestCase):
+    """Проверка что бублики не падают на пустой витрине."""
+
+    def test_render_donuts_empty_df(self):
+        """_render_sovr_donuts не падает на пустом DataFrame."""
+        empty_df = pd.DataFrame(columns=["complex", "sheet_number", "status"])
+        # Не должно выбросить исключение
+        _render_sovr_donuts(empty_df)
+
+    def test_render_donuts_empty_status(self):
+        """_render_sovr_donuts не падает когда все статусы NaN."""
+        df = pd.DataFrame([
+            {"complex": "A", "sheet_number": "СО", "status": None,
+             "send_date": "", "status_date": "", "workflow_id": None,
+             "revision": "", "name": "", "doc_id": 1},
+        ])
+        # Не должно выбросить исключение — None статус должен обработаться
+        try:
+            _render_sovr_donuts(df)
+        except KeyError:
+            self.fail("_render_sovr_donuts упал на NaN статусе (KeyError)")
 
 
 # ===========================================================================
