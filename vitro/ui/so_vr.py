@@ -5,8 +5,8 @@
 Две подвкладки: основная (таблица, бублики) и сервисная (заглушка).
 
 Структура вкладки:
-  1. Фильтры — тип листа (СО/ВР/Оба), статус листа, период по send_date.
-  2. Бублики — СО и ВР (статусы + загружено/план).
+  1. Фильтры — стандартные (Дисциплина/Раздел/Комплект) + статус листа + период.
+  2. Бублики — СО и ВР (статусы + загружено/план) — всегда оба блока.
   3. Сводная таблица — строка = лист (complex + sheet_number).
   4. Экспорт в Excel.
   5. Сервисная подвкладка — заглушка (патч 22.23).
@@ -41,7 +41,6 @@ SHEET_STATUS_COLORS_LOADED = {
 }
 
 STATUS_OPTIONS = ["Не загружен", "A", "B", "C", "Другие"]
-SHEET_TYPE_OPTIONS = ["СО", "ВР", "Оба"]
 
 # ---------------------------------------------------------------------------
 #  Кэшированные данные
@@ -100,44 +99,23 @@ def _classify_status(status: str) -> str:
 #  Фильтры
 # ---------------------------------------------------------------------------
 def _render_filters() -> dict:
-    """Фильтры вкладки СО и ВОР."""
-    result = {
-        "sheet_type": "Оба",
-        "status": (),
-        "date_from": None,
-        "date_to": None,
-    }
+    """Фильтры вкладки СО и ВОР: стандартные + статус + период."""
+    from vitro.ui._filters import render_standard_filters
 
-    with st.expander("Фильтры", expanded=True):
-        # Тип листа
-        c1, c2, c3 = st.columns(3)
+    def _extra_row():
+        """Ряд 3: статус листа + период."""
+        status = st.multiselect(
+            "Статус листа",
+            options=STATUS_OPTIONS,
+            placeholder="Все",
+            key="sovr_status",
+        )
+        st.caption(
+            "Период по дате выдачи (send_date). "
+            "Пустые даты исключаются при заданном периоде."
+        )
+        c1, c2 = st.columns(2)
         with c1:
-            sheet_type = st.selectbox(
-                "Тип листа",
-                options=SHEET_TYPE_OPTIONS,
-                index=SHEET_TYPE_OPTIONS.index("Оба"),
-                key="sovr_sheet_type",
-            )
-            result["sheet_type"] = sheet_type
-
-        with c2:
-            status = st.multiselect(
-                "Статус листа",
-                options=STATUS_OPTIONS,
-                placeholder="Все",
-                key="sovr_status",
-            )
-            result["status"] = tuple(status)
-
-        with c3:
-            st.caption(
-                "Период по дате выдачи (send_date). "
-                "Пустые даты исключаются при заданном периоде."
-            )
-
-        # Период
-        c4, c5 = st.columns(2)
-        with c4:
             date_from = st.date_input(
                 "Период: с",
                 value=None,
@@ -145,7 +123,7 @@ def _render_filters() -> dict:
                 max_value=date(2100, 12, 31),
                 key="sovr_date_from",
             )
-        with c5:
+        with c2:
             date_to = st.date_input(
                 "по",
                 value=None,
@@ -153,11 +131,26 @@ def _render_filters() -> dict:
                 max_value=date(2100, 12, 31),
                 key="sovr_date_to",
             )
+        return {
+            "status": tuple(status),
+            "date_from": date_from,
+            "date_to": date_to,
+        }
 
-        result["date_from"] = date_from
-        result["date_to"] = date_to
+    std = render_standard_filters(
+        key_prefix="sovr_",
+        show_remark_status=False,
+        show_sheet_status=False,
+        extra_row=_extra_row,
+    )
 
-    return result
+    return {
+        "kits": std["kits"],
+        "block_codes": std["block_codes"],
+        "status": std["extra"].get("status", ()),
+        "date_from": std["extra"].get("date_from"),
+        "date_to": std["extra"].get("date_to"),
+    }
 
 
 def _apply_filters(df: pd.DataFrame, flt: dict) -> pd.DataFrame:
@@ -167,12 +160,20 @@ def _apply_filters(df: pd.DataFrame, flt: dict) -> pd.DataFrame:
 
     out = df.copy()
 
-    # Тип листа
-    if flt["sheet_type"] == "СО":
-        out = out[out["sheet_number"] == "СО"]
-    elif flt["sheet_type"] == "ВР":
-        out = out[out["sheet_number"] == "ВР"]
-    # "Оба" — без фильтра
+    # Комплект (complex)
+    kits = flt.get("kits", ())
+    if kits:
+        out = out[out["complex"].isin(kits)]
+
+    # Расположение (4-й блок complex)
+    block_codes = flt.get("block_codes", ())
+    if block_codes:
+        def _get_4th_block(val):
+            if not val:
+                return ""
+            parts = str(val).split("-")
+            return parts[3].strip().upper() if len(parts) >= 4 else ""
+        out = out[out["complex"].apply(_get_4th_block).isin(block_codes)]
 
     # Статус листа
     if flt["status"]:
@@ -241,11 +242,9 @@ def _donut(fig_data: pd.DataFrame, names_col: str, values_col: str,
     st.plotly_chart(fig, width='stretch', key=key)
 
 
-def _render_sovr_donuts(df: pd.DataFrame, sheet_type: str) -> None:
-    """Бублики для СО и ВР."""
+def _render_sovr_donuts(df: pd.DataFrame) -> None:
+    """Бублики для СО и ВР — всегда оба блока."""
     for label, sn in [("СО", "СО"), ("ВР", "ВР")]:
-        if sheet_type not in ("Оба", label):
-            continue
 
         st.markdown(f"##### 🍩 {label}")
 
@@ -529,8 +528,8 @@ def render() -> None:
     # Применяем фильтры
     df_filtered = _apply_filters(df, flt)
 
-    # Бублики
-    _render_sovr_donuts(df_filtered, flt["sheet_type"])
+    # Бублики (оба блока всегда)
+    _render_sovr_donuts(df_filtered)
 
     # Сводная таблица
     _render_sovr_table(df_filtered, flt)
