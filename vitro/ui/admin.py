@@ -80,7 +80,8 @@ def _render_db_stats():
 
     st.caption(
         f"**Последняя синхронизация:** "
-        f"{fmt_msk(last_sync) if last_sync else 'ещё не было'}"
+        f"{fmt_msk(last_sync) if last_sync else 'ещё не было'} "
+        f"(полный проход, включая СО/ВОР)"
     )
 
     if last_snapshots:
@@ -94,35 +95,56 @@ def _render_db_stats():
 #  Синхронизация
 # ---------------------------------------------------------------------------
 def _run_sync():
-    with st.spinner("Синхронизация с SharePoint... (займёт 3–5 минут)"):
-        try:
-            from vitro.sync import refresh_data
-            result = refresh_data(verbose=False)
+    progress_bar = st.progress(0, text="Подготовка синхронизации...")
 
-            st.success(
-                f"✅ Синхронизация завершена\n\n"
-                f"- Файлов (строк documents): "
-                f"**{result['documents']:,}**\n".replace(",", " ") +
-                f"- Замечаний: **{result['comments']:,}**\n"
-                f"- Комплектов: **{result['complexes']:,}**\n"
-                f"- Время: **{result['elapsed']} сек**"
+    def _progress(pct: float, text: str) -> None:
+        progress_bar.progress(min(100, max(0, int(pct))), text=text)
+
+    try:
+        from vitro.sync import refresh_data
+        result = refresh_data(verbose=False, progress_cb=_progress)
+
+        sovr_ok = bool(result.get("sovr_ok", True))
+        sovr_line = (
+            f"- СО/ВОР: **{result.get('sovr_sheets', 0):,}** листов\n".replace(",", " ")
+            if sovr_ok
+            else "- СО/ВОР: **не обновлены**\n"
+        )
+        st.success(
+            f"✅ Синхронизация завершена\n\n"
+            f"- Файлов (строк documents): "
+            f"**{result['documents']:,}**\n".replace(",", " ") +
+            f"- Замечаний: **{result['comments']:,}**\n"
+            f"- Комплектов: **{result['complexes']:,}**\n"
+            f"{sovr_line}"
+            f"- Время: **{result['elapsed']} сек**"
+        )
+
+        # Блок СО/ВР изолирован в refresh_data: основная база уже
+        # обновлена, откатывать синк не нужно — только предупреждаем.
+        if not sovr_ok:
+            st.warning(
+                "⚠️ Основная база обновлена, но статусы СО и ВОР "
+                f"не обновлены: {result.get('sovr_error') or 'неизвестная ошибка'}"
             )
-            st.cache_data.clear()
-        except Exception as e:
-            st.error(f"❌ Ошибка синхронизации: {e}")
-            st.code(traceback.format_exc())
-            try:
-                log_event("sync_error", str(e), status="ERROR")
-            except Exception:
-                pass
+
+        st.cache_data.clear()
+    except Exception as e:
+        st.error(f"❌ Ошибка синхронизации: {e}")
+        st.code(traceback.format_exc())
+        try:
+            log_event("sync_error", str(e), status="ERROR")
+        except Exception:
+            pass
 
 
 def _render_sync():
     st.markdown("##### 🔄 Синхронизация с SharePoint")
 
     st.caption(
-        "Загружает свежие данные из Витрокад и создаёт снимок истории. "
-        "Занимает 3–5 минут. Существующие категории сохраняются."
+        "Загружает свежие данные из Витрокад, обновляет статусы СО и ВОР "
+        "и создаёт снимок истории. Занимает 3–5 минут. "
+        "Существующие категории сохраняются."
     )
 
     if st.button("🚀 Запустить синхронизацию", type="primary",

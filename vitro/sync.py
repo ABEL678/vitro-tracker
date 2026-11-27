@@ -11,6 +11,7 @@
 """
 
 import time
+from collections.abc import Callable
 from datetime import date
 
 from vitro.sharepoint import (
@@ -82,14 +83,19 @@ def refresh_sovr_statuses(docs: list[dict] | None = None,
         return {"ok": False, "documents": 0, "sheets": 0, "error": err}
 
 
-def refresh_data(verbose: bool = True) -> dict:
+def refresh_data(verbose: bool = True,
+                 progress_cb: Callable[[float, str], None] | None = None) -> dict:
     """
     Полный цикл синхронизации:
       1. Документы (листы) из SharePoint
       2. Замечания + справочники статусов и авторов
       3. Комплекты (коды + названия)
       4. Атомарная запись в SQLite с сохранением категорий
-      5. Снимок истории за текущую дату
+      5. Витрина статусов СО/ВР (documents_sovr)
+      6. Снимок истории за текущую дату
+
+    ``progress_cb`` — необязательный колбэк ``(процент, текст)`` для
+    прогресс-бара Streamlit. Ошибка колбэка не прерывает синхронизацию.
     """
     t0 = time.time()
 
@@ -101,17 +107,29 @@ def refresh_data(verbose: bool = True) -> dict:
                 # Windows cp1251 не поддерживает эмодзи — выводим без них
                 print(msg.encode('ascii', 'replace').decode('ascii'))
 
+    def progress(pct: float, msg: str) -> None:
+        """Обновляет внешний прогресс-бар, не влияя на сам синк."""
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(pct, msg)
+        except Exception:
+            pass  # сбой UI-колбэка не должен ломать синхронизацию
+
     # 1. Документы
+    progress(5, "📄 Загрузка документов из SharePoint...")
     log("📄 Загрузка документов из SharePoint...")
     docs = fetch_atp_documents(max_items=0)
     doc_ids = {d["id"] for d in docs}
     log(f"   Листов: {len(docs)}")
 
     # 2. Замечания
+    progress(20, "💬 Загрузка замечаний...")
     log("💬 Загрузка замечаний...")
     raw_comments = fetch_atp_comments(doc_ids=doc_ids, max_items=0)
     log(f"   Замечаний: {len(raw_comments)}")
 
+    progress(40, "📚 Загрузка справочников (статусы, авторы)...")
     log("📚 Загрузка справочников (статусы, авторы)...")
     statuses = fetch_comment_statuses()
     authors  = fetch_authors()
@@ -127,11 +145,13 @@ def refresh_data(verbose: bool = True) -> dict:
     } for c in raw_comments]
 
     # 3. Комплекты
+    progress(50, "🏗 Загрузка комплектов...")
     log("🏗 Загрузка комплектов...")
     complexes = fetch_complex_names()
     log(f"   Комплектов: {len(complexes)}")
 
     # 4. Запись в БД
+    progress(60, "💾 Запись в SQLite...")
     init_db()
     log("💾 Запись в SQLite...")
     n_docs, n_comments = save_all(docs, comments, doc_ids)
@@ -144,6 +164,7 @@ def refresh_data(verbose: bool = True) -> dict:
     # не прерывает остальные сущности синка. Отдельное событие журнала
     # здесь НЕ пишется: итог шага складывается в сообщение единственного
     # события 'refresh' в конце синка (контракт теста 22.9).
+    progress(70, "📑 Обновление статусов СО и ВОР...")
     log("📑 Обновление витрины СО/ВР...")
     try:
         sovr = refresh_sovr_statuses(docs=docs, verbose=verbose)
@@ -160,6 +181,7 @@ def refresh_data(verbose: bool = True) -> dict:
                         f"{sovr.get('error') or 'неизвестная'}")
 
     # 5. Снимок истории
+    progress(88, "📈 Построение снимка истории...")
     log("📈 Построение снимка истории...")
     summary = build_comments_summary(docs, comments)
     today = date.today().isoformat()
@@ -192,12 +214,15 @@ def refresh_data(verbose: bool = True) -> dict:
     except Exception:
         pass  # bare-режим (запуск вне Streamlit) — не критично
 
+    progress(100, "✅ Синхронизация завершена")
+
     return {
         "documents": n_docs,
         "comments":  n_comments,
         "complexes": n_complexes,
         "sovr_sheets": sovr.get("sheets", 0),
         "sovr_ok": bool(sovr.get("ok")),
+        "sovr_error": sovr.get("error") or "",
         "elapsed":   elapsed,
     }
 
