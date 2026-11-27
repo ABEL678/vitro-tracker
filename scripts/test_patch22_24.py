@@ -26,6 +26,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -34,8 +35,11 @@ from openpyxl import Workbook
 
 from vitro.ui.so_vr import (
     KIND_SO, KIND_VR, KIND_TITLES, SHEET_STATUS_COLORS,
-    _apply_filters, _build_sovr_table, _fmt_date, _fmt_workflow,
-    _parse_svok_workbook, _plan_donut_counts, _status_donut_data,
+    _apply_filters, _build_sovr_export_rows, _build_sovr_table,
+    _enrich_svok_excel, _export_sovr_excel, _filter_loaded_by_location,
+    _filter_template, _fmt_date, _fmt_workflow, _location_codes,
+    _parse_svok_workbook, _plan_donut_counts, _sovr_enriched_preview,
+    _sovr_export_filename, _status_donut_data,
 )
 
 
@@ -244,6 +248,7 @@ def _create_svok_file(rows: list[dict]) -> bytes:
         5: "Раздел",
         6: "Марка",
         7: "Наименование основного комплекта рабочих чертежей",
+        8: "Здание, Сооружение, Корпус",
         20: "Текущий статус ВОР",
     }
     for col, title in headers.items():
@@ -258,6 +263,7 @@ def _create_svok_file(rows: list[dict]) -> bytes:
         ws.cell(row=r, column=5, value=row.get("section", ""))
         ws.cell(row=r, column=6, value=row.get("marka", ""))
         ws.cell(row=r, column=7, value=row.get("title", ""))
+        ws.cell(row=r, column=8, value=row.get("location", ""))
         ws.cell(row=r, column=20, value=row.get("vor", ""))
 
     buf = io.BytesIO()
@@ -271,12 +277,14 @@ class TestSvokParser(unittest.TestCase):
     def test_parse_mini_copy(self):
         data = _create_svok_file([
             {"code": "АТ-РД-КЖ1-С-00", "disc": "02_КР", "section": "КЖ",
-             "marka": "КЖ1", "title": "Конструкции", "vor": "В работе"},
+             "marka": "КЖ1", "title": "Конструкции",
+             "location": "С (Стилобат)", "vor": "В работе"},
             {"code": "АТ-РД-ЭО1-С-00", "disc": "03_ЭС", "section": "ЭОМ",
              "marka": "ЭО1", "title": "Электроосвещение",
-             "vor": "Не выдается"},
+             "location": "1 (Корпус 1)", "vor": "Не выдается"},
             {"code": "АТ-РД-ОВ1-С-00", "disc": "04_МЕХ", "section": "ОВ",
-             "marka": "ОВ1", "title": "Отопление", "vor": ""},
+             "marka": "ОВ1", "title": "Отопление",
+             "location": "ГП,АД (Генеральный план, УСД)", "vor": ""},
         ])
         parsed = _parse_svok_workbook(data, "test.xlsx")
         self.assertEqual(parsed["header_row"], 13)
@@ -289,6 +297,10 @@ class TestSvokParser(unittest.TestCase):
         self.assertEqual(by_code["АТ-РД-КЖ1-С-00"]["section"], "КЖ")
         self.assertEqual(by_code["АТ-РД-КЖ1-С-00"]["marka"], "КЖ1")
         self.assertEqual(by_code["АТ-РД-КЖ1-С-00"]["title"], "Конструкции")
+        self.assertEqual(by_code["АТ-РД-КЖ1-С-00"]["location"],
+                         "С (Стилобат)")
+        self.assertEqual(by_code["АТ-РД-ЭО1-С-00"]["location"],
+                         "1 (Корпус 1)")
         self.assertEqual(by_code["АТ-РД-КЖ1-С-00"]["vor_not_issued"], 0)
         self.assertEqual(by_code["АТ-РД-ЭО1-С-00"]["vor_not_issued"], 1)
         self.assertEqual(parsed["not_issued"], 1)
@@ -393,12 +405,13 @@ class TestTemplateIdempotency(unittest.TestCase):
             first = [
                 {"kit_code": "АТ-РД-КЖ1-С-00", "title": "КЖ1",
                  "discipline": "02_КР", "section": "КЖ", "marka": "КЖ1",
-                 "vor_not_issued": 0},
+                 "location": "С (Стилобат)", "vor_not_issued": 0},
                 {"kit_code": "АТ-РД-ЭО1-С-00", "title": "ЭО1",
                  "discipline": "03_ЭС", "section": "ЭОМ", "marka": "ЭО1",
-                 "vor_not_issued": 1},
+                 "location": "1 (Корпус 1)", "vor_not_issued": 1},
                 {"kit_code": "АТ-РД-ОВ1-С-00", "title": "ОВ1",
                  "discipline": "04_МЕХ", "section": "ОВ", "marka": "ОВ1",
+                 "location": "ГП,АД (Генеральный план, УСД)",
                  "vor_not_issued": 0},
             ]
             r1 = replace_sovr_template(first, source="f1.xlsx")
@@ -407,6 +420,9 @@ class TestTemplateIdempotency(unittest.TestCase):
 
             df1 = load_sovr_template()
             self.assertEqual(len(df1), 3)
+            self.assertIn("location", df1.columns)
+            loc1 = df1[df1["kit_code"] == "АТ-РД-КЖ1-С-00"].iloc[0]
+            self.assertEqual(loc1["location"], "С (Стилобат)")
             created = dict(zip(df1["kit_code"], df1["created_at"]))
 
             # Повтор: без ОВ1, с новым статусом «Не выдается» у КЖ1
@@ -551,6 +567,477 @@ class TestNotLoadedRows(unittest.TestCase):
 
 
 # ===========================================================================
+#  22.24b — «Загружено / План» под фильтрами
+# ===========================================================================
+class TestPlanDonutFilters(unittest.TestCase):
+    """22.24b: план и загруженное — от одного отфильтрованного набора.
+
+    Реагируют на дисциплину/раздел/расположение/комплект/марку,
+    НЕ реагируют на «Статус листа» и период. Расположение — из колонки
+    СВОК «Здание, Сооружение, Корпус», а не из 4-го блока шифра.
+    """
+
+    def setUp(self):
+        self.template = pd.DataFrame([
+            {"kit_code": "АТ-РД-ЭО1-1-00", "discipline": "03_ЭС",
+             "section": "ЭОМ", "marka": "ЭО1",
+             "location": "1 (Корпус 1)", "vor_not_issued": 0},
+            {"kit_code": "АТ-РД-ЭО2-1-00", "discipline": "03_ЭС",
+             "section": "ЭОМ", "marka": "ЭО2",
+             "location": "1 (Корпус 1)", "vor_not_issued": 0},
+            {"kit_code": "АТ-РД-КЖ1-2-00", "discipline": "02_КР",
+             "section": "КЖ", "marka": "КЖ1",
+             "location": "2 (Корпус 2)", "vor_not_issued": 0},
+            {"kit_code": "АТ-РД-КЖ2-С-00", "discipline": "02_КР",
+             "section": "КЖ", "marka": "КЖ2",
+             "location": "С (Стилобат)", "vor_not_issued": 1},
+            {"kit_code": "АТ-РД-АД1-А-00", "discipline": "02_КР",
+             "section": "КЖ", "marka": "АД1",
+             "location": "ГП,АД (Генеральный план, УСД)",
+             "vor_not_issued": 0},
+            # Шифр говорит «С», а СВОК — «Корпус 1»: фильтр обязан
+            # использовать колонку СВОК (22.24b).
+            {"kit_code": "АТ-РД-ХХ1-С-00", "discipline": "03_ЭС",
+             "section": "ЭОМ", "marka": "ХХ1",
+             "location": "1 (Корпус 1)", "vor_not_issued": 0},
+        ])
+        self.showcase = pd.DataFrame([
+            {"complex": "АТ-РД-ЭО1-1-00", "sheet_number": "СО",
+             "status": "A", "send_date": "2026-01-10",
+             "discipline": "03_ЭС", "section": "ЭОМ"},
+            {"complex": "АТ-РД-ЭО2-1-00", "sheet_number": "СО",
+             "status": "B", "send_date": "2026-02-10",
+             "discipline": "03_ЭС", "section": "ЭОМ"},
+            {"complex": "АТ-РД-КЖ1-2-00", "sheet_number": "ВР",
+             "status": "A", "send_date": "2026-01-15",
+             "discipline": "02_КР", "section": "КЖ"},
+            {"complex": "АТ-РД-КЖ2-С-00", "sheet_number": "ВР",
+             "status": "C", "send_date": "2026-02-15",
+             "discipline": "02_КР", "section": "КЖ"},
+            {"complex": "АТ-РД-ХХ1-С-00", "sheet_number": "СО",
+             "status": "A", "send_date": "2026-01-12",
+             "discipline": "03_ЭС", "section": "ЭОМ"},
+            # вне перечня (4-й блок шифра = 2)
+            {"complex": "АТ-РД-ЭО9-2-00", "sheet_number": "СО",
+             "status": "A", "send_date": "2026-01-20",
+             "discipline": "03_ЭС", "section": "ЭОМ"},
+        ])
+
+    def _flt(self, **kw):
+        base = {"disc": (), "section": (), "kits": (), "block_codes": (),
+                "marka": "", "status": (), "date_from": None,
+                "date_to": None}
+        base.update(kw)
+        return base
+
+    def _counts(self, kind: str, **kw):
+        """Повторяет логику _render_main для планового бублика."""
+        flt = self._flt(**kw)
+        plan_flt = {**flt, "status": (), "date_from": None, "date_to": None}
+        loaded = _apply_filters(
+            self.showcase, {**plan_flt, "block_codes": ()},
+            apply_period=False)
+        loaded = _filter_loaded_by_location(
+            loaded, plan_flt["block_codes"], self.template)
+        tpl = _filter_template(self.template, plan_flt)
+        all_codes = set(self.template["kit_code"])
+        return _plan_donut_counts(tpl, loaded, kind, all_codes)
+
+    def test_no_filter(self):
+        c = self._counts(KIND_SO)
+        self.assertTrue(c["has_template"])
+        self.assertEqual(c["plan"], 6)
+        self.assertEqual(c["loaded_total"], 4)      # A, B, F, Z
+        self.assertEqual(c["loaded_in_plan"], 3)    # A, B, F
+        self.assertEqual(c["remaining"], 3)         # C, D, E
+        self.assertEqual(c["extra"], 1)             # Z
+
+        vr = self._counts(KIND_VR)
+        self.assertEqual(vr["plan"], 5)             # без D («Не выдается»)
+        self.assertEqual(vr["loaded_total"], 2)     # C, D
+        self.assertEqual(vr["loaded_in_plan"], 1)   # D вне плана
+        self.assertEqual(vr["extra"], 0)
+
+    def test_discipline_and_section_recalculate(self):
+        c = self._counts(KIND_SO, disc=("03_ЭС",))
+        self.assertEqual(c["plan"], 3)              # A, B, F
+        self.assertEqual(c["loaded_in_plan"], 3)    # A, B, F
+        self.assertEqual(c["extra"], 1)             # Z (03_ЭС)
+        kr = self._counts(KIND_SO, disc=("02_КР",))
+        self.assertEqual(kr["plan"], 3)             # C, D, E
+        self.assertEqual(kr["loaded_in_plan"], 0)   # у 02_КР только ВР
+        sec = self._counts(KIND_VR, section=("ЭОМ",))
+        self.assertEqual(sec["plan"], 3)            # A, B, F
+        self.assertEqual(sec["loaded_in_plan"], 0)
+
+    def test_marka_and_kit_recalculate(self):
+        m = self._counts(KIND_SO, marka="ЭО1")
+        self.assertEqual(m["plan"], 1)
+        self.assertEqual(m["loaded_in_plan"], 1)
+        k = self._counts(KIND_SO, kits=("АТ-РД-ЭО2-1-00",))
+        self.assertEqual(k["plan"], 1)
+        self.assertEqual(k["loaded_in_plan"], 1)
+
+    def test_kit_outside_template_only_extra(self):
+        c = self._counts(KIND_SO, kits=("АТ-РД-ЭО9-2-00",))
+        self.assertTrue(c["has_template"])          # полный перечень есть
+        self.assertEqual(c["plan"], 0)
+        self.assertEqual(c["loaded_in_plan"], 0)
+        self.assertEqual(c["extra"], 1)
+
+    def test_status_and_period_do_not_change_plan(self):
+        base = self._counts(KIND_SO)
+        by_status = self._counts(KIND_SO, status=("A",))
+        by_period = self._counts(
+            KIND_SO, date_from=pd.Timestamp("2099-01-01").date(),
+            date_to=pd.Timestamp("2099-12-31").date())
+        for c in (by_status, by_period):
+            self.assertEqual(c["plan"], base["plan"])
+            self.assertEqual(c["loaded_total"], base["loaded_total"])
+            self.assertEqual(c["loaded_in_plan"], base["loaded_in_plan"])
+            self.assertEqual(c["extra"], base["extra"])
+
+    def test_not_issued_never_in_vr_plan(self):
+        c = self._counts(KIND_VR, kits=("АТ-РД-КЖ2-С-00",))
+        self.assertEqual(c["plan"], 0)              # «Не выдается»
+        self.assertEqual(c["loaded_total"], 1)      # запись ВР есть
+        self.assertEqual(c["loaded_in_plan"], 0)
+        self.assertEqual(c["extra"], 0)             # не «сверх перечня»
+
+        by_disc = self._counts(KIND_VR, disc=("02_КР",))
+        self.assertEqual(by_disc["plan"], 2)        # C, E (без D)
+        self.assertEqual(by_disc["loaded_in_plan"], 1)  # C
+
+    def test_location_from_svok_not_cipher(self):
+        # F: шифр «С», СВОК «1 (Корпус 1)» → должен попасть в «Корпус 1»
+        c1 = self._counts(KIND_SO, block_codes=("1",))
+        self.assertEqual(c1["plan"], 3)             # A, B, F
+        self.assertEqual(c1["loaded_in_plan"], 3)   # A, B, F
+        self.assertEqual(c1["extra"], 0)            # Z (блок 2)
+        # «АД» в СВОК соответствует коду фильтра «А»
+        ca = self._counts(KIND_SO, block_codes=("А",))
+        self.assertEqual(ca["plan"], 1)             # E
+        # «С» — только D (F имеет СВОК «Корпус 1»)
+        cs = self._counts(KIND_SO, block_codes=("С",))
+        self.assertEqual(cs["plan"], 1)             # D
+        self.assertEqual(cs["loaded_in_plan"], 0)   # у D запись только ВР
+
+    def test_location_codes_parser(self):
+        self.assertEqual(_location_codes("С (Стилобат)"), {"С"})
+        self.assertEqual(_location_codes("1 (Корпус 1)"), {"1"})
+        self.assertEqual(_location_codes("ГП,АД (Генплан, УСД)"),
+                         {"ГП", "А"})
+        self.assertEqual(_location_codes(None), set())
+        self.assertEqual(_location_codes(""), set())
+
+
+# ===========================================================================
+#  22.24b — витрина СО/ВР в регулярном синке
+# ===========================================================================
+class TestSovrSyncStep(unittest.TestCase):
+    """Шаг синка: fetch → upsert_documents → load_sovr_statuses.
+
+    Идемпотентен, не дублирует записи; сбой fetch/шага логируется и
+    не прерывает остальные сущности синка.
+    """
+
+    DOCS = [
+        {"id": 1, "leaf": "a.pdf", "complex": "АТ-РД-КЖ1-С-00",
+         "sheet_number": "СО", "status": "C", "status_date": "2025-10-01",
+         "send_date": "2025-09-01", "workflow_id": 111,
+         "revision": "01", "name": "a", "discipline": "02_КР",
+         "section": "КЖ"},
+        {"id": 2, "leaf": "a.pdf", "complex": "АТ-РД-КЖ1-С-00",
+         "sheet_number": "СО", "status": "A", "status_date": "2025-10-10",
+         "send_date": "2025-10-09", "workflow_id": 222,
+         "revision": "02", "name": "a", "discipline": "02_КР",
+         "section": "КЖ"},
+        {"id": 3, "leaf": "b.pdf", "complex": "АТ-РД-КЖ1-С-00",
+         "sheet_number": "ВР", "status": "B", "status_date": "2025-10-05",
+         "send_date": "2025-10-04", "workflow_id": 333,
+         "revision": "01", "name": "b", "discipline": "02_КР",
+         "section": "КЖ"},
+    ]
+
+    def setUp(self):
+        import vitro.sqlite_db as db_mod
+        self.db_mod = db_mod
+        fd, self.tmp_db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(self.tmp_db)
+        self.old_path = db_mod.DB_FULL_PATH
+        db_mod.DB_FULL_PATH = Path(self.tmp_db)
+        db_mod.init_db()
+
+    def tearDown(self):
+        self.db_mod.DB_FULL_PATH = self.old_path
+        try:
+            os.unlink(self.tmp_db)
+        except OSError:
+            pass
+
+    def _counts(self):
+        with self.db_mod.get_conn() as conn:
+            docs = conn.execute(
+                "SELECT COUNT(*) FROM documents").fetchone()[0]
+            sovr = conn.execute(
+                "SELECT COUNT(*) FROM documents_sovr").fetchone()[0]
+            row = conn.execute(
+                "SELECT status, send_date, workflow_id, updated_by "
+                "FROM documents_sovr WHERE sheet_number = 'СО'").fetchone()
+        return docs, sovr, row
+
+    def test_step_updates_and_is_idempotent(self):
+        from vitro.sync import refresh_sovr_statuses
+
+        with patch("vitro.sync.fetch_atp_documents",
+                   return_value=list(self.DOCS)):
+            r1 = refresh_sovr_statuses(verbose=False, user="sync")
+        self.assertTrue(r1["ok"])
+        self.assertEqual(r1["documents"], 3)
+        self.assertEqual(r1["sheets"], 2)            # СО + ВР
+        docs, sovr, row = self._counts()
+        self.assertEqual(docs, 3)
+        self.assertEqual(sovr, 2)
+        self.assertEqual(row["status"], "A")         # последний по процессу
+        self.assertEqual(row["send_date"], "2025-10-09")
+        self.assertEqual(row["workflow_id"], 222)
+        self.assertEqual(row["updated_by"], "sync")
+
+        # Повторный запуск не дублирует записи
+        with patch("vitro.sync.fetch_atp_documents",
+                   return_value=list(self.DOCS)):
+            r2 = refresh_sovr_statuses(verbose=False, user="sync")
+        self.assertTrue(r2["ok"])
+        self.assertEqual(r2["sheets"], 2)
+        docs2, sovr2, _ = self._counts()
+        self.assertEqual(docs2, 3)
+        self.assertEqual(sovr2, 2)
+
+    def test_step_accepts_docs_without_second_fetch(self):
+        from vitro.sync import refresh_sovr_statuses
+
+        with patch("vitro.sync.fetch_atp_documents",
+                   side_effect=AssertionError("fetch не должен вызываться")):
+            r = refresh_sovr_statuses(docs=list(self.DOCS), verbose=False)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["sheets"], 2)
+
+    def test_fetch_failure_logged_not_raised(self):
+        """Ручной путь кнопки: сбой fetch логируется, наружу не бросается."""
+        from vitro.ui.so_vr import _refresh_sovr_manual
+
+        with patch("vitro.sync.fetch_atp_documents",
+                   side_effect=RuntimeError("Витро недоступно")):
+            r = _refresh_sovr_manual()   # не должно бросить
+        self.assertFalse(r["ok"])
+        self.assertIn("Витро недоступно", r["error"])
+        with self.db_mod.get_conn() as conn:
+            row = conn.execute(
+                "SELECT status, message FROM log WHERE event = 'sovr_sync' "
+                "ORDER BY rowid DESC LIMIT 1").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "ERROR")
+        self.assertIn("Витро недоступно", row["message"])
+
+    def test_step_failure_does_not_break_sync(self):
+        """Сбой load_sovr_statuses не мешает документам/журналу синка."""
+        from vitro.sync import refresh_data
+
+        with patch("vitro.sync.fetch_atp_documents",
+                   return_value=list(self.DOCS)), \
+             patch("vitro.sync.fetch_atp_comments", return_value=[]), \
+             patch("vitro.sync.fetch_comment_statuses", return_value={}), \
+             patch("vitro.sync.fetch_authors", return_value={}), \
+             patch("vitro.sync.fetch_complex_names", return_value=[]), \
+             patch("vitro.sync.build_comments_summary", return_value=[]), \
+             patch("vitro.sync.load_sovr_statuses",
+                   side_effect=RuntimeError("db fail")):
+            result = refresh_data(verbose=False)
+
+        self.assertEqual(result["documents"], 3)
+        self.assertFalse(result["sovr_ok"])
+        self.assertEqual(result["sovr_sheets"], 0)
+        # Документы и журнал синка записаны, несмотря на сбой шага.
+        # Отдельного события sovr_sync синк НЕ пишет: итог шага витрины
+        # складывается в единственное событие refresh.
+        with self.db_mod.get_conn() as conn:
+            n_docs = conn.execute(
+                "SELECT COUNT(*) FROM documents").fetchone()[0]
+            sovr_events = conn.execute(
+                "SELECT COUNT(*) FROM log WHERE event = 'sovr_sync'"
+            ).fetchone()[0]
+            refresh_rows = conn.execute(
+                "SELECT message FROM log WHERE event = 'refresh' "
+                "AND status = 'OK'").fetchall()
+        self.assertEqual(n_docs, 3)
+        self.assertEqual(sovr_events, 0)
+        self.assertEqual(len(refresh_rows), 1)
+        self.assertIn("Витрина СО/ВР", refresh_rows[0]["message"])
+        self.assertIn("db fail", refresh_rows[0]["message"])
+
+
+# ===========================================================================
+#  22.24b — выгрузка Excel «Основной» подвкладки
+# ===========================================================================
+class TestSovrExcelExportFilters(unittest.TestCase):
+    """Пункт 1: файл отражает фильтры экрана и формат 22.24b."""
+
+    def setUp(self):
+        self.template = pd.DataFrame([
+            {"kit_code": "А", "title": "A", "discipline": "03_ЭС",
+             "section": "ЭОМ", "marka": "ЭО1", "location": "1 (Корпус 1)",
+             "vor_not_issued": 0},
+            {"kit_code": "Б", "title": "B", "discipline": "03_ЭС",
+             "section": "ЭОМ", "marka": "ЭО2", "location": "1 (Корпус 1)",
+             "vor_not_issued": 0},
+            {"kit_code": "В", "title": "C", "discipline": "03_ЭС",
+             "section": "ЭОМ", "marka": "ЭО3", "location": "1 (Корпус 1)",
+             "vor_not_issued": 1},
+            {"kit_code": "Г", "title": "D", "discipline": "02_КР",
+             "section": "КЖ", "marka": "КЖ1", "location": "2 (Корпус 2)",
+             "vor_not_issued": 0},
+        ])
+        self.showcase = pd.DataFrame([
+            {"complex": "А", "sheet_number": "СО", "status": "A",
+             "send_date": "2026-01-05", "status_date": "2026-01-07",
+             "workflow_id": 111, "revision": "01", "name": "a",
+             "doc_id": 1, "discipline": "03_ЭС", "section": "ЭОМ"},
+            {"complex": "А", "sheet_number": "ВР", "status": "B",
+             "send_date": "2026-02-05", "status_date": "2026-02-07",
+             "workflow_id": 222, "revision": "02", "name": "b",
+             "doc_id": 2, "discipline": "03_ЭС", "section": "ЭОМ"},
+            {"complex": "Г", "sheet_number": "СО", "status": "C",
+             "send_date": "2026-03-05", "status_date": "2026-03-07",
+             "workflow_id": 333, "revision": "03", "name": "d",
+             "doc_id": 3, "discipline": "02_КР", "section": "КЖ"},
+        ])
+
+    def _flt(self, **kw):
+        base = {"disc": (), "section": (), "kits": (), "block_codes": (),
+                "marka": "", "status": (), "date_from": None,
+                "date_to": None}
+        base.update(kw)
+        return base
+
+    def _export_sheet(self, flt):
+        filtered = _apply_filters(self.showcase, flt)
+        table = _build_sovr_table(filtered, flt, self.template,
+                                  self.showcase)
+        data = _export_sovr_excel(table, flt)
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data))
+        return table, wb["СО и ВОР"]
+
+    def _codes(self, ws):
+        return {
+            ws.cell(row=r, column=1).value
+            for r in range(4, ws.max_row + 1)
+            if ws.cell(row=r, column=1).value
+        }
+
+    def test_filters_are_respected(self):
+        """Фильтр дисциплины: комплект другой дисциплины в файле отсутствует."""
+        flt = self._flt(disc=("03_ЭС",))
+        _, ws = self._export_sheet(flt)
+        self.assertEqual(self._codes(ws), {"А", "Б", "В"})
+        self.assertNotIn("Г", self._codes(ws))
+
+    def test_dates_and_empty_cells(self):
+        """Даты — ДД.ММ.ГГГГ; пустые значения — пустые ячейки."""
+        flt = self._flt(disc=("03_ЭС",))
+        _, ws = self._export_sheet(flt)
+        # А — строка 4: оба блока заполнены
+        self.assertEqual(ws.cell(row=4, column=4).value, "05.01.2026")
+        self.assertEqual(ws.cell(row=4, column=5).value, "07.01.2026")
+        self.assertEqual(ws.cell(row=4, column=9).value, "05.02.2026")
+        self.assertEqual(ws.cell(row=4, column=10).value, "07.02.2026")
+        # Б — «Не загружен»: обе даты и все поля пустые, без «None»
+        for col in range(2, 12):
+            self.assertIn(ws.cell(row=5, column=col).value, (None, ""))
+            self.assertNotEqual(ws.cell(row=5, column=col).value, "None")
+
+    def test_not_loaded_rows_present(self):
+        """Комплекты «Не загружен» остаются в файле с пустыми блоками."""
+        flt = self._flt(disc=("03_ЭС",))
+        table, ws = self._export_sheet(flt)
+        self.assertEqual(
+            len(table[table["status"] == "Не загружен"]), 3)  # Б СО/ВР + В СО
+        self.assertIn("Б", self._codes(ws))
+        self.assertIn("В", self._codes(ws))
+
+    def test_both_blocks_in_one_row(self):
+        """У комплекта с СО и ВР — одна строка с обоими блоками."""
+        flt = self._flt(disc=("03_ЭС",))
+        _, ws = self._export_sheet(flt)
+        a_rows = [r for r in range(4, ws.max_row + 1)
+                  if ws.cell(row=r, column=1).value == "А"]
+        self.assertEqual(len(a_rows), 1)
+        row = a_rows[0]
+        self.assertEqual(ws.cell(row=row, column=2).value, "01")   # СО
+        self.assertEqual(ws.cell(row=row, column=7).value, "02")   # ВОР
+        self.assertEqual(ws.cell(row=row, column=8).value, "B")
+
+    def test_filename_with_discipline_suffix(self):
+        """Имя файла: дата + суффикс дисциплины."""
+        name = _sovr_export_filename(self._flt(disc=("03_ЭС",)))
+        self.assertTrue(name.startswith("СО_ВОР_выгрузка_"))
+        self.assertTrue(name.endswith("_03_ЭС.xlsx"))
+        plain = _sovr_export_filename(self._flt())
+        self.assertTrue(plain.endswith(".xlsx"))
+        self.assertNotIn("_03_ЭС", plain)
+
+
+# ===========================================================================
+#  Пункт 2 — блок обогащения на «Сервисной», отсутствие пункта в Экспорте
+# ===========================================================================
+class TestEnrichExcelPlacement(unittest.TestCase):
+    """Обогащение СВОК живёт в «Сервисной», в Экспорте такого пункта нет."""
+
+    def test_export_has_no_sovr_enrichment_item(self):
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent
+               / "vitro" / "ui" / "export.py").read_text(encoding="utf-8")
+        self.assertNotIn("_enrich_svok_excel", src)
+        self.assertNotIn("Добавить статусы СО", src)
+        self.assertNotIn("СО и ВОР", src)
+
+    def test_service_subtab_calls_enrichment(self):
+        import inspect
+        import vitro.ui.so_vr as so_vr
+        service_src = inspect.getsource(so_vr.render_service)
+        self.assertIn("_render_enrich_excel()", service_src)
+        block_src = inspect.getsource(so_vr._render_enrich_excel)
+        self.assertIn("_render_enrich_download(", block_src)
+        download_src = inspect.getsource(so_vr._render_enrich_download)
+        self.assertIn("_enrich_pipeline(", download_src)
+        pipeline_src = inspect.getsource(so_vr._enrich_pipeline)
+        self.assertIn("_enrich_svok_excel(", pipeline_src)
+        self.assertIn("_СО_ВОР.xlsx", download_src)
+
+    def test_enriched_preview(self):
+        source = _create_svok_file([
+            {"code": "АТ-РД-КЖ1-С-00", "disc": "02_КР", "section": "КЖ",
+             "marka": "КЖ1", "title": "Конструкции", "vor": ""},
+        ])
+        sovr_data = pd.DataFrame([
+            {"complex": "АТ-РД-КЖ1-С-00", "sheet_number": "СО",
+             "revision": "01", "status": "A", "send_date": "2026-01-15",
+             "status_date": "2026-01-20", "workflow_id": 100},
+        ])
+        enriched = _enrich_svok_excel(source, "СВОК", sovr_data, False)
+        preview = _sovr_enriched_preview(enriched)
+        self.assertFalse(preview.empty)
+        self.assertIn("Ревизия СО", preview.columns)
+        self.assertIn("Ревизия ВР", preview.columns)
+        row = preview.iloc[0]
+        self.assertEqual(row["Шифр РД"], "АТ-РД-КЖ1-С-00")
+        self.assertEqual(row["Статус СО"], "A")
+        self.assertEqual(row["Дата выдачи СО"], "15.01.2026")
+        self.assertEqual(row["Дата получения статуса СО"], "20.01.2026")
+
+
+# ===========================================================================
 #  Регресс — базовые функции прошлых патчей не сломаны
 # ===========================================================================
 class TestBackwardCompatibility(unittest.TestCase):
@@ -567,27 +1054,38 @@ class TestBackwardCompatibility(unittest.TestCase):
         table = _build_sovr_table(df, flt)
         self.assertEqual(len(table), 1)
 
-    def test_export_sheets_short_names(self):
+    def test_export_single_table_two_groups(self):
+        """22.24b: одна таблица, группы «СО»/«ВОР», даты ДД.ММ.ГГГГ."""
         from vitro.ui.so_vr import _export_sovr_excel
         df = pd.DataFrame([
             {"complex": "A", "sheet_number": "СО", "status": "A",
              "send_date": "2026-01-01", "status_date": "2026-01-02",
              "workflow_id": 1, "revision": "01", "name": "a"},
-            {"complex": "B", "sheet_number": "ВР", "status": "B",
-             "send_date": None, "status_date": None,
-             "workflow_id": None, "revision": None, "name": "b"},
+            {"complex": "A", "sheet_number": "ВР", "status": "B",
+             "send_date": "2026-02-03", "status_date": "2026-02-04",
+             "workflow_id": 2, "revision": "02", "name": "b"},
         ])
         data = _export_sovr_excel(df, {})
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(data))
-        self.assertEqual(wb.sheetnames, ["СО", "ВОР"])
-        # развёрнутые названия в строке 1 (A3)
-        self.assertEqual(wb["СО"].cell(row=1, column=1).value,
-                         "Спецификация оборудования и материалов")
-        self.assertEqual(wb["ВОР"].cell(row=1, column=1).value,
-                         "Ведомость объемов работ")
-        # null не превращается в «None»
-        self.assertIn(wb["ВОР"].cell(row=3, column=8).value, (None, ""))
+        self.assertEqual(wb.sheetnames, ["СО и ВОР"])
+        ws = wb["СО и ВОР"]
+        # Строка 1 — полоса актуальности базы (как в «Экспорте»)
+        self.assertIn("База актуальна на", str(ws.cell(row=1, column=1).value))
+        # Двухэтажная шапка: Комплект | СО (B:F) | ВОР (G:K)
+        self.assertEqual(ws.cell(row=2, column=1).value, "Комплект")
+        self.assertEqual(ws.cell(row=2, column=2).value, "СО")
+        self.assertEqual(ws.cell(row=2, column=7).value, "ВОР")
+        self.assertEqual(ws.cell(row=3, column=2).value, "Ревизия")
+        self.assertEqual(ws.cell(row=3, column=6).value, "Номер процесса")
+        self.assertEqual(ws.cell(row=3, column=11).value, "Номер процесса")
+        # Одна строка на комплект: оба блока рядом
+        self.assertEqual(ws.cell(row=4, column=1).value, "A")
+        self.assertEqual(ws.cell(row=4, column=2).value, "01")
+        self.assertEqual(ws.cell(row=4, column=4).value, "01.01.2026")
+        self.assertEqual(ws.cell(row=4, column=7).value, "02")
+        self.assertEqual(ws.cell(row=4, column=9).value, "03.02.2026")
+        self.assertEqual(ws.max_row, 4)
 
 
 if __name__ == "__main__":

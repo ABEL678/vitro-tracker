@@ -20,17 +20,27 @@
   C  — парсер перечня СВОК (лист «СВОК», шапка по «Шифр РД» в колонке C,
        колонка T «Текущий статус ВОР»), план к загрузке, строки
        «Не загружен», фильтр по ним.
+
+Патч 22.24b:
+  «Загружено / План» реагирует на дисциплину, раздел, расположение,
+  комплект и марку; НЕ реагирует на период и «Статус листа».
+  Расположение плана — из колонки СВОК «Здание, Сооружение, Корпус»
+  (после повторной загрузки перечня; для старых строк — fallback по
+  4-му блоку шифра). «Сверх перечня» — загруженные вне полного перечня.
 """
 
 from datetime import date, datetime
 
 import io
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.utils import range_boundaries
+from openpyxl.worksheet.cell_range import CellRange
 
 from vitro._cache import versioned_cache
 from vitro.sheets import looks_like_rd_code, normalize_kit_code
@@ -241,6 +251,33 @@ def _extract_4th_block(code) -> str:
     return parts[3].strip().upper() if len(parts) >= 4 else ""
 
 
+# Соответствие кодов СВОК кодам фильтра «Расположение» (BLOCK_OPTIONS).
+# В перечне СВОК колонка «Здание, Сооружение, Корпус» содержит код в
+# начале значения: «С (Стилобат)», «1 (Корпус 1)», «ГП,АД (...)",
+# «0 (Все здание)». АД (автодороги) в фильтре — код «А».
+_LOCATION_CODE_ALIASES = {"АД": "А", "УДС": "А"}
+
+
+def _location_codes(location) -> set:
+    """Коды расположения из колонки СВОК «Здание, Сооружение, Корпус».
+
+    «С (Стилобат)» → {«С»}; «ГП,АД (Генеральный план, УСД)» → {«ГП», «А»};
+    пусто/None → пустое множество (вызывающий код использует fallback
+    по 4-му блоку шифра).
+    """
+    s = str(location or "").strip()
+    if not s:
+        return set()
+    lead = s.split("(", 1)[0]
+    codes: set = set()
+    for token in lead.replace(";", ",").replace("/", ",").split(","):
+        code = token.strip().upper()
+        if not code:
+            continue
+        codes.add(_LOCATION_CODE_ALIASES.get(code, code))
+    return codes
+
+
 def _filter_by_marka(df: pd.DataFrame, marka: str) -> pd.DataFrame:
     """Строгий фильтр по марке (3-й блок шифра) — общий хелпер проекта."""
     if not marka:
@@ -332,8 +369,20 @@ def _filter_template(template_df: pd.DataFrame, flt: dict) -> pd.DataFrame:
     if kits:
         out = out[out["kit_code"].isin(kits)]
     block_codes = tuple(flt.get("block_codes") or ())
-    if block_codes:
-        out = out[out["kit_code"].apply(_extract_4th_block).isin(block_codes)]
+    if block_codes and not out.empty:
+        # 22.24b: расположение берём из колонки СВОК «Здание,
+        # Сооружение, Корпус» (после повторной загрузки перечня).
+        # Для старых строк без location — fallback по 4-му блоку шифра.
+        selected = set(block_codes)
+        if "location" in out.columns:
+            codes = [
+                (_location_codes(loc) or {_extract_4th_block(code)})
+                for code, loc in zip(out["kit_code"], out["location"])
+            ]
+        else:
+            codes = [{_extract_4th_block(code)} for code in out["kit_code"]]
+        mask = [bool(c & selected) for c in codes]
+        out = out[mask]
 
     marka = flt.get("marka") or ""
     if marka and not out.empty:
@@ -341,6 +390,42 @@ def _filter_template(template_df: pd.DataFrame, flt: dict) -> pd.DataFrame:
         keep = _filter_by_marka(tmp, marka).index
         out = out.loc[out.index.intersection(keep)]
     return out
+
+
+def _template_location_map(template_df: pd.DataFrame | None) -> dict:
+    """{kit_code: set(кодов расположения)} из колонки location перечня."""
+    if template_df is None or template_df.empty \
+            or "location" not in template_df.columns:
+        return {}
+    return {
+        str(code).strip(): _location_codes(loc)
+        for code, loc in zip(template_df["kit_code"], template_df["location"])
+    }
+
+
+def _filter_loaded_by_location(df: pd.DataFrame, block_codes,
+                               template_df: pd.DataFrame | None
+                               ) -> pd.DataFrame:
+    """Фильтр витрины по расположению с учётом колонки location перечня.
+
+    План и «Загружено» должны решаться по одному правилу расположения
+    (22.24b). Для комплектов перечня код берётся из СВОК; для записей
+    вне перечня («сверх перечня») — fallback по 4-му блоку шифра.
+    """
+    blocks = tuple(block_codes or ())
+    if df is None or df.empty or not blocks:
+        return df
+
+    selected = set(blocks)
+    loc_map = _template_location_map(template_df)
+
+    def _keep(code) -> bool:
+        codes = loc_map.get(str(code).strip())
+        if not codes:
+            codes = {_extract_4th_block(code)}
+        return bool(codes & selected)
+
+    return df[df["complex"].apply(_keep)]
 
 
 # ---------------------------------------------------------------------------
@@ -412,14 +497,23 @@ def _status_donut_data(df: pd.DataFrame, kind: str) -> pd.DataFrame:
 
 
 def _plan_donut_counts(template_df: pd.DataFrame,
-                       loaded_df: pd.DataFrame, kind: str) -> dict:
-    """Числа для бублика «Загружено / План» (C2).
+                       loaded_df: pd.DataFrame, kind: str,
+                       all_template_codes: set | None = None) -> dict:
+    """Числа для бублика «Загружено / План» (C2, правило 22.24b).
 
-    План СО — все комплекты перечня; план ВОР — комплекты перечня без
+    template_df — перечень СВОК, УЖЕ отфильтрованный по дисциплине,
+    разделу, расположению, комплекту и марке (без статуса листа/периода).
+    loaded_df   — витрина под теми же фильтрами (без статуса/периода).
+
+    План СО — комплекты отфильтрованного перечня; план ВОР — они же без
     «Не выдается» в колонке T (N «Наличие ВОР» игнорируется).
-    «Загружено» — комплекты с записью листа этого вида в витрине.
-    Бублик рисуется в границах плана: loaded_in_plan + remaining = plan;
-    загруженные сверх перечня показываются в подписи (extra).
+    «Загружено» (loaded_in_plan) — комплекты плана с записью листа этого
+    вида в отфильтрованной витрине.
+    «Сверх перечня» (extra) — загруженные комплекты, которых нет в ПОЛНОМ
+    перечне (all_template_codes); в план они не входят.
+
+    Загруженные комплекты с «Не выдается» (ВОР) исключены из плана
+    правилом, а не отнесены к «сверх перечня».
 
     Возвращает {"has_template", "plan", "loaded_total", "loaded_in_plan",
     "remaining", "extra"}.
@@ -438,10 +532,20 @@ def _plan_donut_counts(template_df: pd.DataFrame,
 
     result["loaded_total"] = len(loaded_set)
 
+    if all_template_codes is not None:
+        all_template = {str(c) for c in all_template_codes if str(c).strip()}
+        result["has_template"] = bool(all_template)
+    else:
+        all_template = set()
+        if template_df is not None and not template_df.empty:
+            all_template = set(
+                template_df["kit_code"].dropna().astype(str))
+        result["has_template"] = bool(all_template)
+
     if template_df is None or template_df.empty:
+        result["extra"] = len(loaded_set - all_template)
         return result
 
-    result["has_template"] = True
     plan_df = template_df
     if kind == KIND_VR:
         if "vor_not_issued" in template_df.columns:
@@ -452,25 +556,28 @@ def _plan_donut_counts(template_df: pd.DataFrame,
         plan_df = template_df[not_issued.astype(int) == 0]
 
     plan_set = set(plan_df["kit_code"].dropna().astype(str))
-    all_template = set(template_df["kit_code"].dropna().astype(str))
+    if all_template_codes is None:
+        all_template = set(template_df["kit_code"].dropna().astype(str))
     result["plan"] = len(plan_set)
     result["loaded_in_plan"] = len(loaded_set & plan_set)
     result["remaining"] = len(plan_set - loaded_set)
-    # «сверх перечня» — загружено то, чего нет в перечне вовсе;
-    # комплекты с «Не выдается» из плана ВОР исключены правилом, а не
-    # «сверх перечня».
+    # «сверх перечня» — загруженные вне ПОЛНОГО перечня; membership
+    # проверяем по полному набору, а не по отфильтрованному.
     result["extra"] = len(loaded_set - all_template)
     return result
 
 
 def _render_sovr_donuts(df_status: pd.DataFrame,
                         template_df: pd.DataFrame | None = None,
-                        loaded_df: pd.DataFrame | None = None) -> None:
-    """Бублики СО и ВОРО: «Статусы» и «Загружено / План» рядом (A5).
+                        loaded_df: pd.DataFrame | None = None,
+                        all_template_codes: set | None = None) -> None:
+    """Бублики СО и ВОР: «Статусы» и «Загружено / План» рядом (A5).
 
-    df_status — витрина под всеми фильтрами, КРОМЕ периода (A1).
-    loaded_df — вся витрина (для плана бублика, C2: план от фильтров
-    не зависит).
+    df_status — витрина под фильтрами дисциплины/раздела/расположения/
+    комплекта/марки и статуса листа, но БЕЗ периода (A1).
+    template_df / loaded_df — перечень и витрина под теми же фильтрами,
+    кроме статуса листа и периода (22.24b: план зависит от фильтров).
+    all_template_codes — полный набор шифров перечня (для «сверх перечня»).
     """
     if loaded_df is None:
         loaded_df = df_status
@@ -499,7 +606,8 @@ def _render_sovr_donuts(df_status: pd.DataFrame,
         # --- Загружено / План (C2) ---
         with right:
             st.markdown("###### Загружено / План")
-            counts = _plan_donut_counts(template_df, loaded_df, kind)
+            counts = _plan_donut_counts(
+                template_df, loaded_df, kind, all_template_codes)
 
             if not counts["has_template"]:
                 st.caption(
@@ -524,7 +632,7 @@ def _render_sovr_donuts(df_status: pd.DataFrame,
             ])
             plan_data = plan_data[plan_data["Количество"] > 0]
             caption = (f"План: **{_fmt_num(counts['plan'])}** · "
-                       f"Загружено: **{_fmt_num(counts['loaded_total'])}**")
+                       f"Загружено: **{_fmt_num(counts['loaded_in_plan'])}**")
             if counts["extra"]:
                 caption += f" · сверх перечня: **{counts['extra']}**"
             st.caption(caption)
@@ -644,13 +752,18 @@ def _build_sovr_table(df: pd.DataFrame, flt: dict,
 
 def _render_sovr_table(df: pd.DataFrame, flt: dict,
                        template_df: pd.DataFrame | None = None,
-                       base_df: pd.DataFrame | None = None) -> None:
-    """Отображение сводной таблицы: два блока с развёрнутыми названиями."""
+                       base_df: pd.DataFrame | None = None
+                       ) -> pd.DataFrame | None:
+    """Отображение сводной таблицы: два блока с развёрнутыми названиями.
+
+    Возвращает построенную таблицу (включая строки «Не загружен») —
+    её же использует выгрузка Excel под таблицами.
+    """
     table = _build_sovr_table(df, flt, template_df, base_df)
 
     if table.empty:
         st.info("Нет данных по выбранным фильтрам.")
-        return
+        return None
 
     for kind in (KIND_SO, KIND_VR):
         sub = table[table["sheet_number"] == kind]
@@ -694,79 +807,212 @@ def _render_sovr_table(df: pd.DataFrame, flt: dict,
     if not_loaded:
         caption += f" · «Не загружен»: **{not_loaded}**"
     st.caption(caption)
+    return table
 
 
 # ---------------------------------------------------------------------------
-#  Экспорт в Excel
+#  Экспорт в Excel (22.24b: одна таблица по комплектам)
 # ---------------------------------------------------------------------------
-_HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
-_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
 _THIN = Side(style="thin", color="B0B0B0")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
-_WRAP = Alignment(wrap_text=True, vertical="top")
 
-_EXPORT_HEADERS = ["Комплект", "Номер листа", "Наименование", "Ревизия",
-                   "Статус", "Дата выдачи", "Дата получения статуса",
-                   "№ процесса"]
-_EXPORT_KEYS = ["complex", "sheet_number", "name", "revision", "status",
-                "send_date", "status_date", "workflow_id"]
+_GROUP_HEADERS = ["Ревизия", "Статус", "Дата выдачи",
+                  "Дата получения статуса", "Номер процесса"]
+_GROUP_KEYS = ["revision", "status", "send_date", "status_date", "workflow"]
+_EXPORT_SHEET_TITLE = "СО и ВОР"
 
 
-def _write_sovr_sheet(ws, kind: str, sub: pd.DataFrame) -> None:
-    """Лист одного вида: развёрнутое название + шапка + данные."""
-    ncols = len(_EXPORT_HEADERS)
+def _cell_text(value):
+    """Текст ячейки экспорта: null/NaN/«None» → пустая ячейка (None)."""
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ("none", "nan", "nat", "<na>"):
+        return None
+    return s
 
-    # Строка 1 — развёрнутое название блока (A3)
+
+def _cell_date(value):
+    """Дата ячейки экспорта: ДД.ММ.ГГГГ; пусто/непарсируемое → None."""
+    formatted = _fmt_date(value)
+    return formatted if formatted and formatted != "—" else None
+
+
+def _cell_workflow(value):
+    """№ процесса ячейки экспорта: пусто → None (без «None»)."""
+    return _cell_text(_fmt_workflow(value))
+
+
+def _build_sovr_export_rows(df: pd.DataFrame) -> list[dict]:
+    """Одна строка на комплект: блоки СО и ВОР рядом.
+
+    Принимает и «сырую» витрину (по строке на лист), и таблицу
+    ``_build_sovr_table`` (включая синтетические строки «Не загружен»).
+    Если листа вида нет (или строка «Не загружен») — блок пустой.
+    """
+    if df is None or df.empty or "sheet_number" not in df.columns:
+        return []
+
+    by_kind: dict[str, dict[str, object]] = {KIND_SO: {}, KIND_VR: {}}
+    for kind in (KIND_SO, KIND_VR):
+        sub = df[df["sheet_number"] == kind]
+        if sub.empty:
+            continue
+        # В таблице уже одна строка на (комплект, вид); на «сырой»
+        # витрине берём первую запись, чтобы не дублировать комплект.
+        sub = sub.drop_duplicates(subset=["complex"], keep="first")
+        for _, row in sub.iterrows():
+            code = _cell_text(row.get("complex"))
+            if code:
+                by_kind[kind][code] = row
+
+    codes = sorted(set(by_kind[KIND_SO]) | set(by_kind[KIND_VR]))
+    rows: list[dict] = []
+    for code in codes:
+        item: dict = {"complex": code}
+        for kind, prefix in ((KIND_SO, "so"), (KIND_VR, "vr")):
+            row = by_kind[kind].get(code)
+            if row is None or _is_not_loaded(row.get("status")):
+                values = (None, None, None, None, None)
+            else:
+                values = (
+                    _cell_text(row.get("revision")),
+                    _cell_text(row.get("status")),
+                    _cell_date(row.get("send_date")),
+                    _cell_date(row.get("status_date")),
+                    _cell_workflow(row.get("workflow_id")),
+                )
+            for key, value in zip(_GROUP_KEYS, values):
+                item[f"{prefix}_{key}"] = value
+        rows.append(item)
+    return rows
+
+
+def _write_sovr_export_sheet(ws, rows: list[dict], sync_ts=None) -> None:
+    """Лист по макету samples/СО_ВР_Таблица.xlsx (v1_предпочтительно).
+
+    Строка 1 — полоса актуальности базы (как в выгрузках «Экспорт»),
+    строка 2 — группы «СО»/«ВОР», строка 3 — подколонки, данные с 4-й.
+    Исходная таблица сохраняет свою колонку «Комплект»; блоки статусов
+    добавляются справа, порядок и названия — как на экране/в макете.
+    """
+    # Переиспользуем стили и текст полосы даты из «Экспорта»,
+    # не создавая второй набор оформления.
+    from vitro.ui.export import (
+        _KIT_DATE_FILL, _KIT_HEADER_FILL, _KIT_TABLE_BORDER,
+        _kit_sync_caption,
+    )
+
+    ncols = 1 + 2 * len(_GROUP_HEADERS)
+    last_letter = get_column_letter(ncols)
+
+    # --- Строка 1: дата и время последнего обновления базы ---
+    for col in range(1, ncols + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.fill = _KIT_DATE_FILL
+        cell.border = _KIT_TABLE_BORDER
+    strip = ws.cell(row=1, column=1, value=_kit_sync_caption(sync_ts))
+    strip.font = Font(bold=True)
+    strip.alignment = Alignment(horizontal="center", vertical="center")
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
-    title_cell = ws.cell(row=1, column=1, value=KIND_TITLES[kind])
-    title_cell.font = Font(bold=True, size=12, color="1F4E78")
-    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 22
 
-    # Строка 2 — шапка колонок
-    for j, h in enumerate(_EXPORT_HEADERS, start=1):
-        cell = ws.cell(row=2, column=j, value=h)
-        cell.fill = _HEADER_FILL
-        cell.font = _HEADER_FONT
-        cell.border = _BORDER
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    # --- Строка 2: группы «СО» и «ВОР»; «Комплект» — на две строки ---
+    ws.merge_cells(start_row=2, start_column=1, end_row=3, end_column=1)
+    kit_header = ws.cell(row=2, column=1, value="Комплект")
+    kit_header.fill = _KIT_HEADER_FILL
+    kit_header.font = Font(bold=True)
+    kit_header.border = _KIT_TABLE_BORDER
+    kit_header.alignment = Alignment(horizontal="center",
+                                     vertical="center")
+    ws.cell(row=3, column=1).border = _KIT_TABLE_BORDER
 
-    for i, (_, row) in enumerate(sub.iterrows(), start=3):
-        for j, (key, header) in enumerate(zip(_EXPORT_KEYS, _EXPORT_HEADERS),
-                                          start=1):
-            val = row.get(key)
-            if key in ("send_date", "status_date"):
-                val = _fmt_date(val)
-            elif key == "workflow_id":
-                val = _fmt_workflow(val)
-            cell = ws.cell(row=i, column=j, value=val)
-            cell.border = _BORDER
-            cell.alignment = _WRAP
+    for group_idx, title in enumerate(
+            (KIND_SHORT[KIND_SO], KIND_SHORT[KIND_VR])):
+        start_col = 2 + group_idx * len(_GROUP_HEADERS)
+        end_col = start_col + len(_GROUP_HEADERS) - 1
+        ws.merge_cells(start_row=2, start_column=start_col,
+                       end_row=2, end_column=end_col)
+        group_cell = ws.cell(row=2, column=start_col, value=title)
+        group_cell.fill = _KIT_HEADER_FILL
+        group_cell.font = Font(bold=True)
+        group_cell.border = _KIT_TABLE_BORDER
+        group_cell.alignment = Alignment(horizontal="center",
+                                         vertical="center")
+        for col in range(start_col, end_col + 1):
+            ws.cell(row=2, column=col).border = _KIT_TABLE_BORDER
+            sub_cell = ws.cell(row=3, column=col,
+                               value=_GROUP_HEADERS[col - start_col])
+            sub_cell.fill = _KIT_HEADER_FILL
+            sub_cell.font = Font(bold=True)
+            sub_cell.border = _KIT_TABLE_BORDER
+            sub_cell.alignment = Alignment(wrap_text=True,
+                                           vertical="center",
+                                           horizontal="center")
 
-    for j in range(1, ncols + 1):
-        ws.column_dimensions[get_column_letter(j)].width = 20
+    # --- Данные с 4-й строки ---
+    for row_idx, item in enumerate(rows, start=4):
+        kit_cell = ws.cell(row=row_idx, column=1, value=item.get("complex"))
+        kit_cell.border = _KIT_TABLE_BORDER
+        kit_cell.alignment = Alignment(vertical="center")
+        for group_idx, prefix in enumerate(("so", "vr")):
+            start_col = 2 + group_idx * len(_GROUP_HEADERS)
+            for offset, key in enumerate(_GROUP_KEYS):
+                cell = ws.cell(
+                    row=row_idx, column=start_col + offset,
+                    value=item.get(f"{prefix}_{key}"),
+                )
+                cell.border = _KIT_TABLE_BORDER
+                cell.alignment = Alignment(horizontal="center",
+                                           vertical="center")
 
-    ws.freeze_panes = "A3"
-    if ws.max_row >= 3:
-        ws.auto_filter.ref = f"A2:{get_column_letter(ncols)}{ws.max_row}"
+    widths = [28, 10, 10, 13, 18, 14,
+              10, 10, 13, 18, 14]
+    for col_idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    ws.freeze_panes = "B4"
+    ws.auto_filter.ref = f"A3:{last_letter}{max(ws.max_row, 3)}"
 
 
-def _export_sovr_excel(df: pd.DataFrame, flt: dict | None = None) -> bytes:
-    """Сводная таблица СО/ВОР → Excel (листы «СО» и «ВОР»)."""
+def _export_sovr_excel(df: pd.DataFrame, flt: dict | None = None,
+                       sync_ts=None) -> bytes:
+    """Витрина СО/ВОР → Excel по макету v1 (одна строка на комплект).
+
+    ``df`` — отфильтрованные данные экрана (таблица ``_build_sovr_table``)
+    либо «сырая» витрина; ``flt`` сохранён для совместимости вызова.
+    ``sync_ts`` — время последнего обновления базы
+    (``deadlines._load_last_sync_date``), как в выгрузках «Экспорт».
+    """
     from openpyxl import Workbook
 
     wb = Workbook()
-    for idx, kind in enumerate((KIND_SO, KIND_VR)):
-        if df is None or df.empty:
-            sub = pd.DataFrame(columns=_EXPORT_KEYS)
-        else:
-            sub = df[df["sheet_number"] == kind]
-        ws = wb.active if idx == 0 else wb.create_sheet()
-        ws.title = KIND_SHORT[kind]
-        _write_sovr_sheet(ws, kind, sub)
+    ws = wb.active
+    ws.title = _EXPORT_SHEET_TITLE
+    _write_sovr_export_sheet(ws, _build_sovr_export_rows(df), sync_ts)
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _safe_filename_part(value) -> str:
+    """Убирает из части имени файла символы, запрещённые в Windows."""
+    return "".join(
+        ch if ch not in '\\/:*?"<>|' else "_" for ch in str(value)
+    ).strip()
+
+
+def _sovr_export_filename(flt: dict | None = None) -> str:
+    """«СО_ВОР_выгрузка_ГГГГ-ММ-ДД.xlsx» + суффикс дисциплины."""
+    name = f"СО_ВОР_выгрузка_{date.today():%Y-%m-%d}"
+    for disc in tuple((flt or {}).get("disc") or ()):
+        part = _safe_filename_part(disc)
+        if part:
+            name += f"_{part}"
+    return f"{name}.xlsx"
 
 
 # ---------------------------------------------------------------------------
@@ -780,11 +1026,95 @@ _SOV_HEADER_FILL_VR = PatternFill("solid", fgColor="2E75B6")
 _SOV_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
 
 
+def _cell_has_value(value) -> bool:
+    """Непустое значение ячейки: None, пустая строка и NaN — пусто."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, float):
+        return not pd.isna(value)
+    return True
+
+
+def _sheet_content_bounds(ws) -> tuple[int, int]:
+    """Реальная последняя строка и колонка с данными.
+
+    Смотрим только уже существующие ячейки с непустым значением:
+    форматирование/объединения, растянутые до конца листа, больше не
+    раздувают диапазон (``ws.max_row`` на таких файлах огромен).
+    """
+    last_row = 0
+    last_col = 0
+    for (row, col), cell in getattr(ws, "_cells", {}).items():
+        if not _cell_has_value(getattr(cell, "value", None)):
+            continue
+        if row > last_row:
+            last_row = row
+        if col > last_col:
+            last_col = col
+    return max(last_row, 1), max(last_col, 1)
+
+
+def _last_data_row(ws, col: int, min_row: int) -> int:
+    """Последняя строка с непустым значением в колонке ``col``.
+
+    Для СВОК это колонка с шифрами РД: ниже таблицы могут быть только
+    пустые форматированные строки, они в диапазон данных не входят.
+    """
+    last = min_row - 1
+    for (row, c), cell in getattr(ws, "_cells", {}).items():
+        if c != col or row < min_row:
+            continue
+        if _cell_has_value(getattr(cell, "value", None)) and row > last:
+            last = row
+    return last
+
+
+def _insert_row_bounded(ws, idx: int, last_row: int) -> None:
+    """Вставить пустую строку перед ``idx``, не обходя весь лист.
+
+    ``openpyxl.insert_rows`` внутри вызывает ``iter_rows`` до ``ws.max_row``
+    и создаёт ячейку для каждой координаты: на файлах, где форматирование
+    раздуло лист до сотен тысяч строк, это часы работы. Здесь сдвигаются
+    только уже существующие ячейки в реальном диапазоне данных.
+    """
+    rows = sorted(
+        ((r, c) for (r, c) in getattr(ws, "_cells", {})
+         if idx <= r <= last_row),
+        reverse=True,
+    )
+    for row, col in rows:
+        ws._move_cell(row, col, 1, 0)
+    try:
+        ws._current_row = max(int(ws._current_row or 0), last_row + 1)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _shift_merges_after_insert(ws, insert_row: int) -> None:
+    """Сдвинуть объединения вниз на вставленную строку без unmerge/merge.
+
+    ``unmerge_cells``/``merge_cells`` пересоздают MergedCell по каждой
+    ячейке диапазона; на объединениях, растянутых до конца листа, это
+    миллионы объектов. Здесь правится только набор диапазонов.
+    """
+    src_merges = [CellRange(str(rng)) for rng in ws.merged_cells.ranges]
+    ws.merged_cells.ranges.clear()
+    for cr in src_merges:
+        if cr.min_row >= insert_row:
+            cr.shift(row_shift=1)
+        elif cr.max_row >= insert_row:
+            cr.max_row += 1
+        ws.merged_cells.ranges.add(cr)
+
+
 def _enrich_svok_excel(
     source_bytes: bytes,
     sheet_name: str,
     sovr_data: pd.DataFrame,
     is_xlsm: bool,
+    wb=None,
 ) -> bytes:
     """
     Обогащает пользовательский Excel (СВОК) колонками СО/ВР.
@@ -796,10 +1126,17 @@ def _enrich_svok_excel(
     - Заполняет данные по complex из sovr_data.
     - Учитывает "Не выдается" в колонке T файла для ВР.
     - Сохраняет VBA для .xlsm.
-    """
-    from openpyxl import load_workbook
 
-    wb = load_workbook(io.BytesIO(source_bytes), read_only=False, keep_vba=is_xlsm)
+    ``wb`` — уже открытый workbook (обычный режим, keep_vba по ``is_xlsm``),
+    чтобы не читать файл второй раз за нажатие. Функция его не закрывает:
+    это делает вызывающий. Если ``wb`` не передан, файл читается здесь
+    (совместимость со старыми вызовами).
+    """
+    if wb is None:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(io.BytesIO(source_bytes), read_only=False,
+                           keep_vba=is_xlsm)
 
     if sheet_name not in wb:
         # Ищем лист с "СВОК" в имени
@@ -816,10 +1153,20 @@ def _enrich_svok_excel(
 
     ws = wb[sheet_name]
 
+    # Реальный диапазон данных. ws.max_row/max_column могут быть раздуты
+    # форматированием или объединениями до конца листа — обходить их
+    # нельзя: на реальном файле 6,6 МБ это 10+ минут.
+    content_last_row, content_last_col = _sheet_content_bounds(ws)
+    print(f"[enrich] диапазон листа «{sheet_name}»: по данным строки до "
+          f"{content_last_row}, колонки до {content_last_col} "
+          f"(ws.max_row={ws.max_row}, ws.max_column={ws.max_column})",
+          flush=True)
+
     # Находим колонку "Шифр РД" (ищем в первых 50 строках)
     kit_col_num = None
     kit_header_row = None
-    for row in ws.iter_rows(min_row=1, max_row=50, max_col=ws.max_column):
+    for row in ws.iter_rows(min_row=1, max_row=50,
+                            max_col=content_last_col):
         for cell in row:
             if cell.value and "шифр" in str(cell.value).lower():
                 kit_col_num = cell.column
@@ -832,15 +1179,21 @@ def _enrich_svok_excel(
         st.error("Не найдена колонка с шифрами (ожидался заголовок 'Шифр РД').")
         return source_bytes
 
+    # Последняя строка таблицы — по непустым шифрам РД (а не по max_row).
+    last_data_row = _last_data_row(ws, kit_col_num, kit_header_row + 1)
+    print(f"[enrich] строк с шифрами РД: до {last_data_row} "
+          f"(шапка в строке {kit_header_row})", flush=True)
+
     # Последняя колонка данных
-    max_col = ws.max_column
+    max_col = content_last_col
 
     # Определяем колонку T (для проверки "Не выдается")
     col_t_num = 20  # T = 20
 
     # Собираем словарь "Не выдается" по шифрам (после insert_rows данные сдвинулись)
     not_issued: set = set()
-    for row in ws.iter_rows(min_row=kit_header_row + 2, max_row=ws.max_row, min_col=col_t_num, max_col=col_t_num):
+    for row in ws.iter_rows(min_row=kit_header_row + 2, max_row=last_data_row,
+                            min_col=col_t_num, max_col=col_t_num):
         cell = row[0]
         if cell.value and "не выд" in str(cell.value).lower():
             # Ищем шифр в этой строке (колонка kit_col_num)
@@ -860,12 +1213,12 @@ def _enrich_svok_excel(
 
     # Двухэтажная шапка: строка над шапкой — объединённые ячейки "СО" / "ВОР"
     header_merge_row = kit_header_row - 1
-    ws.insert_rows(header_merge_row)
+    # Вставка только по реальному диапазону (не по раздутому ws.max_row).
+    _insert_row_bounded(ws, header_merge_row, content_last_row)
 
-    # Сдвигаем существующие merges
-    src_merges = [str(_r) for _r in ws.merged_cells.ranges]
-    for _m in src_merges:
-        ws.unmerge_cells(_m)
+    # Сдвигаем существующие merges (набор диапазонов, без пересоздания
+    # MergedCell по каждой ячейке).
+    _shift_merges_after_insert(ws, header_merge_row)
 
     # Вставляем объединённые ячейки для "СО" и "ВОР"
     ws.merge_cells(
@@ -887,17 +1240,6 @@ def _enrich_svok_excel(
     cell_merge_vr.fill = _SOV_HEADER_FILL_VR
     cell_merge_vr.border = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
     cell_merge_vr.alignment = Alignment(horizontal="center", vertical="center")
-
-    # Возвращаем merges (со сдвигом)
-    for _m in src_merges:
-        _c1, _r1, _c2, _r2 = range_boundaries(_m)
-        if _r1 >= header_merge_row:
-            _r1 += 1
-            _r2 += 1
-        elif _r2 >= header_merge_row:
-            _r2 += 1
-        ws.merge_cells(start_row=_r1, start_column=_c1,
-                       end_row=_r2, end_column=_c2)
 
     # Шапки подколонок
     for i, name in enumerate(_SOVSo_HEADERS, start=col_start_so):
@@ -933,8 +1275,9 @@ def _enrich_svok_excel(
             "workflow_id": row.get("workflow_id") or "",
         }
 
-    # Заполняем строки данных (после insert_rows данные с kit_header_row+2)
-    for row_idx in range(kit_header_row + 2, ws.max_row + 1):
+    # Заполняем строки данных (после insert_rows данные с kit_header_row+2).
+    # Конец — по реальной последней строке с шифром, а не по ws.max_row.
+    for row_idx in range(kit_header_row + 2, last_data_row + 2):
         # Получаем шифр
         code_cell = ws.cell(row=row_idx, column=kit_col_num)
         code = code_cell.value
@@ -963,7 +1306,7 @@ def _enrich_svok_excel(
                 ws.cell(row=row_idx, column=col_start_vr + i, value=val)
 
     # Форматирование данных (после insert_rows данные с kit_header_row+2)
-    for row_idx in range(kit_header_row + 2, ws.max_row + 1):
+    for row_idx in range(kit_header_row + 2, last_data_row + 2):
         for col in range(col_start_so, col_end_so + 1):
             c = ws.cell(row=row_idx, column=col)
             c.border = _THIN
@@ -974,9 +1317,12 @@ def _enrich_svok_excel(
             c.alignment = Alignment(horizontal="center", vertical="center")
 
     # Сохраняем
+    _t_save = time.perf_counter()
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
+    print(f"[enrich] сохранение результата: "
+          f"{time.perf_counter() - _t_save:.2f} с", flush=True)
     return buf.getvalue()
 
 
@@ -1051,7 +1397,7 @@ def _parse_svok_workbook(data: bytes, filename: str = "") -> dict:
     Образец: лист «СВОК», шапка в строке 13 (в колонке C — «Шифр РД»),
     данные со строки 16 (сводный блок строк 3–8 не трогается — читаем
     только нужные строки). Возвращает:
-      {"rows": [ {kit_code, title, discipline, section, marka,
+       {"rows": [ {kit_code, title, discipline, section, marka, location,
                   vor_status, vor_not_issued} ],
        "warnings": [...], "sheet": имя листа, "header_row": N}
 
@@ -1084,12 +1430,17 @@ def _parse_svok_workbook(data: bytes, filename: str = "") -> dict:
     disc_col = _find_col(ws, header_row, ("дисциплин", "группа"))
     section_col = _find_col(ws, header_row, ("раздел",))
     marka_col = _find_col(ws, header_row, ("марка",))
+    # 22.24b: «Здание, Сооружение, Корпус» — источник фильтра
+    # «Расположение» для плана.
+    location_col = _find_col(
+        ws, header_row, ("здание", "сооружение", "корпус"))
     vor_col = _find_vor_status_col(ws, header_row)
 
     warnings: list[str] = []
     missing = [name for name, col in (
         ("Наименование", title_col), ("Дисциплина", disc_col),
-        ("Раздел", section_col), ("Марка", marka_col)) if col is None]
+        ("Раздел", section_col), ("Марка", marka_col),
+        ("Здание/Корпус", location_col)) if col is None]
     if missing:
         warnings.append(
             "Не найдены колонки: " + ", ".join(missing) + " — поля пустые.")
@@ -1129,6 +1480,7 @@ def _parse_svok_workbook(data: bytes, filename: str = "") -> dict:
             "discipline": str(_cell(disc_col) or "").strip(),
             "section": str(_cell(section_col) or "").strip(),
             "marka": str(_cell(marka_col) or "").strip(),
+            "location": str(_cell(location_col) or "").strip(),
             "vor_status": str(vor_status or "").strip(),
             "vor_not_issued": 1 if not_issued else 0,
         })
@@ -1159,25 +1511,46 @@ def _render_main() -> None:
     df_no_period = _apply_filters(df_all, flt, apply_period=False)
     # Таблица — все фильтры, включая период
     df_table = _apply_filters(df_all, flt, apply_period=True)
+
+    # 22.24b: «Загружено / План» зависит от дисциплины/раздела/
+    # расположения/комплекта/марки, но НЕ от статуса листа и периода.
+    # Один и тот же набор фильтров для плана и загруженного.
+    plan_flt = {**flt, "status": (), "date_from": None, "date_to": None}
+    # Расположение плана — из колонки СВОК, поэтому в _apply_filters
+    # блоки не применяем (иначе отсечём по 4-му блоку шифра).
+    df_plan = _apply_filters(
+        df_all, {**plan_flt, "block_codes": ()}, apply_period=False)
+    df_plan = _filter_loaded_by_location(
+        df_plan, flt.get("block_codes") or (), template_df)
+    template_plan = _filter_template(template_df, plan_flt)
+    all_template_codes = set()
+    if template_df is not None and not template_df.empty:
+        all_template_codes = set(
+            template_df["kit_code"].dropna().astype(str))
+
     # Для «Не загружен»: загруженность комплекта без статуса/периода
     df_base = _apply_filters(
         df_all, {**flt, "status": (), "date_from": None, "date_to": None},
         apply_period=False)
 
-    _render_sovr_donuts(df_no_period, template_df, df_all)
-    _render_sovr_table(df_table, flt, template_df, df_base)
+    _render_sovr_donuts(df_no_period, template_plan, df_plan,
+                        all_template_codes)
+    table = _render_sovr_table(df_table, flt, template_df, df_base)
 
-    table = _build_sovr_table(df_table, flt, template_df, df_base)
-    if not table.empty:
-        excel_bytes = _export_sovr_excel(table, flt)
+    if table is not None and not table.empty:
+        from vitro.ui.deadlines import _load_last_sync_date
         st.download_button(
-            "📥 Выгрузить в Excel",
-            data=excel_bytes,
-            file_name=f"СО_и_ВОР_{datetime.now():%Y%m%d_%H%M}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width='content',
+            "📥 Скачать Excel",
+            data=_export_sovr_excel(
+                table, flt, sync_ts=_load_last_sync_date()),
+            file_name=_sovr_export_filename(flt),
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            width='stretch',
             key="sovr_export_excel",
-            help="Выгрузка витрины статусов СО/ВОР и строк «Не загружен».",
+            help="Отфильтрованные данные экрана: одна строка на комплект, "
+                 "блоки СО и ВОР справа; строки «Не загружен» — с пустыми "
+                 "полями.",
         )
 
 
@@ -1204,12 +1577,29 @@ def _render_template_upload() -> None:
     if uploaded is not None:
         st.caption(f"Выбран файл: **{uploaded.name}**")
 
-    if st.button(
-        "Загрузить перечень СО/ВОР",
-        type="primary",
-        key="sovr_svok_load",
-        disabled=uploaded is None,
-    ):
+    # Фикс 27.11.2026: рядом с загрузкой перечня — кнопка добавления
+    # статусов СО и ВОР по тому же файлу (без повторной загрузки).
+    col_load, col_enrich = st.columns([1, 1])
+    with col_load:
+        load_clicked = st.button(
+            "Загрузить перечень СО/ВОР",
+            type="primary",
+            key="sovr_svok_load",
+            disabled=uploaded is None,
+            width='stretch',
+        )
+    with col_enrich:
+        if uploaded is not None:
+            _render_enrich_download(
+                uploaded,
+                key_prefix="sovr_svok_enrich",
+            )
+        else:
+            st.caption(
+                "После выбора файла нажмите кнопку — получите файл "
+                "с добавленными статусами СО и ВОР.")
+
+    if load_clicked:
         parsed = _parse_svok_workbook(uploaded.getvalue(), uploaded.name)
         for w in parsed["warnings"]:
             st.warning(w)
@@ -1232,12 +1622,373 @@ def _render_template_upload() -> None:
             f"Лист: «{parsed['sheet']}», шапка: строка {parsed['header_row']}.")
 
 
+def _file_stem(name: str) -> str:
+    """Имя файла без расширения (для «<имя>_СО_ВОР.xlsx»)."""
+    name = str(name or "СВОК")
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    return _safe_filename_part(name) or "СВОК"
+
+
+def _is_macro_workbook(uploaded) -> bool:
+    """Нужно ли сохранять VBA: .xlsm по имени или по MIME.
+
+    Это не фильтр приёма файла, а только выбор ``keep_vba`` для openpyxl.
+    """
+    name = str(getattr(uploaded, "name", "") or "").lower()
+    mime = str(getattr(uploaded, "type", "") or "").lower()
+    return name.endswith(".xlsm") or "macroenabled" in mime
+
+
+def _find_kits_sheet(wb) -> str | None:
+    """Лист с шифрами РД.
+
+    Сначала лист с «СВОК» в имени, затем любой лист с шапкой «Шифр РД»
+    в колонке C, затем любое упоминание «шифр» в первых 50 строках.
+    """
+    svok = _find_svok_sheet(wb)
+    if svok is not None and _find_svok_header(wb[svok]):
+        return svok
+    for name in wb.sheetnames:
+        if _find_svok_header(wb[name]):
+            return name
+    for name in wb.sheetnames:
+        ws = wb[name]
+        max_row = min(int(ws.max_row or 0), 50)
+        max_col = min(int(ws.max_column or 0), 60)
+        for row in ws.iter_rows(min_row=1, max_row=max_row, max_col=max_col):
+            for cell in row:
+                value = cell.value
+                if value and "шифр" in str(value).lower():
+                    return name
+    return None
+
+
+def _detect_sheet_in_workbook(wb) -> tuple[str | None, list[str]]:
+    """Лист с шифрами РД и список листов уже открытого файла.
+
+    Файл повторно не читается: вызывающий передаёт тот же workbook,
+    который затем идёт в ``_enrich_svok_excel``.
+    """
+    try:
+        sheets = list(wb.sheetnames)
+    except Exception:  # noqa: BLE001
+        return None, []
+    try:
+        return _find_kits_sheet(wb), sheets
+    except Exception:  # noqa: BLE001
+        return None, sheets
+
+
+def _enrich_pipeline(source, is_xlsm, sheet, sovr_data, progress) -> dict:
+    """Тяжёлая часть «Добавить статусы СО и ВОР» в отдельном потоке.
+
+    Вызовов ``st`` здесь нет: этап пишется в ``progress["stage"]``, а
+    результат возвращается словарём ``{"payload", "sheet", "sheets",
+    "error"}``. Так главный поток может показывать прогресс и сработать
+    по тайм-гварду, пока openpyxl читает/пишет файл.
+    """
+    from openpyxl import load_workbook
+
+    t_all = time.perf_counter()
+    progress["stage"] = "Открываем файл…"
+    t0 = time.perf_counter()
+    try:
+        wb = load_workbook(io.BytesIO(source), read_only=False,
+                           keep_vba=is_xlsm)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[enrich] открытие workbook: сбой за "
+              f"{time.perf_counter() - t0:.2f} с", flush=True)
+        return {"error": f"Не удалось прочитать файл: {exc}"}
+    print(f"[enrich] открытие workbook (обычный режим): "
+          f"{time.perf_counter() - t0:.2f} с", flush=True)
+
+    try:
+        sheets: list[str] = []
+        if sheet is None:
+            progress["stage"] = "Определяем лист с шифрами РД…"
+            t0 = time.perf_counter()
+            sheet, sheets = _detect_sheet_in_workbook(wb)
+            print(f"[enrich] детект листа: "
+                  f"{time.perf_counter() - t0:.2f} с", flush=True)
+            if sheet is None and sheets:
+                return {"sheets": sheets}
+            sheet = sheet or "СВОК"
+
+        progress["stage"] = "Добавляем статусы СО и ВОР…"
+        t0 = time.perf_counter()
+        payload = _enrich_svok_excel(source, sheet, sovr_data, is_xlsm, wb=wb)
+        print(f"[enrich] _enrich_svok_excel: "
+              f"{time.perf_counter() - t0:.2f} с", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Не удалось добавить статусы СО и ВОР: {exc}"}
+    finally:
+        try:
+            wb.close()
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[enrich] итого обработки: "
+              f"{time.perf_counter() - t_all:.2f} с", flush=True)
+
+    if payload is source:
+        return {"error": "Не найдена шапка с шифрами РД на выбранном листе."}
+    return {"payload": payload, "sheet": sheet}
+
+
+def _render_enrich_download(uploaded, key_prefix: str) -> None:
+    """Кнопка «Добавить статусы СО и ВОР» для загруженного файла.
+
+    Если файл выбран — кнопка видна всегда. До нажатия файл не читается:
+    определение листа с шифрами РД и добавление статусов выполняются
+    только в обработчике нажатия. Файл открывается ОДИН раз за нажатие:
+    тот же workbook идёт и в детект листа, и в ``_enrich_svok_excel``.
+    Любой сбой (чтение файла, детект листа, добавление статусов)
+    показывает сообщение, но кнопку не прячет.
+
+    Повторные перерисовки страницы обработку не перезапускают: результат
+    лежит в ``st.session_state`` по отпечатку файла (``file_id`` + имя +
+    размер), а тяжёлая часть запускается только из обработчика кнопки.
+    """
+    filename = str(getattr(uploaded, "name", "") or "СВОК")
+    is_xlsm = _is_macro_workbook(uploaded)
+    payload_key = f"{key_prefix}_payload"
+    name_key = f"{key_prefix}_name"
+    error_key = f"{key_prefix}_error"
+    sheets_key = f"{key_prefix}_sheets"
+    fingerprint_key = f"{key_prefix}_fingerprint"
+
+    # Новый файл — сохранённый результат, ошибка и список листов относятся
+    # к прежнему файлу и больше не подходят. getvalue() здесь не вызываем:
+    # отпечаток берётся из метаданных UploadedFile.
+    fingerprint = (
+        getattr(uploaded, "file_id", None),
+        filename,
+        getattr(uploaded, "size", None),
+    )
+    if st.session_state.get(fingerprint_key) != fingerprint:
+        for stale in (payload_key, name_key, error_key, sheets_key,
+                      f"{key_prefix}_sheet"):
+            st.session_state.pop(stale, None)
+        st.session_state[fingerprint_key] = fingerprint
+
+    def add_statuses(sheet: str | None) -> None:
+        """Один проход: чтение → детект (если нужно) → добавление → сохранение.
+
+        Тяжёлая часть (openpyxl) идёт в отдельном потоке: главный поток
+        показывает этап и через 60 секунд выводит предупреждение, а не
+        крутит бесконечный спиннер.
+        """
+        st.session_state.pop(error_key, None)
+        st.session_state.pop(payload_key, None)
+        t_all = time.perf_counter()
+
+        t0 = time.perf_counter()
+        try:
+            source = uploaded.getvalue()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[enrich] чтение файла из uploader: сбой за "
+                  f"{time.perf_counter() - t0:.2f} с", flush=True)
+            st.session_state[error_key] = (
+                f"Не удалось прочитать файл: {exc}")
+            return
+        print(f"[enrich] чтение файла из uploader: "
+              f"{time.perf_counter() - t0:.2f} с", flush=True)
+        print(f"[enrich] файл: {filename} "
+              f"({len(source) / 1048576:.1f} МБ), xlsm={is_xlsm}",
+              flush=True)
+
+        t0 = time.perf_counter()
+        try:
+            sovr_data = _load_sovr_data()
+        except Exception as exc:  # noqa: BLE001
+            st.session_state[error_key] = (
+                f"Не удалось получить статусы СО и ВОР из базы: {exc}")
+            return
+        print(f"[enrich] данные витрины СО/ВР: "
+              f"{time.perf_counter() - t0:.2f} с", flush=True)
+
+        progress = {"stage": "Открываем файл…"}
+        slow_slot = st.empty()
+        initial_label = "Добавляем статусы СО и ВОР…"
+        if len(source) >= 5 * 1024 * 1024:
+            initial_label = ("Добавляем статусы СО и ВОР… Файл большой — "
+                             "это может занять несколько минут.")
+        try:
+            with st.status(initial_label, expanded=False) as status:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        _enrich_pipeline, source, is_xlsm, sheet,
+                        sovr_data, progress)
+                    warned = False
+                    while not future.done():
+                        time.sleep(0.5)
+                        label = progress.get("stage") or initial_label
+                        if not warned and time.perf_counter() - t_all > 60:
+                            warned = True
+                            label = ("Файл большой: обработка идёт больше "
+                                     "минуты…")
+                            slow_slot.warning(
+                                "Файл большой — обработка занимает больше "
+                                "60 секунд. Это может занять несколько "
+                                "минут; страницу не закрывайте.")
+                        status.update(label=label)
+                    result = future.result()
+                status.update(label="Готово", state="complete")
+        except Exception as exc:  # noqa: BLE001
+            st.session_state[error_key] = (
+                f"Не удалось добавить статусы СО и ВОР: {exc}")
+            return
+        finally:
+            print(f"[enrich] итого обработчика: "
+                  f"{time.perf_counter() - t_all:.2f} с", flush=True)
+
+        if result.get("error"):
+            st.session_state[error_key] = result["error"]
+            return
+        if result.get("sheets"):
+            # Лист не определён — ниже покажем список листов и отдельную
+            # кнопку, чтобы добавление запускалось осознанно.
+            st.session_state[sheets_key] = result["sheets"]
+            if not st.session_state.get(error_key):
+                st.session_state[error_key] = (
+                    "В файле не найден лист с шифрами РД, укажите лист")
+            return
+        payload = result.get("payload")
+        if not payload:
+            st.session_state[error_key] = (
+                "Не удалось добавить статусы СО и ВОР: пустой результат.")
+            return
+        st.session_state[payload_key] = payload
+        st.session_state[name_key] = f"{_file_stem(filename)}_СО_ВОР.xlsx"
+        st.session_state.pop(sheets_key, None)
+
+    if st.button(
+        "📥 Добавить статусы СО и ВОР",
+        width='stretch',
+        key=f"{key_prefix}_add",
+        help="Файл читается только при нажатии: лист с шифрами РД "
+             "определяется в этот момент.",
+    ):
+        # Результат по этому же файлу уже собран: повторное нажатие не
+        # запускает тяжёлый проход заново (пересборка — повторный выбор
+        # файла, у него новый file_id).
+        if not st.session_state.get(payload_key):
+            st.session_state.pop(sheets_key, None)
+            st.session_state.pop(f"{key_prefix}_sheet", None)
+            add_statuses(None)
+
+    sheets = st.session_state.get(sheets_key) or []
+    if sheets:
+        sheet = st.selectbox(
+            "Лист файла",
+            sheets,
+            key=f"{key_prefix}_sheet",
+        )
+        if st.button(
+            "Добавить статусы на выбранный лист",
+            width='stretch',
+            key=f"{key_prefix}_apply",
+        ):
+            add_statuses(sheet)
+
+    error = st.session_state.get(error_key)
+    if error:
+        st.error(error)
+
+    payload = st.session_state.get(payload_key)
+    if payload:
+        st.download_button(
+            "📥 Добавить статусы СО и ВОР",
+            data=payload,
+            file_name=st.session_state.get(name_key)
+            or f"{_file_stem(filename)}_СО_ВОР.xlsx",
+            mime=("application/vnd.openxmlformats-officedocument"
+                  ".spreadsheetml.sheet"),
+            width='stretch',
+            key=f"{key_prefix}_download",
+        )
+
+
+def _render_enrich_excel() -> None:
+    """Добавление статусов СО и ВОР в пользовательский Excel.
+
+    Поведение как в «Экспорте»: поле загрузки → сразу кнопка
+    «Добавить статусы СО и ВОР» → файл ``<имя>_СО_ВОР.xlsx``. До нажатия
+    кнопки файл не читается; предпросмотра и предварительных проверок
+    нет; используется тот же ``_enrich_svok_excel``, что и раньше.
+    """
+    st.markdown("#### ➕ Добавить статусы СО и ВОР в Excel")
+    st.caption(
+        "Загрузите тот же файл, что и в «Перечень СО и ВОР (СВОК)». "
+        "Справа от таблицы появятся два блока по 5 колонок: «СО» и «ВОР» — "
+        "ревизия, статус, дата выдачи, дата получения статуса, номер "
+        "процесса. Файл принимается без фильтрации по типу и расширению."
+    )
+
+    col_up, col_dl = st.columns([1, 1])
+    with col_up:
+        uploaded = st.file_uploader(
+            "Excel-файл с перечнем комплектов",
+            key="sovr_enrich_file",
+            help="Приём файла не фильтруется. Отказ — только если в файле "
+                 "нет листа с шифрами РД.",
+        )
+        # Виджет и session_state могут разойтись — берём любой непустой.
+        if uploaded is None:
+            uploaded = st.session_state.get("sovr_enrich_file")
+
+    if uploaded is None or not hasattr(uploaded, "getvalue"):
+        return
+
+    with col_dl:
+        _render_enrich_download(
+            uploaded,
+            key_prefix="sovr_enrich_file",
+        )
+
+
+def _refresh_sovr_manual(user: str = "service_subtab") -> dict:
+    """Ручное обновление витрины СО/ВР (кнопка «Сервисной» подвкладки).
+
+    Единственный путь, который пишет отдельное событие журнала
+    ``sovr_sync``: это самостоятельное действие пользователя, у него
+    должна быть своя запись. Регулярный синк пишет одно событие
+    ``refresh`` в конце и складывает туда же итог шага витрины.
+
+    Возвращает словарь ``refresh_sovr_statuses``:
+    ``{"ok", "documents", "sheets"}`` (+ ``"error"`` при сбое).
+    """
+    from vitro.sqlite_db import log_event
+    from vitro.sync import refresh_sovr_statuses
+
+    result = refresh_sovr_statuses(verbose=False, user=user)
+    if result.get("ok"):
+        log_event(
+            "sovr_sync",
+            f"Витрина СО/ВР: документов {result.get('documents', 0)}, "
+            f"листов {result.get('sheets', 0)}",
+            rows=result.get("sheets", 0),
+        )
+    else:
+        try:
+            log_event("sovr_sync", result.get("error") or "ошибка",
+                      status="ERROR")
+        except Exception:
+            pass
+    return result
+
+
 def render_service() -> None:
     """Сервисная подвкладка: обновление витрины и загрузка перечня."""
     st.markdown("### ⚙️ Сервисные операции")
 
     # --- Перечень СВОК (C1) ---
     _render_template_upload()
+
+    st.divider()
+
+    # --- Добавление статусов СО/ВОР в пользовательский Excel (22.23) ---
+    _render_enrich_excel()
 
     st.divider()
 
@@ -1260,25 +2011,20 @@ def render_service() -> None:
     ):
         st.session_state["sovr_refresh_running"] = True
 
-        from vitro.sharepoint import fetch_atp_documents
-        from vitro.sqlite_db import (
-            load_sovr_statuses as _load_sovr_statuses,
-            upsert_documents,
-        )
-
         progress_bar = st.progress(0, text="Инициализация...")
         status_text = st.empty()
 
         try:
             progress_bar.progress(20, text="Шаг 1/2: Загрузка документов из Витро...")
             status_text.caption("Подключение к SharePoint Витро...")
-            docs = fetch_atp_documents()
-            status_text.caption(f"Загружено документов: **{len(docs)}**")
+            result = _refresh_sovr_manual()
 
-            progress_bar.progress(60, text="Шаг 2/2: Обновление витрины СО/ВР...")
-            status_text.caption("Сохранение документов и статусов в локальную базу...")
-            n_saved = upsert_documents(docs)
-            inserted = _load_sovr_statuses(user="service_subtab")
+            if not result.get("ok"):
+                raise RuntimeError(
+                    result.get("error") or "неизвестная ошибка")
+
+            n_saved = result.get("documents", 0)
+            inserted = result.get("sheets", 0)
             progress_bar.progress(100, text="Готово!")
 
             _load_sovr_data.clear()
